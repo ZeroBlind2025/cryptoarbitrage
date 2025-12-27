@@ -1,0 +1,30 @@
+{
+  "name": "polymarket-arbitrage-dashboard",
+  "version": "1.0.0",
+  "description": "Research dashboard for Polymarket arbitrage scanner",
+  "scripts": {
+    "dev": "python server.py --debug",
+    "start": "python server.py --auto-start",
+    "server": "python server.py",
+    "scanner": "python step_e_integrated_scanner.py --mode scan"
+  },
+  "dependencies": {
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "recharts": "^2.10.3",
+    "lucide-react": "^0.294.0"
+  },
+  "devDependencies": {},
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ZeroBlind2025/cryptoarbitrage"
+  },
+  "keywords": [
+    "polymarket",
+    "arbitrage",
+    "crypto",
+    "prediction-markets",
+    "dashboard"
+  ],
+  "license": "MIT"
+}
