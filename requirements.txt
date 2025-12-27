@@ -4,6 +4,10 @@
 requests>=2.28.0
 python-dotenv>=1.0.0
 
+# Web Server (for dashboard)
+flask>=3.0.0
+flask-cors>=4.0.0
+
 # Blockchain/Trading (install when ready for live trading)
 # py-clob-client  # Polymarket's official client
 # web3>=6.0.0     # Polygon interaction

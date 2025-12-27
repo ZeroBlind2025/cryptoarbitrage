@@ -66,22 +66,48 @@ The difference between these is "price slip" - a key metric for your white paper
 | `step_c_scanner_v4.py` | Gamma scanner with exclusion funnel |
 | `step_d_clob_client.py` | CLOB client for real prices & orders |
 | `step_e_integrated_scanner.py` | Combined pipeline |
+| `server.py` | Flask web server for dashboard |
+| `dashboard.jsx` | React dashboard component |
+| `templates/index.html` | Dashboard HTML template |
 
 ## Quick Start
 
 ```bash
 # Install dependencies
-pip install requests python-dotenv
+pip install -r requirements.txt
 
-# For live trading (optional)
-pip install py-clob-client web3
+# Run the dashboard (includes scanner)
+python server.py --auto-start
 
-# Run in scan mode (no API keys needed)
-python step_c_scanner_v4.py
-
-# Run integrated scanner (needs network access)
+# Or run just the CLI scanner
 python step_e_integrated_scanner.py --mode scan --duration 3600
 ```
+
+## Dashboard
+
+The dashboard provides a real-time view of the scanner:
+
+- **Active Opportunities**: Current arb opportunities with Gamma vs CLOB prices
+- **Price Slip Chart**: Tracks how indicative prices differ from executable
+- **Scan Activity**: Bar chart of opportunities per scan cycle
+- **Exclusion Funnel**: Why markets get filtered out
+- **Closest Misses**: Markets just above profitability threshold
+- **Trade History**: Paper trading results (in paper mode)
+
+Access the dashboard at `http://localhost:5000` after starting the server.
+
+### Dashboard API Endpoints
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /` | Dashboard UI |
+| `GET /api/status` | Scanner status |
+| `GET /api/data` | All dashboard data |
+| `POST /api/start` | Start scanner |
+| `POST /api/stop` | Stop scanner |
+| `GET /api/events` | SSE stream for real-time updates |
+| `GET /api/logs/scans` | Historical scan logs |
+| `GET /api/logs/executions` | Trade execution logs |
 
 ## Environment Setup (for live trading)
 
