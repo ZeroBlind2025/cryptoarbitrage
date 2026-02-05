@@ -414,10 +414,10 @@ def start_hft_scanner(
 
     print(f"[HFT] Found {len(active_markets)} markets to monitor")
 
-    # Configure engines
+    # Configure engines - execute on ANY price_sum < $1.00
     sum_to_one_config = SumToOneConfig(
-        max_price_sum=0.97,
-        min_edge_after_fees=0.005,
+        max_price_sum=1.0,        # Execute if total < $1.00
+        min_edge_after_fees=0.0,  # No minimum edge required
         max_position_usd=100.0,
     )
 

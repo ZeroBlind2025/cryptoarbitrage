@@ -168,11 +168,11 @@ class EngineSignal:
 class SumToOneConfig:
     """Configuration for Sum-to-One engine"""
 
-    # Threshold: max price sum to trigger
-    max_price_sum: float = 0.97  # 3% edge minimum
+    # Threshold: max price sum to trigger (< $1.00 = guaranteed profit)
+    max_price_sum: float = 1.0  # Execute if total < $1.00
 
-    # Minimum edge after fees
-    min_edge_after_fees: float = 0.005  # 0.5%
+    # Minimum edge after fees (0 = any profit is good)
+    min_edge_after_fees: float = 0.0  # No minimum
 
     # Fee estimate
     fee_rate: float = 0.02  # 2% Polymarket fee
