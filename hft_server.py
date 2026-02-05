@@ -122,6 +122,49 @@ def log_trade(trade: Trade):
 # MARKET DISCOVERY
 # =============================================================================
 
+def detect_market_category(slug: str, question: str) -> str:
+    """
+    Detect market category from slug and question text.
+
+    Categories:
+    - "crypto": BTC, ETH, XRP, SOL price markets
+    - "sports": Sports/game outcome markets
+    - "politics": Election/political markets
+    - "other": Everything else
+    """
+    slug_lower = slug.lower()
+    question_lower = question.lower()
+    combined = slug_lower + " " + question_lower
+
+    # Crypto keywords (15-min price windows)
+    crypto_keywords = [
+        "btc", "bitcoin", "eth", "ethereum", "xrp", "ripple", "sol", "solana",
+        "crypto", "price above", "price below", "price at"
+    ]
+    if any(kw in combined for kw in crypto_keywords):
+        return "crypto"
+
+    # Sports keywords
+    sports_keywords = [
+        "nba", "nfl", "mlb", "nhl", "soccer", "football", "basketball", "baseball",
+        "hockey", "tennis", "golf", "ufc", "mma", "boxing", "f1", "formula",
+        "game", "match", "win", "score", "playoff", "championship", "super bowl",
+        "world series", "finals", "league", "team", "player"
+    ]
+    if any(kw in combined for kw in sports_keywords):
+        return "sports"
+
+    # Politics keywords
+    politics_keywords = [
+        "election", "president", "congress", "senate", "vote", "poll",
+        "republican", "democrat", "biden", "trump", "governor", "mayor"
+    ]
+    if any(kw in combined for kw in politics_keywords):
+        return "politics"
+
+    return "other"
+
+
 def discover_markets() -> list[dict]:
     """
     Use Gamma scanner to discover active markets,
@@ -148,14 +191,19 @@ def discover_markets() -> list[dict]:
             token_b_id = target.get("token_b_id")
 
             if token_a_id and token_b_id:
+                slug = target.get("slug", "")
+                question = target.get("question", "")
+                category = detect_market_category(slug, question)
+
                 markets.append({
-                    "slug": target.get("slug", ""),
-                    "question": target.get("question", ""),
+                    "slug": slug,
+                    "question": question,
                     "token_a_id": token_a_id,
                     "token_b_id": token_b_id,
                     "price_sum_indicative": target.get("price_sum_indicative"),
                     "minutes_until": target.get("minutes_until"),
                     "volume_24h": target.get("volume_24h"),
+                    "category": category,
                 })
 
         return markets

@@ -504,6 +504,7 @@ class HFTClient:
         token_b_id: str,
         minutes_until_resolution: Optional[float] = None,
         volume_24h: Optional[float] = None,
+        market_category: Optional[str] = None,
     ) -> list[EngineSignal]:
         """
         Check market with all enabled engines.
@@ -529,6 +530,7 @@ class HFTClient:
             token_b_ask_depth=book_b.asks[0].size if book_b.asks else 0,
             minutes_until_resolution=minutes_until_resolution,
             volume_24h=volume_24h,
+            market_category=market_category,
             timestamp_us=time.perf_counter_ns() // 1000,
         )
 
@@ -1109,6 +1111,7 @@ class HFTScanner:
                     token_b_id=market.get("token_b_id", ""),
                     minutes_until_resolution=market.get("minutes_until"),
                     volume_24h=market.get("volume_24h"),
+                    market_category=market.get("category"),
                 )
 
                 # Process each signal
