@@ -267,7 +267,13 @@ class MarketScanner:
                 if offset == 0:
                     print(f"[DEBUG] API response type: {type(data)}, len: {len(data) if isinstance(data, list) else 'N/A'}", flush=True)
                     if isinstance(data, list) and data:
-                        print(f"[DEBUG] First market keys: {list(data[0].keys())[:10]}", flush=True)
+                        first_market = data[0]
+                        print(f"[DEBUG] First market ALL keys: {list(first_market.keys())}", flush=True)
+                        # Check for token-related fields
+                        print(f"[DEBUG] tokens: {first_market.get('tokens', 'NOT FOUND')}", flush=True)
+                        print(f"[DEBUG] outcomes: {first_market.get('outcomes', 'NOT FOUND')}", flush=True)
+                        print(f"[DEBUG] clobTokenIds: {first_market.get('clobTokenIds', 'NOT FOUND')}", flush=True)
+                        print(f"[DEBUG] outcomePrices: {first_market.get('outcomePrices', 'NOT FOUND')}", flush=True)
                     elif isinstance(data, dict):
                         print(f"[DEBUG] Response is dict with keys: {list(data.keys())}", flush=True)
 
