@@ -41,6 +41,7 @@ from hft_client import (
     TradingMode,
     Trade,
     OrderStatus,
+    ArbOpportunity,
 )
 from arb_engines import (
     EngineType,
