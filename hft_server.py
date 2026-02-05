@@ -175,15 +175,14 @@ def discover_markets() -> list[dict]:
 
     if gamma_scanner is None:
         # Use relaxed config to get more markets (not just arb opportunities)
+        # Set all friction buffers to 0 so threshold = 1.0 (gets all markets)
         config = GammaConfig(
             max_resolution_hours=24,
             min_volume_24h=500.0,  # Lower volume threshold
-            fee_buffer=0.02,
-            slippage_buffer=0.005,
-            risk_buffer=0.005,
+            fee_buffer=0.0,       # No fee buffer
+            slippage_buffer=0.0,  # No slippage buffer
+            risk_buffer=0.0,      # No risk buffer - threshold will be 1.0
         )
-        # Override the price sum threshold to get ALL markets, not just arb opps
-        config.max_price_sum_threshold = 1.05  # Get everything under $1.05
         gamma_scanner = GammaScanner(config)
 
     try:
