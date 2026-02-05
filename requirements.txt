@@ -7,6 +7,11 @@ python-dotenv>=1.0.0
 # Web Server (for dashboard)
 flask>=3.0.0
 flask-cors>=4.0.0
+gunicorn>=21.0.0
+
+# Async/WebSocket support (for HFT)
+aiohttp>=3.9.0
+websockets>=12.0
 
 # Blockchain/Trading (install when ready for live trading)
 # py-clob-client  # Polymarket's official client
