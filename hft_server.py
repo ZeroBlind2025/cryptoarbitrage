@@ -291,8 +291,14 @@ def discover_markets() -> list[dict]:
         print("[HFT] Fetching live sports events...", flush=True)
 
         import re
-        today_str = now.strftime("%Y-%m-%d")  # e.g., "2026-02-05"
-        yesterday_str = (now - timedelta(days=1)).strftime("%Y-%m-%d")  # For timezone edge cases
+        from zoneinfo import ZoneInfo
+
+        # Use PST/PDT for determining "today"
+        pst = ZoneInfo("America/Los_Angeles")
+        now_pst = datetime.now(pst)
+        today_str = now_pst.strftime("%Y-%m-%d")  # Today in PST
+        yesterday_str = (now_pst - timedelta(days=1)).strftime("%Y-%m-%d")  # Yesterday in PST
+        print(f"[HFT] Today (PST): {today_str}", flush=True)
 
         def extract_date_from_slug(slug: str) -> str | None:
             """Extract YYYY-MM-DD date from slug if present"""
