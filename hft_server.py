@@ -88,6 +88,11 @@ signal_history: deque[dict] = deque(maxlen=200)
 scanner_thread: Optional[threading.Thread] = None
 stop_scanner = threading.Event()
 
+# Market refresh settings
+MARKET_REFRESH_INTERVAL_MINUTES = 15
+refresh_thread: Optional[threading.Thread] = None
+stop_refresh = threading.Event()
+
 
 # =============================================================================
 # CALLBACKS
@@ -529,20 +534,31 @@ def start_hft_scanner(
     # Start scanner
     hft_scanner.start()
 
+    # Start market refresh thread (to pick up new live events)
+    global refresh_thread, stop_refresh
+    stop_refresh.clear()
+    refresh_thread = threading.Thread(target=market_refresh_loop, daemon=True)
+    refresh_thread.start()
+
     server_state["mode"] = mode
     server_state["is_running"] = True
     server_state["started_at"] = datetime.now(timezone.utc).isoformat()
 
     enabled = hft_client.get_enabled_engines()
-    return True, f"Started in {mode} mode with {len(active_markets)} markets. Engines: {', '.join(enabled)}"
+    return True, f"Started in {mode} mode with {len(active_markets)} markets. Engines: {', '.join(enabled)}. Market refresh every {MARKET_REFRESH_INTERVAL_MINUTES}min."
 
 
 def stop_hft_scanner():
     """Stop the HFT scanner"""
-    global hft_scanner, server_state
+    global hft_scanner, server_state, refresh_thread, stop_refresh
 
     if not server_state["is_running"]:
         return False, "Scanner not running"
+
+    # Stop refresh thread
+    stop_refresh.set()
+    if refresh_thread and refresh_thread.is_alive():
+        refresh_thread.join(timeout=5)
 
     if hft_scanner:
         hft_scanner.stop()
@@ -550,6 +566,39 @@ def stop_hft_scanner():
     server_state["is_running"] = False
 
     return True, "Scanner stopped"
+
+
+def market_refresh_loop():
+    """Periodically refresh markets to pick up new live events"""
+    global active_markets, hft_scanner
+
+    print(f"[HFT] Market refresh thread started (every {MARKET_REFRESH_INTERVAL_MINUTES} minutes)")
+
+    while not stop_refresh.is_set():
+        # Wait for the interval (checking stop flag every second)
+        for _ in range(MARKET_REFRESH_INTERVAL_MINUTES * 60):
+            if stop_refresh.is_set():
+                break
+            time.sleep(1)
+
+        if stop_refresh.is_set():
+            break
+
+        # Refresh markets
+        try:
+            print(f"[HFT] Refreshing markets...", flush=True)
+            new_markets = discover_markets()
+
+            if new_markets and hft_scanner:
+                active_markets = new_markets
+                hft_scanner.update_markets(new_markets)
+            else:
+                print(f"[HFT] No markets found during refresh, keeping existing", flush=True)
+
+        except Exception as e:
+            print(f"[HFT] Market refresh error: {e}", flush=True)
+
+    print("[HFT] Market refresh thread stopped")
 
 
 # =============================================================================
