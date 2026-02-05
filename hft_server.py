@@ -315,7 +315,8 @@ def stop_hft_scanner():
 @app.route('/')
 def index():
     """Serve the HFT dashboard"""
-    return render_template('hft_dashboard.html')
+    # Serve from static to avoid Jinja2 interpreting React's {{ }} syntax
+    return app.send_static_file('hft_dashboard.html')
 
 
 @app.route('/api/status')
