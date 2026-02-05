@@ -1094,6 +1094,13 @@ class HFTScanner:
             self._thread.join(timeout=5)
         print("[HFT] Scanner stopped")
 
+    def update_markets(self, new_markets: list[dict]):
+        """Update the market list (for periodic refresh)"""
+        old_count = len(self.markets)
+        self.markets = new_markets
+        new_count = len(self.markets)
+        print(f"[HFT] Markets updated: {old_count} -> {new_count}")
+
     def _scan_loop(self):
         """Main scanning loop with multi-engine support"""
         while self._running:
