@@ -268,12 +268,14 @@ class MarketScanner:
                     print(f"[DEBUG] API response type: {type(data)}, len: {len(data) if isinstance(data, list) else 'N/A'}", flush=True)
                     if isinstance(data, list) and data:
                         first_market = data[0]
-                        print(f"[DEBUG] First market ALL keys: {list(first_market.keys())}", flush=True)
-                        # Check for token-related fields
-                        print(f"[DEBUG] tokens: {first_market.get('tokens', 'NOT FOUND')}", flush=True)
-                        print(f"[DEBUG] outcomes: {first_market.get('outcomes', 'NOT FOUND')}", flush=True)
-                        print(f"[DEBUG] clobTokenIds: {first_market.get('clobTokenIds', 'NOT FOUND')}", flush=True)
-                        print(f"[DEBUG] outcomePrices: {first_market.get('outcomePrices', 'NOT FOUND')}", flush=True)
+                        print(f"[DEBUG] First market slug: {first_market.get('slug', 'N/A')}", flush=True)
+                        # Show actual values for token-related fields
+                        outcomes = first_market.get('outcomes', 'NOT FOUND')
+                        clob_ids = first_market.get('clobTokenIds', 'NOT FOUND')
+                        prices = first_market.get('outcomePrices', 'NOT FOUND')
+                        print(f"[DEBUG] outcomes: {outcomes}", flush=True)
+                        print(f"[DEBUG] clobTokenIds: {clob_ids}", flush=True)
+                        print(f"[DEBUG] outcomePrices: {prices}", flush=True)
                     elif isinstance(data, dict):
                         print(f"[DEBUG] Response is dict with keys: {list(data.keys())}", flush=True)
 
@@ -307,6 +309,11 @@ class MarketScanner:
         Parse raw API response into BinaryMarket.
 
         Returns None if market is invalid/unparseable.
+
+        Gamma API returns parallel arrays:
+        - outcomes: ["Yes", "No"]
+        - clobTokenIds: ["token_id_1", "token_id_2"]
+        - outcomePrices: ["0.55", "0.45"] or [0.55, 0.45]
         """
         try:
             # Extract basic fields
@@ -314,47 +321,98 @@ class MarketScanner:
             market_id = raw.get("id", "")
             slug = raw.get("slug", "")
             question = raw.get("question", "")
-            active = raw.get("active", False)
+            active = raw.get("active", True)  # Default to True if not specified
 
-            # Parse outcomes
-            outcomes = raw.get("outcomes", [])
-            outcome_labels = outcomes if isinstance(outcomes, list) else []
+            # Parse outcomes - can be string like "[\"Yes\", \"No\"]" or list
+            outcomes_raw = raw.get("outcomes", [])
+            if isinstance(outcomes_raw, str):
+                try:
+                    outcome_labels = json.loads(outcomes_raw)
+                except json.JSONDecodeError:
+                    outcome_labels = []
+            else:
+                outcome_labels = outcomes_raw if isinstance(outcomes_raw, list) else []
 
-            # Parse tokens
-            tokens = raw.get("tokens", [])
             raw_outcome_count = len(outcome_labels)
+
+            # Parse token IDs - can be string like "[\"id1\", \"id2\"]" or list
+            clob_token_ids_raw = raw.get("clobTokenIds", [])
+            if isinstance(clob_token_ids_raw, str):
+                try:
+                    clob_token_ids = json.loads(clob_token_ids_raw)
+                except json.JSONDecodeError:
+                    clob_token_ids = []
+            else:
+                clob_token_ids = clob_token_ids_raw if isinstance(clob_token_ids_raw, list) else []
+
+            # Parse prices - can be string like "[\"0.55\", \"0.45\"]" or list
+            outcome_prices_raw = raw.get("outcomePrices", [])
+            if isinstance(outcome_prices_raw, str):
+                try:
+                    outcome_prices = json.loads(outcome_prices_raw)
+                except json.JSONDecodeError:
+                    outcome_prices = []
+            else:
+                outcome_prices = outcome_prices_raw if isinstance(outcome_prices_raw, list) else []
+
+            # Also try 'tokens' array as fallback (some endpoints may use this)
+            tokens = raw.get("tokens", [])
 
             token_a = None
             token_b = None
             priced_count = 0
 
-            for tok in tokens:
-                if not isinstance(tok, dict):
-                    continue
+            # First try parallel arrays (clobTokenIds + outcomePrices)
+            if clob_token_ids and outcome_prices and len(clob_token_ids) == len(outcome_prices):
+                for i, token_id in enumerate(clob_token_ids):
+                    outcome = outcome_labels[i] if i < len(outcome_labels) else f"Outcome_{i}"
+                    price = outcome_prices[i]
 
-                token_id = tok.get("token_id", "")
-                outcome = tok.get("outcome", "")
-                price = tok.get("price")
+                    try:
+                        price_float = float(price)
+                    except (ValueError, TypeError):
+                        continue
 
-                if price is None:
-                    continue
+                    if not 0 <= price_float <= 1:
+                        continue
 
-                try:
-                    price_float = float(price)
-                except (ValueError, TypeError):
-                    continue
+                    priced_count += 1
 
-                if not 0 <= price_float <= 1:
-                    continue
+                    t = Token(token_id=str(token_id), outcome=outcome, price=price_float)
 
-                priced_count += 1
+                    if token_a is None:
+                        token_a = t
+                    elif token_b is None:
+                        token_b = t
+            # Fallback: try nested tokens array
+            elif tokens:
+                for tok in tokens:
+                    if not isinstance(tok, dict):
+                        continue
 
-                t = Token(token_id=token_id, outcome=outcome, price=price_float)
+                    token_id = tok.get("token_id", "")
+                    outcome = tok.get("outcome", "")
+                    price = tok.get("price")
 
-                if token_a is None:
-                    token_a = t
-                elif token_b is None:
-                    token_b = t
+                    if price is None:
+                        continue
+
+                    try:
+                        price_float = float(price)
+                    except (ValueError, TypeError):
+                        continue
+
+                    if not 0 <= price_float <= 1:
+                        continue
+
+                    priced_count += 1
+
+                    t = Token(token_id=token_id, outcome=outcome, price=price_float)
+
+                    if token_a is None:
+                        token_a = t
+                    elif token_b is None:
+                        token_b = t
 
             # Parse resolution time
             end_date_str = raw.get("endDate") or raw.get("end_date_iso")
