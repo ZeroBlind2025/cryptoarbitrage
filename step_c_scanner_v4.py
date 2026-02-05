@@ -263,6 +263,19 @@ class MarketScanner:
                 resp.raise_for_status()
                 data = resp.json()
 
+                # Debug first request
+                if offset == 0:
+                    print(f"[DEBUG] API response type: {type(data)}, len: {len(data) if isinstance(data, list) else 'N/A'}", flush=True)
+                    if isinstance(data, list) and data:
+                        print(f"[DEBUG] First market keys: {list(data[0].keys())[:10]}", flush=True)
+                    elif isinstance(data, dict):
+                        print(f"[DEBUG] Response is dict with keys: {list(data.keys())}", flush=True)
+
+                # Handle both list and dict responses
+                if isinstance(data, dict):
+                    # API might return {"data": [...]} or similar
+                    data = data.get("data", data.get("markets", []))
+
                 if not data:
                     break
 
