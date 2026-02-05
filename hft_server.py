@@ -286,54 +286,109 @@ def discover_markets() -> list[dict]:
 
         # ============================================================
         # FETCH LIVE SPORTS MARKETS
-        # Use /events endpoint which is better organized for live sports
+        # Use /sports -> /events flow to find games actually in progress
         # ============================================================
         print("[HFT] Fetching live sports events...", flush=True)
 
+        def is_event_live(event: dict) -> bool:
+            """Check if a sports event is actually live (game in progress)"""
+            # Check start time - game must have started
+            start_date_str = event.get("startDate") or event.get("startDateIso")
+            if start_date_str:
+                try:
+                    if "T" in str(start_date_str):
+                        start_date = datetime.fromisoformat(start_date_str.replace("Z", "+00:00"))
+                        if start_date > now:
+                            return False  # Game hasn't started yet
+                except:
+                    pass
+
+            # Check end time - game shouldn't be over
+            end_date_str = event.get("endDate") or event.get("endDateIso")
+            if end_date_str:
+                try:
+                    if "T" in str(end_date_str):
+                        end_date = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
+                        if end_date < now:
+                            return False  # Game already ended
+                except:
+                    pass
+
+            # Must be active and not closed
+            if event.get("closed") == True:
+                return False
+            if event.get("active") == False:
+                return False
+
+            return True
+
         try:
-            # First get list of sports leagues
+            # Step 1: Get list of sports leagues from /sports
             resp = requests.get(f"{GAMMA_API}/sports", timeout=30)
             if resp.status_code == 200:
                 leagues = resp.json()
                 print(f"[HFT] Found {len(leagues)} sports leagues", flush=True)
 
-                # Query each league for live events
-                for league in leagues[:10]:  # Limit to first 10 leagues
-                    series_id = league.get("id") or league.get("series_id")
-                    league_name = league.get("name", "Unknown")
+                # Debug: Show league structure
+                if leagues:
+                    sample = leagues[0]
+                    print(f"[DEBUG] League fields: {list(sample.keys())}", flush=True)
+
+                # Step 2: Query each league for live events
+                for league in leagues:
+                    # Polymarket uses different field names - try common ones
+                    series_id = (
+                        league.get("series_id") or
+                        league.get("seriesId") or
+                        league.get("id")
+                    )
+                    league_name = league.get("name") or league.get("title", "Unknown")
+                    league_slug = league.get("slug", "")
 
                     if not series_id:
+                        print(f"[DEBUG] No series_id for league: {league}", flush=True)
                         continue
 
                     try:
+                        # Get events for this league
                         events_resp = requests.get(
                             f"{GAMMA_API}/events",
                             params={
                                 "series_id": series_id,
                                 "active": "true",
                                 "closed": "false",
-                                "limit": 50,
+                                "limit": 100,
                             },
                             timeout=10
                         )
+
                         if events_resp.status_code == 200:
                             events = events_resp.json()
+                            live_count = 0
+
                             for event in events:
-                                # Each event can have multiple markets
+                                # Only include events where game is actually live
+                                if not is_event_live(event):
+                                    continue
+
+                                live_count += 1
                                 event_markets = event.get("markets", [])
                                 event_slug = event.get("slug", "")
                                 event_title = event.get("title", "")
 
-                                # Debug first few
-                                if sports_found < 5:
-                                    print(f"[DEBUG] {league_name}: {event_slug[:40]}...", flush=True)
+                                # Debug first few live events
+                                if sports_found < 10:
+                                    start_str = event.get("startDate", "?")
+                                    print(f"[LIVE] {league_name}: {event_title[:40]}... (started: {start_str})", flush=True)
 
                                 for mkt in event_markets:
                                     market_data = parse_market_data(mkt)
                                     if market_data:
                                         market_data["category"] = "sports"
                                         market_data["league"] = league_name
-                                        # Use event end date if available
+                                        market_data["event_title"] = event_title
+
+                                        # Calculate time until resolution
                                         end_date_str = mkt.get("endDate") or event.get("endDate")
                                         if end_date_str:
                                             try:
@@ -342,43 +397,22 @@ def discover_markets() -> list[dict]:
                                                     market_data["minutes_until"] = (end_date - now).total_seconds() / 60
                                             except:
                                                 market_data["minutes_until"] = None
+
                                         markets.append(market_data)
                                         sports_found += 1
-                    except:
-                        pass
+
+                            if live_count > 0:
+                                print(f"[HFT] {league_name}: {live_count} live events", flush=True)
+
+                    except Exception as e:
+                        print(f"[DEBUG] Error querying {league_name}: {e}", flush=True)
 
                     time_module.sleep(0.05)  # Rate limiting
 
         except Exception as e:
+            import traceback
             print(f"[HFT] Error fetching sports leagues: {e}", flush=True)
-
-        # Fallback: also try direct /events with tag_id for live games
-        if sports_found < 5:
-            print("[HFT] Trying fallback /events query...", flush=True)
-            try:
-                resp = requests.get(
-                    f"{GAMMA_API}/events",
-                    params={
-                        "tag_id": SPORTS_TAG_ID,
-                        "active": "true",
-                        "closed": "false",
-                        "limit": 100,
-                    },
-                    timeout=30
-                )
-                if resp.status_code == 200:
-                    events = resp.json()
-                    print(f"[HFT] Fallback got {len(events)} events", flush=True)
-                    for event in events[:20]:
-                        event_markets = event.get("markets", [])
-                        for mkt in event_markets:
-                            market_data = parse_market_data(mkt)
-                            if market_data and not any(m["slug"] == market_data["slug"] for m in markets):
-                                market_data["category"] = "sports"
-                                markets.append(market_data)
-                                sports_found += 1
-            except Exception as e:
-                print(f"[HFT] Fallback error: {e}", flush=True)
+            traceback.print_exc()
 
         print(f"[HFT] Total: {crypto_found} crypto, {sports_found} sports = {len(markets)} markets", flush=True)
         return markets
