@@ -174,14 +174,15 @@ def discover_markets() -> list[dict]:
     global gamma_scanner
 
     if gamma_scanner is None:
-        # Use relaxed config to get more markets (not just arb opportunities)
-        # Set all friction buffers to 0 so threshold = 1.0 (gets all markets)
+        # Use very relaxed config to discover ALL active markets
+        # The engines will handle category filtering (crypto/sports/etc.)
         config = GammaConfig(
-            max_resolution_hours=24,
-            min_volume_24h=500.0,  # Lower volume threshold
-            fee_buffer=0.0,       # No fee buffer
-            slippage_buffer=0.0,  # No slippage buffer
-            risk_buffer=0.0,      # No risk buffer - threshold will be 1.0
+            max_resolution_hours=8760,  # 1 year - get all markets
+            min_resolution_hours=0,     # No minimum
+            min_volume_24h=0.0,         # No volume filter - get everything
+            fee_buffer=0.0,             # No fee buffer
+            slippage_buffer=0.0,        # No slippage buffer
+            risk_buffer=0.0,            # No risk buffer - threshold will be 1.0
         )
         gamma_scanner = GammaScanner(config)
 
