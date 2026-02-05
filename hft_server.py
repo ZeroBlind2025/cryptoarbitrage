@@ -840,7 +840,7 @@ def api_data():
             },
         },
         "signals": list(signal_history)[-20:],
-        "markets": active_markets[:10],  # Top 10 markets
+        "markets": active_markets,  # All markets
     })
 
 
