@@ -343,6 +343,19 @@ def discover_markets() -> list[dict]:
                     if event.get("closed") == True:
                         continue
 
+                    # Check if game has ended (endDate in the past)
+                    event_end_str = event.get("endDate") or event.get("endDateIso")
+                    if event_end_str:
+                        try:
+                            if "T" in str(event_end_str):
+                                event_end = datetime.fromisoformat(event_end_str.replace("Z", "+00:00"))
+                                minutes_until_end = (event_end - now).total_seconds() / 60
+                                # Skip if game ended more than 30 min ago (buffer for overtime)
+                                if minutes_until_end < -30:
+                                    continue  # Game is over
+                        except:
+                            pass
+
                     # This is a live/today's event - add all its markets
                     live_events += 1
                     if live_events <= 5:
