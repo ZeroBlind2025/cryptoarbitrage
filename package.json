@@ -3,10 +3,10 @@
   "version": "1.0.0",
   "description": "Research dashboard for Polymarket arbitrage scanner",
   "scripts": {
-    "dev": "python server.py --debug",
-    "start": "python server.py --auto-start",
-    "server": "python server.py",
-    "scanner": "python step_e_integrated_scanner.py --mode scan"
+    "dev": "python3 server.py --debug",
+    "start": "python3 server.py --auto-start",
+    "server": "python3 server.py",
+    "scanner": "python3 step_e_integrated_scanner.py --mode scan"
   },
   "dependencies": {
     "react": "^18.2.0",
