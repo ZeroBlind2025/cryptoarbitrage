@@ -549,11 +549,11 @@ class HFTClient:
         market_slug: str,
         token_a_id: str,
         token_b_id: str,
-        threshold: float = 0.97,
+        threshold: float = 1.0,
     ) -> Optional[ArbOpportunity]:
         """
         Legacy method: Check for sum-to-one arbitrage opportunity.
-        Returns opportunity if price_sum < threshold.
+        Returns opportunity if price_sum < threshold (< $1.00 = profit).
 
         For multi-engine support, use check_market() instead.
         """

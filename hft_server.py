@@ -170,18 +170,18 @@ def discover_markets() -> list[dict]:
     """
     Discover target markets for HFT monitoring.
 
-    Uses Gamma API tag filtering:
-    - tag_id=21: Crypto markets (filter for 15-min windows)
-    - tag_id=100639: Sports markets (filter for live games)
+    - Crypto 15-min: Search for btc/eth/sol/xrp-updown-15m-{timestamp} markets
+    - Sports live: tag_id=100639 filtered for games ending soon
     """
     import requests
     from datetime import datetime, timezone
+    import time as time_module
 
     GAMMA_API = "https://gamma-api.polymarket.com"
-
-    # Tag IDs from Polymarket API
-    CRYPTO_TAG_ID = 21
     SPORTS_TAG_ID = 100639
+
+    # 15-minute market cryptos
+    CRYPTO_SYMBOLS = ["btc", "eth", "sol", "xrp"]
 
     markets = []
     crypto_found = 0
@@ -189,69 +189,100 @@ def discover_markets() -> list[dict]:
 
     try:
         now = datetime.now(timezone.utc)
+        current_ts = int(now.timestamp())
 
         # ============================================================
         # FETCH CRYPTO 15-MIN MARKETS
         # ============================================================
-        print("[HFT] Fetching crypto markets (tag_id=21)...", flush=True)
+        print("[HFT] Searching for 15-min crypto markets...", flush=True)
 
+        # Generate timestamps for current and upcoming 15-min windows
+        # Round down to nearest 15 minutes
+        base_ts = (current_ts // 900) * 900  # 900 seconds = 15 minutes
+
+        # Try multiple time offsets to catch active markets
+        timestamps_to_try = [
+            base_ts,          # Current window
+            base_ts + 900,    # Next window
+            base_ts + 1800,   # +30 min
+            base_ts - 900,    # Previous (might still be active)
+        ]
+
+        # Search for each crypto symbol
+        for symbol in CRYPTO_SYMBOLS:
+            for ts in timestamps_to_try:
+                slug_pattern = f"{symbol}-updown-15m-{ts}"
+
+                try:
+                    resp = requests.get(
+                        f"{GAMMA_API}/markets",
+                        params={
+                            "slug": slug_pattern,
+                            "active": "true",
+                            "closed": "false",
+                        },
+                        timeout=10
+                    )
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        if isinstance(data, list) and data:
+                            for raw in data:
+                                market_data = parse_market_data(raw)
+                                if market_data:
+                                    # Calculate minutes until resolution
+                                    end_ts = ts + 900  # 15 min after start
+                                    minutes_until = (end_ts - current_ts) / 60
+                                    if minutes_until > 0:
+                                        market_data["category"] = "crypto"
+                                        market_data["minutes_until"] = minutes_until
+                                        markets.append(market_data)
+                                        crypto_found += 1
+                                        print(f"[HFT] Found crypto: {slug_pattern} ({minutes_until:.1f}m)", flush=True)
+                except:
+                    pass
+
+                # Small delay to avoid rate limiting
+                time_module.sleep(0.05)
+
+        # Also try a general search for "updown-15m" patterns
         try:
             resp = requests.get(
                 f"{GAMMA_API}/markets",
                 params={
-                    "tag_id": CRYPTO_TAG_ID,
                     "active": "true",
                     "closed": "false",
-                    "limit": 200,
+                    "limit": 100,
                 },
                 timeout=30
             )
-            resp.raise_for_status()
-            crypto_markets = resp.json()
-            print(f"[HFT] Fetched {len(crypto_markets)} crypto markets", flush=True)
-
-            # Debug: show first few slugs
-            for i, m in enumerate(crypto_markets[:5]):
-                slug = m.get("slug", "")[:60]
-                print(f"[DEBUG] Crypto #{i+1}: {slug}", flush=True)
-
-            # Filter for 15-min window markets (look for patterns like "15m", "15-min", short resolution)
-            for raw in crypto_markets:
-                slug = raw.get("slug", "")
-                question = raw.get("question", "")
-                combined = (slug + " " + question).lower()
-
-                # Check for 15-minute market patterns
-                is_15min_market = any(pat in combined for pat in ["15m", "15-min", "15 min", "15-minute"])
-
-                # Also check resolution time
-                end_date_str = raw.get("endDate") or raw.get("endDateIso")
-                minutes_until = None
-                if end_date_str:
-                    try:
-                        if "T" in str(end_date_str):
-                            end_date = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
-                        else:
-                            end_date = datetime.strptime(end_date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-                        minutes_until = (end_date - now).total_seconds() / 60
-                    except:
-                        pass
-
-                # Accept if it's a 15-min market OR resolves soon (within 60 min)
-                is_short_term = minutes_until is not None and 0 < minutes_until <= 60
-
-                if is_15min_market or is_short_term:
-                    market_data = parse_market_data(raw)
-                    if market_data:
-                        market_data["category"] = "crypto"
-                        market_data["minutes_until"] = minutes_until
-                        markets.append(market_data)
-                        crypto_found += 1
-                        if crypto_found <= 3:
-                            print(f"[HFT] Added crypto: {slug[:50]}... mins={minutes_until}", flush=True)
-
+            if resp.status_code == 200:
+                all_markets = resp.json()
+                for raw in all_markets:
+                    slug = raw.get("slug", "")
+                    if "updown-15m" in slug.lower() or "-15m-" in slug.lower():
+                        # Check if we already have this market
+                        if not any(m["slug"] == slug for m in markets):
+                            market_data = parse_market_data(raw)
+                            if market_data:
+                                end_date_str = raw.get("endDate") or raw.get("endDateIso")
+                                minutes_until = None
+                                if end_date_str:
+                                    try:
+                                        if "T" in str(end_date_str):
+                                            end_date = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
+                                            minutes_until = (end_date - now).total_seconds() / 60
+                                    except:
+                                        pass
+                                if minutes_until and 0 < minutes_until <= 20:
+                                    market_data["category"] = "crypto"
+                                    market_data["minutes_until"] = minutes_until
+                                    markets.append(market_data)
+                                    crypto_found += 1
+                                    print(f"[HFT] Found crypto (scan): {slug[:40]}... ({minutes_until:.1f}m)", flush=True)
         except Exception as e:
-            print(f"[HFT] Error fetching crypto: {e}", flush=True)
+            print(f"[HFT] General scan error: {e}", flush=True)
+
+        print(f"[HFT] Crypto 15m markets found: {crypto_found}", flush=True)
 
         # ============================================================
         # FETCH LIVE SPORTS MARKETS
@@ -383,10 +414,10 @@ def start_hft_scanner(
 
     print(f"[HFT] Found {len(active_markets)} markets to monitor")
 
-    # Configure engines
+    # Configure engines - execute on ANY price_sum < $1.00
     sum_to_one_config = SumToOneConfig(
-        max_price_sum=0.97,
-        min_edge_after_fees=0.005,
+        max_price_sum=1.0,        # Execute if total < $1.00
+        min_edge_after_fees=0.0,  # No minimum edge required
         max_position_usd=100.0,
     )
 
