@@ -192,6 +192,8 @@ def discover_markets() -> list[dict]:
     markets = []
     crypto_found = 0
     sports_found = 0
+    crypto_keyword_matches = 0
+    sports_keyword_matches = 0
 
     try:
         print("[HFT] Fetching markets from Gamma API...", flush=True)
@@ -261,9 +263,24 @@ def discover_markets() -> list[dict]:
                 except:
                     pass
 
-            # Check for crypto 15-min markets
+            # Check for crypto keywords (regardless of timing for debug)
             is_crypto = any(kw in combined for kw in CRYPTO_KEYWORDS)
-            is_15min = minutes_until is not None and 0 < minutes_until <= 20
+            is_sports = any(kw in combined for kw in SPORTS_KEYWORDS)
+
+            # Debug: track keyword matches
+            if is_crypto:
+                crypto_keyword_matches += 1
+                if crypto_keyword_matches <= 3:
+                    print(f"[DEBUG] Crypto keyword match: {slug[:60]}... mins={minutes_until}", flush=True)
+
+            if is_sports:
+                sports_keyword_matches += 1
+                if sports_keyword_matches <= 3:
+                    print(f"[DEBUG] Sports keyword match: {slug[:60]}... mins={minutes_until}", flush=True)
+
+            # Check for crypto 15-min markets
+            # Relaxed: check if crypto market resolves within 60 mins (not just 20)
+            is_15min = minutes_until is not None and 0 < minutes_until <= 60
 
             if is_crypto and is_15min:
                 try:
@@ -282,9 +299,9 @@ def discover_markets() -> list[dict]:
                     pass
                 continue
 
-            # Check for live sports markets (2-6 hours until resolution)
-            is_sports = any(kw in combined for kw in SPORTS_KEYWORDS)
-            is_live = minutes_until is not None and 30 < minutes_until <= 360  # 30 min to 6 hours
+            # Check for live sports markets - relaxed window
+            # 30 min to 12 hours (720 min) to catch more live games
+            is_live = minutes_until is not None and 30 < minutes_until <= 720
 
             if is_sports and is_live:
                 try:
@@ -302,7 +319,8 @@ def discover_markets() -> list[dict]:
                 except (ValueError, TypeError):
                     pass
 
-        print(f"[HFT] Found {crypto_found} crypto 15-min markets, {sports_found} live sports markets", flush=True)
+        print(f"[HFT] Keyword matches: {crypto_keyword_matches} crypto, {sports_keyword_matches} sports", flush=True)
+        print(f"[HFT] Passed time filter: {crypto_found} crypto, {sports_found} sports", flush=True)
         print(f"[HFT] Total markets to monitor: {len(markets)}", flush=True)
 
         return markets
