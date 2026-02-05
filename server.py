@@ -53,10 +53,18 @@ except ImportError as e:
 app = Flask(__name__, static_folder='static', template_folder='templates')
 CORS(app)
 
+@app.errorhandler(404)
+def handle_not_found(e):
+    """Return 404 for missing resources"""
+    return jsonify({"error": "Not found"}), 404
+
 @app.errorhandler(Exception)
 def handle_exception(e):
     """Log all errors for debugging"""
     import traceback
+    from werkzeug.exceptions import NotFound
+    if isinstance(e, NotFound):
+        return jsonify({"error": "Not found"}), 404
     print(f"ERROR: {type(e).__name__}: {e}")
     traceback.print_exc()
     return jsonify({"error": str(e), "type": type(e).__name__}), 500
