@@ -1,0 +1,699 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HFT Arbitrage Dashboard</title>
+    <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+    <script src="https://unpkg.com/prop-types@15/prop-types.min.js" crossorigin></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://unpkg.com/recharts@2.1.16/umd/Recharts.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { background-color: #0f172a; }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+        .animate-pulse { animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite; }
+        @keyframes flash { 0% { background-color: rgba(34, 197, 94, 0.3); } 100% { background-color: transparent; } }
+        .flash-green { animation: flash 1s ease-out; }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useCallback } = React;
+        const { LineChart, Line, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, AreaChart, Area } = Recharts;
+
+        // Icons
+        const Zap = () => <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><polygon points="13,2 3,14 12,14 11,22 21,10 12,10 13,2"/></svg>;
+        const Activity = () => <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><polyline points="22,12 18,12 15,21 9,3 6,12 2,12"/></svg>;
+        const DollarSign = () => <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><line x1="12" y1="1" x2="12" y2="23"/><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg>;
+        const Clock = () => <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12,6 12,12 16,14"/></svg>;
+        const TrendingUp = () => <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><polyline points="23,6 13.5,15.5 8.5,10.5 1,18"/><polyline points="17,6 23,6 23,12"/></svg>;
+        const Target = () => <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></svg>;
+        const Play = () => <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><polygon points="5,3 19,12 5,21 5,3"/></svg>;
+        const Square = () => <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/></svg>;
+        const CheckCircle = () => <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22,4 12,14.01 9,11.01"/></svg>;
+        const XCircle = () => <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>;
+
+        // Status Badge
+        const StatusBadge = ({ status }) => {
+            const colors = {
+                filled: 'bg-green-500/20 text-green-400 border-green-500/30',
+                pending: 'bg-yellow-500/20 text-yellow-400 border-yellow-500/30',
+                rejected: 'bg-red-500/20 text-red-400 border-red-500/30',
+                failed: 'bg-red-500/20 text-red-400 border-red-500/30',
+            };
+            return (
+                <span className={`px-2 py-0.5 text-xs rounded border ${colors[status] || colors.pending}`}>
+                    {status}
+                </span>
+            );
+        };
+
+        // Mode Badge
+        const ModeBadge = ({ mode }) => (
+            <span className={`px-2 py-0.5 text-xs rounded font-medium ${
+                mode === 'live'
+                    ? 'bg-red-500/20 text-red-400 border border-red-500/30'
+                    : 'bg-blue-500/20 text-blue-400 border border-blue-500/30'
+            }`}>
+                {mode.toUpperCase()}
+            </span>
+        );
+
+        // Stat Card
+        const StatCard = ({ icon: Icon, label, value, subValue, color = 'blue', trend }) => (
+            <div className="bg-slate-800/50 backdrop-blur rounded-xl p-4 border border-slate-700/50">
+                <div className="flex items-center justify-between mb-2">
+                    <div className={`p-2 rounded-lg bg-${color}-500/20 text-${color}-400`}>
+                        <Icon />
+                    </div>
+                    {trend !== undefined && (
+                        <span className={`text-xs font-medium ${trend >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                            {trend >= 0 ? '+' : ''}{trend.toFixed(2)}%
+                        </span>
+                    )}
+                </div>
+                <p className="text-2xl font-bold text-white font-mono">{value}</p>
+                <p className="text-sm text-slate-400">{label}</p>
+                {subValue && <p className="text-xs text-slate-500 mt-1">{subValue}</p>}
+            </div>
+        );
+
+        // Engine Badge
+        const EngineBadge = ({ engine }) => {
+            const colors = {
+                sum_to_one: 'bg-purple-500/20 text-purple-400 border-purple-500/30',
+                tail_end: 'bg-orange-500/20 text-orange-400 border-orange-500/30',
+            };
+            const labels = {
+                sum_to_one: 'S2O',
+                tail_end: 'TAIL',
+            };
+            return (
+                <span className={`px-2 py-0.5 text-xs rounded border font-medium ${colors[engine] || colors.sum_to_one}`}>
+                    {labels[engine] || engine}
+                </span>
+            );
+        };
+
+        // Trade Row
+        const TradeRow = ({ trade, isNew }) => {
+            const time = new Date(trade.timestamp).toLocaleTimeString();
+            const edge = (trade.expected_edge * 100).toFixed(2);
+            const latency = (trade.total_latency_us / 1000).toFixed(1);
+
+            return (
+                <div className={`bg-slate-800/30 rounded-lg p-3 border border-slate-700/50 hover:border-slate-600/50 transition-all ${isNew ? 'flash-green' : ''}`}>
+                    <div className="flex items-center justify-between mb-2">
+                        <div className="flex items-center gap-2">
+                            <EngineBadge engine={trade.engine} />
+                            <ModeBadge mode={trade.mode} />
+                            <StatusBadge status={trade.status} />
+                        </div>
+                        <span className="text-xs text-slate-500">{time}</span>
+                    </div>
+                    <p className="text-sm text-white truncate mb-2" title={trade.market_slug}>
+                        {trade.market_slug}
+                    </p>
+                    <div className="grid grid-cols-5 gap-2 text-xs">
+                        <div>
+                            <p className="text-slate-500">Type</p>
+                            <p className="text-white font-mono">{trade.trade_type?.replace('_', ' ') || 'buy both'}</p>
+                        </div>
+                        <div>
+                            <p className="text-slate-500">Cost</p>
+                            <p className="text-white font-mono">${trade.total_cost.toFixed(2)}</p>
+                        </div>
+                        <div>
+                            <p className="text-slate-500">{trade.engine === 'tail_end' ? 'Prob' : 'Edge'}</p>
+                            <p className="text-green-400 font-mono">
+                                {trade.engine === 'tail_end' && trade.target_probability
+                                    ? `${(trade.target_probability * 100).toFixed(1)}%`
+                                    : `${edge}%`
+                                }
+                            </p>
+                        </div>
+                        <div>
+                            <p className="text-slate-500">Latency</p>
+                            <p className="text-cyan-400 font-mono">{latency}ms</p>
+                        </div>
+                        <div>
+                            <p className="text-slate-500">PnL</p>
+                            {trade.resolved ? (
+                                <p className={`font-mono ${(trade.pnl || 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                                    {(trade.pnl || 0) >= 0 ? '+' : ''}${(trade.pnl || 0).toFixed(2)}
+                                </p>
+                            ) : (
+                                <p className="text-slate-500 font-mono">-</p>
+                            )}
+                        </div>
+                    </div>
+                </div>
+            );
+        };
+
+        // Latency Chart
+        const LatencyDisplay = ({ latency }) => {
+            if (!latency || !latency.count) {
+                return (
+                    <div className="text-slate-500 text-center py-8">
+                        No latency data yet
+                    </div>
+                );
+            }
+
+            return (
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                    <div className="bg-slate-700/30 rounded-lg p-3 text-center">
+                        <p className="text-2xl font-bold text-cyan-400 font-mono">{latency.avg_ms.toFixed(1)}</p>
+                        <p className="text-xs text-slate-400">Avg (ms)</p>
+                    </div>
+                    <div className="bg-slate-700/30 rounded-lg p-3 text-center">
+                        <p className="text-2xl font-bold text-green-400 font-mono">{(latency.min_us / 1000).toFixed(1)}</p>
+                        <p className="text-xs text-slate-400">Min (ms)</p>
+                    </div>
+                    <div className="bg-slate-700/30 rounded-lg p-3 text-center">
+                        <p className="text-2xl font-bold text-yellow-400 font-mono">{latency.p99_ms.toFixed(1)}</p>
+                        <p className="text-xs text-slate-400">P99 (ms)</p>
+                    </div>
+                    <div className="bg-slate-700/30 rounded-lg p-3 text-center">
+                        <p className="text-2xl font-bold text-red-400 font-mono">{(latency.max_us / 1000).toFixed(1)}</p>
+                        <p className="text-xs text-slate-400">Max (ms)</p>
+                    </div>
+                </div>
+            );
+        };
+
+        // Engine Toggle Card
+        const EngineToggle = ({ name, label, description, enabled, stats, onToggle, isRunning }) => {
+            const colors = {
+                sum_to_one: { active: 'border-purple-500/50 bg-purple-500/10', text: 'text-purple-400' },
+                tail_end: { active: 'border-orange-500/50 bg-orange-500/10', text: 'text-orange-400' },
+            };
+            const color = colors[name] || colors.sum_to_one;
+
+            return (
+                <div className={`rounded-xl p-4 border transition-all ${
+                    enabled ? color.active : 'border-slate-700/50 bg-slate-800/30'
+                }`}>
+                    <div className="flex items-center justify-between mb-2">
+                        <div>
+                            <h3 className={`font-semibold ${enabled ? color.text : 'text-slate-400'}`}>
+                                {label}
+                            </h3>
+                            <p className="text-xs text-slate-500">{description}</p>
+                        </div>
+                        <button
+                            onClick={() => onToggle(name)}
+                            disabled={!isRunning}
+                            className={`relative w-12 h-6 rounded-full transition-colors ${
+                                enabled ? 'bg-green-500' : 'bg-slate-600'
+                            } ${!isRunning ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'}`}
+                        >
+                            <div className={`absolute top-1 w-4 h-4 rounded-full bg-white transition-transform ${
+                                enabled ? 'translate-x-7' : 'translate-x-1'
+                            }`} />
+                        </button>
+                    </div>
+                    <div className="grid grid-cols-2 gap-2 mt-3 text-xs">
+                        <div>
+                            <p className="text-slate-500">Signals</p>
+                            <p className="text-white font-mono">{stats?.signals || 0}</p>
+                        </div>
+                        {name === 'tail_end' && (
+                            <div>
+                                <p className="text-slate-500">Avg Prob</p>
+                                <p className="text-white font-mono">
+                                    {stats?.avg_probability ? `${(stats.avg_probability * 100).toFixed(1)}%` : '-'}
+                                </p>
+                            </div>
+                        )}
+                        {name === 'sum_to_one' && (
+                            <div>
+                                <p className="text-slate-500">Status</p>
+                                <p className={`font-mono ${enabled ? 'text-green-400' : 'text-slate-500'}`}>
+                                    {enabled ? 'Active' : 'Paused'}
+                                </p>
+                            </div>
+                        )}
+                    </div>
+                </div>
+            );
+        };
+
+        // PnL Summary
+        const PnLSummary = ({ pnl, mode, tradesByEngine }) => {
+            const data = pnl[mode] || {};
+            const engineData = tradesByEngine?.[mode] || {};
+            const totalPnl = data.total_pnl || 0;
+            const balance = data.balance || 10000;
+            const roi = data.total_cost > 0 ? (totalPnl / data.total_cost * 100) : 0;
+
+            return (
+                <div className="space-y-3">
+                    <div className="flex justify-between items-center">
+                        <span className="text-slate-400">Filled Trades</span>
+                        <span className="text-white font-mono">{data.filled || 0}</span>
+                    </div>
+                    <div className="flex justify-between items-center text-xs">
+                        <span className="text-slate-500 pl-2">Sum-to-One</span>
+                        <span className="text-purple-400 font-mono">{engineData.sum_to_one || 0}</span>
+                    </div>
+                    <div className="flex justify-between items-center text-xs">
+                        <span className="text-slate-500 pl-2">Tail-End</span>
+                        <span className="text-orange-400 font-mono">{engineData.tail_end || 0}</span>
+                    </div>
+                    <div className="flex justify-between items-center">
+                        <span className="text-slate-400">Resolved</span>
+                        <span className="text-white font-mono">{data.resolved || 0}</span>
+                    </div>
+                    <div className="flex justify-between items-center">
+                        <span className="text-slate-400">Total Cost</span>
+                        <span className="text-white font-mono">${(data.total_cost || 0).toFixed(2)}</span>
+                    </div>
+                    <div className="border-t border-slate-700 pt-3">
+                        <div className="flex justify-between items-center">
+                            <span className="text-slate-400">Total PnL</span>
+                            <span className={`font-mono font-bold ${totalPnl >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                                {totalPnl >= 0 ? '+' : ''}${totalPnl.toFixed(2)}
+                            </span>
+                        </div>
+                    </div>
+                    {mode === 'demo' && (
+                        <div className="flex justify-between items-center">
+                            <span className="text-slate-400">Balance</span>
+                            <span className="text-white font-mono">${balance.toFixed(2)}</span>
+                        </div>
+                    )}
+                    <div className="flex justify-between items-center">
+                        <span className="text-slate-400">ROI</span>
+                        <span className={`font-mono ${roi >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                            {roi >= 0 ? '+' : ''}{roi.toFixed(2)}%
+                        </span>
+                    </div>
+                </div>
+            );
+        };
+
+        // Main Dashboard
+        function HFTDashboard() {
+            const [data, setData] = useState(null);
+            const [selectedMode, setSelectedMode] = useState('demo');
+            const [isRunning, setIsRunning] = useState(false);
+            const [error, setError] = useState(null);
+            const [newTradeIds, setNewTradeIds] = useState(new Set());
+
+            // Fetch data
+            const fetchData = useCallback(async () => {
+                try {
+                    const response = await fetch('/api/data');
+                    const newData = await response.json();
+
+                    // Track new trades for animation
+                    if (data) {
+                        const oldIds = new Set([
+                            ...(data.trades?.demo || []).map(t => t.trade_id),
+                            ...(data.trades?.live || []).map(t => t.trade_id),
+                        ]);
+                        const currentIds = [
+                            ...(newData.trades?.demo || []).map(t => t.trade_id),
+                            ...(newData.trades?.live || []).map(t => t.trade_id),
+                        ];
+                        const newIds = currentIds.filter(id => !oldIds.has(id));
+                        if (newIds.length > 0) {
+                            setNewTradeIds(new Set(newIds));
+                            setTimeout(() => setNewTradeIds(new Set()), 1000);
+                        }
+                    }
+
+                    setData(newData);
+                    setIsRunning(newData.status?.is_running || false);
+                    setError(null);
+                } catch (err) {
+                    setError('Failed to fetch data');
+                }
+            }, [data]);
+
+            useEffect(() => {
+                fetchData();
+                const interval = setInterval(fetchData, 1000);
+                return () => clearInterval(interval);
+            }, []);
+
+            // Engine state for starting
+            const [enableSumToOne, setEnableSumToOne] = useState(true);
+            const [enableTailEnd, setEnableTailEnd] = useState(true);
+
+            // Start/Stop scanner
+            const toggleScanner = async () => {
+                try {
+                    const endpoint = isRunning ? '/api/stop' : '/api/start';
+                    const body = isRunning ? {} : {
+                        mode: selectedMode,
+                        enable_sum_to_one: enableSumToOne,
+                        enable_tail_end: enableTailEnd,
+                    };
+
+                    if (!isRunning && selectedMode === 'live') {
+                        const confirm = window.confirm(
+                            'WARNING: Live mode will execute REAL trades with REAL money.\n\n' +
+                            'Are you sure you want to continue?'
+                        );
+                        if (!confirm) return;
+                        body.confirm_live = true;
+                    }
+
+                    const response = await fetch(endpoint, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(body),
+                    });
+
+                    const result = await response.json();
+                    if (result.success) {
+                        setIsRunning(!isRunning);
+                    } else {
+                        setError(result.error || 'Operation failed');
+                    }
+                } catch (err) {
+                    setError('Failed to toggle scanner');
+                }
+            };
+
+            const status = data?.status || {};
+            const scanner = data?.scanner || {};
+            const latency = data?.latency || {};
+            const pnl = data?.pnl || { demo: {}, live: {} };
+            const trades = data?.trades || { demo: [], live: [] };
+            const engines = data?.engines || { sum_to_one: {}, tail_end: {} };
+            const tradesByEngine = data?.trades_by_engine || { demo: {}, live: {} };
+            const allTrades = [...(trades.demo || []), ...(trades.live || [])]
+                .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+
+            // Toggle engine
+            const toggleEngine = async (engineName) => {
+                try {
+                    const response = await fetch('/api/engines/toggle', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ engine: engineName }),
+                    });
+                    const result = await response.json();
+                    if (!result.error) {
+                        fetchData(); // Refresh data
+                    }
+                } catch (err) {
+                    setError('Failed to toggle engine');
+                }
+            };
+
+            return (
+                <div className="min-h-screen bg-slate-900 text-white p-4 md:p-6">
+                    {/* Header */}
+                    <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 mb-6">
+                        <div>
+                            <h1 className="text-2xl md:text-3xl font-bold bg-gradient-to-r from-cyan-400 to-blue-500 bg-clip-text text-transparent">
+                                HFT Arbitrage Dashboard
+                            </h1>
+                            <p className="text-slate-400 text-sm mt-1">
+                                High-frequency trading on Polygon CLOB
+                            </p>
+                        </div>
+
+                        <div className="flex items-center gap-3">
+                            {error && (
+                                <span className="text-red-400 text-sm">{error}</span>
+                            )}
+
+                            {/* Mode selector */}
+                            <div className="flex rounded-lg overflow-hidden border border-slate-700">
+                                <button
+                                    onClick={() => !isRunning && setSelectedMode('demo')}
+                                    disabled={isRunning}
+                                    className={`px-4 py-2 text-sm font-medium transition-colors ${
+                                        selectedMode === 'demo'
+                                            ? 'bg-blue-500/20 text-blue-400'
+                                            : 'bg-slate-800 text-slate-400 hover:bg-slate-700'
+                                    } ${isRunning ? 'opacity-50 cursor-not-allowed' : ''}`}
+                                >
+                                    Demo
+                                </button>
+                                <button
+                                    onClick={() => !isRunning && setSelectedMode('live')}
+                                    disabled={isRunning}
+                                    className={`px-4 py-2 text-sm font-medium transition-colors ${
+                                        selectedMode === 'live'
+                                            ? 'bg-red-500/20 text-red-400'
+                                            : 'bg-slate-800 text-slate-400 hover:bg-slate-700'
+                                    } ${isRunning ? 'opacity-50 cursor-not-allowed' : ''}`}
+                                >
+                                    Live
+                                </button>
+                            </div>
+
+                            {/* Start/Stop button */}
+                            <button
+                                onClick={toggleScanner}
+                                className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-all ${
+                                    isRunning
+                                        ? 'bg-red-500/20 text-red-400 hover:bg-red-500/30 border border-red-500/30'
+                                        : 'bg-green-500/20 text-green-400 hover:bg-green-500/30 border border-green-500/30'
+                                }`}
+                            >
+                                {isRunning ? <Square /> : <Play />}
+                                {isRunning ? 'Stop' : 'Start'}
+                            </button>
+
+                            {/* Status indicator */}
+                            <div className={`flex items-center gap-2 px-3 py-2 rounded-lg ${
+                                isRunning ? 'bg-green-500/10 border border-green-500/30' : 'bg-slate-800 border border-slate-700'
+                            }`}>
+                                <div className={`w-2 h-2 rounded-full ${
+                                    isRunning ? 'bg-green-400 animate-pulse' : 'bg-slate-500'
+                                }`} />
+                                <span className="text-sm">
+                                    {isRunning ? `${status.mode?.toUpperCase()}` : 'Stopped'}
+                                </span>
+                            </div>
+                        </div>
+                    </div>
+
+                    {/* Stats Row */}
+                    <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-4 mb-6">
+                        <StatCard
+                            icon={Target}
+                            label="Markets"
+                            value={scanner.markets_monitored || 0}
+                            subValue="Monitored"
+                            color="purple"
+                        />
+                        <StatCard
+                            icon={Activity}
+                            label="Scans"
+                            value={scanner.scans_completed?.toLocaleString() || 0}
+                            subValue="Completed"
+                            color="blue"
+                        />
+                        <StatCard
+                            icon={Zap}
+                            label="Signals"
+                            value={scanner.signals_detected || 0}
+                            subValue="Detected"
+                            color="yellow"
+                        />
+                        <StatCard
+                            icon={CheckCircle}
+                            label="Trades"
+                            value={scanner.trades_executed || 0}
+                            subValue="Executed"
+                            color="green"
+                        />
+                        <StatCard
+                            icon={Clock}
+                            label="Avg Latency"
+                            value={latency.avg_ms ? `${latency.avg_ms.toFixed(1)}ms` : '-'}
+                            subValue="Detection to fill"
+                            color="cyan"
+                        />
+                        <StatCard
+                            icon={DollarSign}
+                            label="Demo Balance"
+                            value={`$${(pnl.demo?.balance || 10000).toFixed(0)}`}
+                            subValue="Paper trading"
+                            color="blue"
+                        />
+                    </div>
+
+                    {/* Engine Controls */}
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
+                        <EngineToggle
+                            name="sum_to_one"
+                            label="Sum-to-One"
+                            description="Buy YES+NO when combined < $1.00 (guaranteed profit)"
+                            enabled={engines.sum_to_one?.enabled ?? true}
+                            stats={engines.sum_to_one}
+                            onToggle={toggleEngine}
+                            isRunning={isRunning}
+                        />
+                        <EngineToggle
+                            name="tail_end"
+                            label="Tail-End"
+                            description="Buy 95-99% outcomes near resolution (directional)"
+                            enabled={engines.tail_end?.enabled ?? true}
+                            stats={engines.tail_end}
+                            onToggle={toggleEngine}
+                            isRunning={isRunning}
+                        />
+                    </div>
+
+                    {/* Main Grid */}
+                    <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                        {/* Left Column - Trades */}
+                        <div className="lg:col-span-2 space-y-6">
+                            {/* Recent Trades */}
+                            <div className="bg-slate-800/50 backdrop-blur rounded-xl border border-slate-700/50 p-4">
+                                <div className="flex items-center justify-between mb-4">
+                                    <h2 className="text-lg font-semibold flex items-center gap-2">
+                                        <span className="text-green-400"><Zap /></span>
+                                        Recent Trades
+                                    </h2>
+                                    <div className="flex gap-2">
+                                        <span className="text-xs text-slate-400">
+                                            {trades.demo?.length || 0} demo / {trades.live?.length || 0} live
+                                        </span>
+                                    </div>
+                                </div>
+
+                                <div className="space-y-3 max-h-[500px] overflow-y-auto">
+                                    {allTrades.length > 0 ? (
+                                        allTrades.slice(0, 20).map((trade) => (
+                                            <TradeRow
+                                                key={trade.trade_id}
+                                                trade={trade}
+                                                isNew={newTradeIds.has(trade.trade_id)}
+                                            />
+                                        ))
+                                    ) : (
+                                        <p className="text-slate-500 text-center py-12">
+                                            No trades yet. Start the scanner to begin.
+                                        </p>
+                                    )}
+                                </div>
+                            </div>
+
+                            {/* Latency Metrics */}
+                            <div className="bg-slate-800/50 backdrop-blur rounded-xl border border-slate-700/50 p-4">
+                                <h2 className="text-lg font-semibold mb-4 flex items-center gap-2">
+                                    <span className="text-cyan-400"><Clock /></span>
+                                    Latency Metrics
+                                </h2>
+                                <LatencyDisplay latency={latency} />
+                                {latency.count > 0 && (
+                                    <p className="text-xs text-slate-500 mt-3 text-center">
+                                        Based on {latency.count} samples
+                                    </p>
+                                )}
+                            </div>
+                        </div>
+
+                        {/* Right Column - PnL & Config */}
+                        <div className="space-y-6">
+                            {/* Demo PnL */}
+                            <div className="bg-slate-800/50 backdrop-blur rounded-xl border border-slate-700/50 p-4">
+                                <h2 className="text-lg font-semibold mb-4 flex items-center gap-2">
+                                    <span className="text-blue-400"><DollarSign /></span>
+                                    Demo PnL
+                                </h2>
+                                <PnLSummary pnl={pnl} mode="demo" tradesByEngine={tradesByEngine} />
+                            </div>
+
+                            {/* Live PnL */}
+                            <div className="bg-slate-800/50 backdrop-blur rounded-xl border border-red-500/30 p-4">
+                                <h2 className="text-lg font-semibold mb-4 flex items-center gap-2">
+                                    <span className="text-red-400"><TrendingUp /></span>
+                                    Live PnL
+                                </h2>
+                                <PnLSummary pnl={pnl} mode="live" tradesByEngine={tradesByEngine} />
+                            </div>
+
+                            {/* Config */}
+                            <div className="bg-slate-800/50 backdrop-blur rounded-xl border border-slate-700/50 p-4">
+                                <h2 className="text-lg font-semibold mb-4">Configuration</h2>
+                                <div className="space-y-2 text-sm">
+                                    <div className="flex justify-between">
+                                        <span className="text-slate-400">Order Type</span>
+                                        <span className="text-white font-mono">FOK</span>
+                                    </div>
+                                    <div className="flex justify-between">
+                                        <span className="text-slate-400">Price Threshold</span>
+                                        <span className="text-white font-mono">$0.970</span>
+                                    </div>
+                                    <div className="flex justify-between">
+                                        <span className="text-slate-400">Max Order</span>
+                                        <span className="text-white font-mono">$100</span>
+                                    </div>
+                                    <div className="flex justify-between">
+                                        <span className="text-slate-400">Max Exposure</span>
+                                        <span className="text-white font-mono">$500</span>
+                                    </div>
+                                    <div className="flex justify-between">
+                                        <span className="text-slate-400">Scan Interval</span>
+                                        <span className="text-white font-mono">500ms</span>
+                                    </div>
+                                    <div className="flex justify-between">
+                                        <span className="text-slate-400">Price Buffer</span>
+                                        <span className="text-white font-mono">10 bps</span>
+                                    </div>
+                                </div>
+                            </div>
+
+                            {/* Active Markets */}
+                            <div className="bg-slate-800/50 backdrop-blur rounded-xl border border-slate-700/50 p-4">
+                                <h2 className="text-lg font-semibold mb-4 flex items-center gap-2">
+                                    <span className="text-purple-400"><Target /></span>
+                                    Active Markets
+                                </h2>
+                                <div className="space-y-2 max-h-[200px] overflow-y-auto">
+                                    {(data?.markets || []).length > 0 ? (
+                                        data.markets.map((market, i) => (
+                                            <div key={i} className="bg-slate-700/30 rounded-lg p-2">
+                                                <p className="text-sm text-white truncate" title={market.slug}>
+                                                    {market.slug}
+                                                </p>
+                                                <div className="flex justify-between text-xs text-slate-400 mt-1">
+                                                    <span>Sum: ${market.price_sum_indicative?.toFixed(3) || '-'}</span>
+                                                    <span>{market.minutes_until || '-'}m</span>
+                                                </div>
+                                            </div>
+                                        ))
+                                    ) : (
+                                        <p className="text-slate-500 text-center py-4">
+                                            Start scanner to discover markets
+                                        </p>
+                                    )}
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    {/* Footer */}
+                    <div className="mt-8 text-center text-xs text-slate-500">
+                        <p>HFT Arbitrage System - Sum-to-One &amp; Tail-End Engines</p>
+                        <p className="mt-1">
+                            <span className="text-purple-400">S2O</span>: Guaranteed profit (YES+NO &lt; $1) |
+                            <span className="text-orange-400 ml-1">TAIL</span>: Directional (95-99% near resolution)
+                        </p>
+                        <p className="mt-1">Demo mode uses paper trading. Live mode executes real trades.</p>
+                    </div>
+                </div>
+            );
+        }
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<HFTDashboard />);
+    </script>
+</body>
+</html>
