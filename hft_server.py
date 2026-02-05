@@ -49,7 +49,8 @@ from arb_engines import (
     SumToOneConfig,
     TailEndConfig,
 )
-from step_c_scanner_v4 import ScanConfig as GammaConfig, MarketScanner as GammaScanner
+# Note: Using direct API calls for market discovery instead of GammaScanner
+# to be more targeted (only crypto 15-min and live sports markets)
 
 
 # =============================================================================
@@ -69,7 +70,6 @@ server_state = {
 # HFT components
 hft_client: Optional[HFTClient] = None
 hft_scanner: Optional[HFTScanner] = None
-gamma_scanner: Optional[GammaScanner] = None
 
 # Trade tracking (shared between demo and live)
 demo_trades: deque[Trade] = deque(maxlen=500)
@@ -168,78 +168,148 @@ def detect_market_category(slug: str, question: str) -> str:
 
 def discover_markets() -> list[dict]:
     """
-    Use Gamma scanner to discover active markets,
-    then extract token IDs for HFT monitoring.
-    """
-    global gamma_scanner
+    Discover target markets for HFT monitoring.
 
-    if gamma_scanner is None:
-        # Use very relaxed config to discover ALL active markets
-        # The engines will handle category filtering (crypto/sports/etc.)
-        config = GammaConfig(
-            max_resolution_hours=8760,  # 1 year - get all markets
-            min_resolution_hours=0,     # No minimum
-            min_volume_24h=0.0,         # No volume filter - get everything
-            fee_buffer=0.0,             # No fee buffer
-            slippage_buffer=0.0,        # No slippage buffer
-            risk_buffer=0.0,            # No risk buffer - threshold will be 1.0
-        )
-        gamma_scanner = GammaScanner(config)
+    Focus on:
+    1. Crypto 15-min markets: BTC, ETH, XRP, SOL price windows (resolve in ~15 min)
+    2. Live sports markets: Games in progress (resolve in 2-6 hours)
+    """
+    import requests
+    from datetime import datetime, timezone
+
+    GAMMA_API = "https://gamma-api.polymarket.com"
+
+    # Crypto keywords for 15-min price markets
+    CRYPTO_KEYWORDS = ["btc", "bitcoin", "eth", "ethereum", "xrp", "ripple", "sol", "solana"]
+
+    # Sports keywords for live games
+    SPORTS_KEYWORDS = [
+        "nba", "nfl", "mlb", "nhl", "soccer", "football", "basketball", "baseball",
+        "hockey", "tennis", "golf", "ufc", "mma", "boxing", "f1", "formula 1",
+        "game", "match", "vs", "playoff", "championship"
+    ]
+
+    markets = []
+    crypto_found = 0
+    sports_found = 0
 
     try:
-        print("[HFT] Calling Gamma API...", flush=True)
-        result = gamma_scanner.scan()
-        print(f"[HFT] Gamma returned {len(result.targets)} targets", flush=True)
+        print("[HFT] Fetching markets from Gamma API...", flush=True)
 
-        # Debug: show funnel stats to understand where markets are filtered
-        funnel = result.funnel
-        print(f"[HFT] Funnel: fetched={funnel.total_fetched}, active={funnel.passed_active}, "
-              f"binary={funnel.passed_binary}, priced={funnel.passed_priced}, "
-              f"window={funnel.passed_window}, volume={funnel.passed_volume}, "
-              f"threshold={funnel.passed_threshold}", flush=True)
-        print(f"[HFT] Exclusions: inactive={funnel.excluded_inactive}, "
-              f"not_binary={funnel.excluded_not_binary}, no_prices={funnel.excluded_missing_prices}, "
-              f"window={funnel.excluded_outside_window}, volume={funnel.excluded_low_volume}, "
-              f"above_thresh={funnel.excluded_above_threshold}", flush=True)
+        # Fetch active markets (limit to 500 to be efficient)
+        resp = requests.get(
+            f"{GAMMA_API}/markets",
+            params={"limit": 500, "active": "true", "closed": "false"},
+            timeout=30
+        )
+        resp.raise_for_status()
+        raw_markets = resp.json()
 
-        markets = []
-        skipped_no_tokens = 0
-        for target in result.targets:
-            token_a_id = target.get("token_a_id")
-            token_b_id = target.get("token_b_id")
+        print(f"[HFT] Fetched {len(raw_markets)} markets from API", flush=True)
 
-            if token_a_id and token_b_id:
-                slug = target.get("slug", "")
-                question = target.get("question", "")
-                category = detect_market_category(slug, question)
+        now = datetime.now(timezone.utc)
 
-                markets.append({
-                    "slug": slug,
-                    "question": question,
-                    "token_a_id": token_a_id,
-                    "token_b_id": token_b_id,
-                    "price_sum_indicative": target.get("price_sum_indicative"),
-                    "minutes_until": target.get("minutes_until"),
-                    "volume_24h": target.get("volume_24h"),
-                    "category": category,
-                })
+        for raw in raw_markets:
+            slug = raw.get("slug", "")
+            question = raw.get("question", "")
+            combined = (slug + " " + question).lower()
+
+            # Parse token IDs and prices
+            clob_ids_raw = raw.get("clobTokenIds", "[]")
+            prices_raw = raw.get("outcomePrices", "[]")
+            outcomes_raw = raw.get("outcomes", "[]")
+
+            # Handle JSON strings
+            if isinstance(clob_ids_raw, str):
+                try:
+                    clob_ids = json.loads(clob_ids_raw)
+                except:
+                    continue
             else:
-                skipped_no_tokens += 1
+                clob_ids = clob_ids_raw or []
 
-        print(f"[HFT] Markets with token IDs: {len(markets)}, skipped (no tokens): {skipped_no_tokens}", flush=True)
+            if isinstance(prices_raw, str):
+                try:
+                    prices = json.loads(prices_raw)
+                except:
+                    continue
+            else:
+                prices = prices_raw or []
 
-        # Log category breakdown
-        categories = {}
-        for m in markets:
-            cat = m.get("category", "unknown")
-            categories[cat] = categories.get(cat, 0) + 1
-        print(f"[HFT] Category breakdown: {categories}", flush=True)
+            if isinstance(outcomes_raw, str):
+                try:
+                    outcomes = json.loads(outcomes_raw)
+                except:
+                    outcomes = ["Yes", "No"]
+            else:
+                outcomes = outcomes_raw or ["Yes", "No"]
+
+            # Need exactly 2 outcomes with token IDs
+            if len(clob_ids) != 2 or len(prices) != 2:
+                continue
+
+            # Parse end date for resolution timing
+            end_date_str = raw.get("endDate") or raw.get("endDateIso")
+            minutes_until = None
+            if end_date_str:
+                try:
+                    if "T" in str(end_date_str):
+                        end_date = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
+                    else:
+                        end_date = datetime.strptime(end_date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                    minutes_until = (end_date - now).total_seconds() / 60
+                except:
+                    pass
+
+            # Check for crypto 15-min markets
+            is_crypto = any(kw in combined for kw in CRYPTO_KEYWORDS)
+            is_15min = minutes_until is not None and 0 < minutes_until <= 20
+
+            if is_crypto and is_15min:
+                try:
+                    markets.append({
+                        "slug": slug,
+                        "question": question,
+                        "token_a_id": str(clob_ids[0]),
+                        "token_b_id": str(clob_ids[1]),
+                        "price_sum_indicative": float(prices[0]) + float(prices[1]),
+                        "minutes_until": minutes_until,
+                        "volume_24h": float(raw.get("volume24hr") or raw.get("volume", 0) or 0),
+                        "category": "crypto",
+                    })
+                    crypto_found += 1
+                except (ValueError, TypeError):
+                    pass
+                continue
+
+            # Check for live sports markets (2-6 hours until resolution)
+            is_sports = any(kw in combined for kw in SPORTS_KEYWORDS)
+            is_live = minutes_until is not None and 30 < minutes_until <= 360  # 30 min to 6 hours
+
+            if is_sports and is_live:
+                try:
+                    markets.append({
+                        "slug": slug,
+                        "question": question,
+                        "token_a_id": str(clob_ids[0]),
+                        "token_b_id": str(clob_ids[1]),
+                        "price_sum_indicative": float(prices[0]) + float(prices[1]),
+                        "minutes_until": minutes_until,
+                        "volume_24h": float(raw.get("volume24hr") or raw.get("volume", 0) or 0),
+                        "category": "sports",
+                    })
+                    sports_found += 1
+                except (ValueError, TypeError):
+                    pass
+
+        print(f"[HFT] Found {crypto_found} crypto 15-min markets, {sports_found} live sports markets", flush=True)
+        print(f"[HFT] Total markets to monitor: {len(markets)}", flush=True)
 
         return markets
 
     except Exception as e:
         import traceback
-        print(f"[HFT] Market discovery failed: {e}")
+        print(f"[HFT] Market discovery failed: {e}", flush=True)
         traceback.print_exc()
         return []
 
