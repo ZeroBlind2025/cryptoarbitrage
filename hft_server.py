@@ -27,7 +27,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import asdict
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional, Generator
 
@@ -286,29 +286,31 @@ def discover_markets() -> list[dict]:
 
         # ============================================================
         # FETCH LIVE SPORTS MARKETS
-        # Find ANY live event from sports tag - let tail-end >90% logic run 24/7
+        # Parse date from slug (e.g., cbb-team1-team2-2025-11-24) - only include TODAY's games
         # ============================================================
         print("[HFT] Fetching live sports events...", flush=True)
 
-        def parse_event_start(event: dict) -> datetime | None:
-            """Parse event start date, return None if not parseable"""
-            start_str = event.get("startDate") or event.get("startDateIso")
-            if not start_str or "T" not in str(start_str):
-                return None
-            try:
-                return datetime.fromisoformat(str(start_str).replace("Z", "+00:00"))
-            except:
-                return None
+        import re
+        today_str = now.strftime("%Y-%m-%d")  # e.g., "2026-02-05"
+        yesterday_str = (now - timedelta(days=1)).strftime("%Y-%m-%d")  # For timezone edge cases
+
+        def extract_date_from_slug(slug: str) -> str | None:
+            """Extract YYYY-MM-DD date from slug if present"""
+            # Match patterns like 2025-11-24 or 2026-02-05
+            match = re.search(r'(\d{4}-\d{2}-\d{2})', slug)
+            if match:
+                return match.group(1)
+            return None
 
         try:
-            # Query /events with sports tag_id - get ALL active events
+            # Query /events with sports tag_id
             resp = requests.get(
                 f"{GAMMA_API}/events",
                 params={
                     "tag_id": SPORTS_TAG_ID,  # 100639
                     "active": "true",
                     "closed": "false",
-                    "limit": 500,  # Get more events
+                    "limit": 500,
                 },
                 timeout=30
             )
@@ -322,21 +324,23 @@ def discover_markets() -> list[dict]:
                     event_slug = event.get("slug", "")
                     event_title = event.get("title", "")
 
-                    # Only filter: startDate must be in the past (event has started)
-                    start_dt = parse_event_start(event)
-                    if start_dt is None:
-                        continue  # No start date, skip
-                    if start_dt > now:
-                        continue  # Event hasn't started yet
+                    # Extract date from slug - only include TODAY's games
+                    slug_date = extract_date_from_slug(event_slug)
+                    if slug_date is None:
+                        continue  # No date in slug = not a sports game (e.g., Ubisoft, Half-Life)
+
+                    # Only include if date is today or yesterday (timezone buffer)
+                    if slug_date != today_str and slug_date != yesterday_str:
+                        continue  # Old game or future game
 
                     # Check if not closed
                     if event.get("closed") == True:
                         continue
 
-                    # This is a live event - add all its markets
+                    # This is a live/today's event - add all its markets
                     live_events += 1
                     if live_events <= 5:
-                        print(f"[LIVE] {event_title[:60]}... (started: {start_dt})", flush=True)
+                        print(f"[LIVE] {event_title[:60]}... (date: {slug_date})", flush=True)
 
                     event_markets = event.get("markets", [])
                     for mkt in event_markets:
@@ -358,13 +362,13 @@ def discover_markets() -> list[dict]:
                             markets.append(market_data)
                             sports_found += 1
 
-                print(f"[HFT] Found {live_events} live events with {sports_found} markets", flush=True)
+                print(f"[HFT] Found {live_events} today's events with {sports_found} markets", flush=True)
 
         except Exception as e:
             print(f"[HFT] Sports discovery error: {e}", flush=True)
 
         if sports_found == 0:
-            print("[HFT] No live sports events found right now", flush=True)
+            print("[HFT] No live sports events found for today", flush=True)
 
         print(f"[HFT] Total: {crypto_found} crypto, {sports_found} sports = {len(markets)} markets", flush=True)
         return markets
