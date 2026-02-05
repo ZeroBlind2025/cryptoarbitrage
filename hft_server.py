@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 HFT ARBITRAGE SERVER
 ====================
