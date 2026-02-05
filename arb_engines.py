@@ -63,7 +63,29 @@ class MarketState:
     # Volume
     volume_24h: Optional[float] = None
 
+    # Market category for engine routing
+    market_category: Optional[str] = None  # "crypto", "sports", "politics", etc.
+
     timestamp_us: int = 0
+
+    def is_crypto_15min(self) -> bool:
+        """Check if this is a 15-min crypto market (BTC, ETH, XRP, SOL)"""
+        if self.market_category != "crypto":
+            return False
+        if self.minutes_until_resolution is None:
+            return False
+        # 15-minute window markets resolve within ~20 minutes
+        if self.minutes_until_resolution > 20:
+            return False
+        # Check for the 4 main crypto assets
+        slug_lower = self.market_slug.lower()
+        question_lower = self.question.lower()
+        crypto_keywords = ["btc", "bitcoin", "eth", "ethereum", "xrp", "ripple", "sol", "solana"]
+        return any(kw in slug_lower or kw in question_lower for kw in crypto_keywords)
+
+    def is_sports(self) -> bool:
+        """Check if this is a sports market"""
+        return self.market_category == "sports"
 
     @property
     def price_sum(self) -> Optional[float]:
@@ -164,6 +186,10 @@ class SumToOneConfig:
     # Any resolution timing is fine for sum-to-one
     max_resolution_hours: Optional[float] = None
 
+    # Market type filter: only analyze these categories
+    # Default: focus on 15-min crypto markets (BTC, ETH, XRP, SOL)
+    crypto_15min_only: bool = True
+
 
 class SumToOneEngine:
     """
@@ -188,6 +214,10 @@ class SumToOneEngine:
         Returns signal if opportunity detected, None otherwise.
         """
         if not self.enabled:
+            return None
+
+        # Market type filter: only 15-min crypto markets (BTC, ETH, XRP, SOL)
+        if self.config.crypto_15min_only and not market.is_crypto_15min():
             return None
 
         # Need both asks
@@ -287,6 +317,10 @@ class TailEndConfig:
     # Risk management
     max_concurrent_positions: int = 5
 
+    # Market type filter: only analyze these categories
+    # Default: focus on sports markets for tail-end
+    sports_only: bool = True
+
 
 class TailEndEngine:
     """
@@ -323,6 +357,10 @@ class TailEndEngine:
         Returns signal if opportunity detected, None otherwise.
         """
         if not self.enabled:
+            return None
+
+        # Market type filter: only sports markets for tail-end
+        if self.config.sports_only and not market.is_sports():
             return None
 
         # Check concurrent position limit
