@@ -1,0 +1,402 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Polymarket Arbitrage Scanner</title>
+    <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://unpkg.com/recharts@2.10.3/umd/Recharts.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { background-color: #111827; }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+        .animate-pulse { animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite; }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect } = React;
+        const { LineChart, Line, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } = Recharts;
+
+        // Icons as simple SVG components
+        const Activity = () => <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><polyline points="22,12 18,12 15,21 9,3 6,12 2,12"/></svg>;
+        const TrendingUp = () => <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><polyline points="23,6 13.5,15.5 8.5,10.5 1,18"/><polyline points="17,6 23,6 23,12"/></svg>;
+        const AlertTriangle = () => <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>;
+        const DollarSign = () => <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><line x1="12" y1="1" x2="12" y2="23"/><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg>;
+        const Clock = () => <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12,6 12,12 16,14"/></svg>;
+        const Target = () => <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></svg>;
+        const Zap = () => <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><polygon points="13,2 3,14 12,14 11,22 21,10 12,10 13,2"/></svg>;
+        const Eye = () => <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>;
+
+        const COLORS = ['#ef4444', '#f97316', '#eab308', '#22c55e', '#3b82f6', '#8b5cf6', '#ec4899'];
+
+        const StatCard = ({ icon: Icon, label, value, subValue, trend, color = 'blue' }) => (
+            <div className="bg-gray-800 rounded-lg p-4 border border-gray-700">
+                <div className="flex items-center justify-between">
+                    <div className={`p-2 rounded-lg bg-${color}-500/20 text-${color}-400`}>
+                        <Icon />
+                    </div>
+                    {trend !== undefined && (
+                        <span className={`text-xs ${trend > 0 ? 'text-green-400' : 'text-red-400'}`}>
+                            {trend > 0 ? '\u2191' : '\u2193'} {Math.abs(trend)}%
+                        </span>
+                    )}
+                </div>
+                <div className="mt-3">
+                    <p className="text-2xl font-bold text-white">{value}</p>
+                    <p className="text-sm text-gray-400">{label}</p>
+                    {subValue && <p className="text-xs text-gray-500 mt-1">{subValue}</p>}
+                </div>
+            </div>
+        );
+
+        const OpportunityRow = ({ opp }) => (
+            <div className="bg-gray-800/50 rounded-lg p-3 border border-gray-700 hover:border-gray-600 transition-colors">
+                <div className="flex items-start justify-between">
+                    <div className="flex-1">
+                        <p className="text-sm font-medium text-white truncate">{opp.question}</p>
+                        <p className="text-xs text-gray-500 mt-1">{opp.slug}</p>
+                    </div>
+                    <span className={`px-2 py-1 rounded text-xs font-medium ${
+                        opp.status === 'executable' ? 'bg-green-500/20 text-green-400' : 'bg-yellow-500/20 text-yellow-400'
+                    }`}>
+                        {opp.status}
+                    </span>
+                </div>
+                <div className="grid grid-cols-4 gap-4 mt-3 text-xs">
+                    <div>
+                        <p className="text-gray-500">Gamma Sum</p>
+                        <p className="text-white font-mono">${(opp.gammaSum || 0).toFixed(3)}</p>
+                    </div>
+                    <div>
+                        <p className="text-gray-500">CLOB Sum</p>
+                        <p className="text-white font-mono">${(opp.clobSum || 0).toFixed(3)}</p>
+                    </div>
+                    <div>
+                        <p className="text-gray-500">Net Profit</p>
+                        <p className="text-green-400 font-mono">{((opp.netProfit || 0) * 100).toFixed(2)}%</p>
+                    </div>
+                    <div>
+                        <p className="text-gray-500">Resolves</p>
+                        <p className="text-white">{opp.minutesUntil}m</p>
+                    </div>
+                </div>
+            </div>
+        );
+
+        function Dashboard() {
+            const [data, setData] = useState({
+                scanHistory: [],
+                exclusionFunnel: [],
+                priceSlipHistory: [],
+                opportunities: [],
+                closestMisses: [],
+                trades: [],
+                status: { isRunning: false, mode: 'scan', scanCount: 0, paperBalance: 10000 }
+            });
+            const [mode, setMode] = useState('scan');
+            const [isRunning, setIsRunning] = useState(false);
+            const [error, setError] = useState(null);
+
+            // Fetch data from API
+            const fetchData = async () => {
+                try {
+                    const response = await fetch('/api/data');
+                    const newData = await response.json();
+                    setData(newData);
+                    setIsRunning(newData.status?.isRunning || false);
+                    setMode(newData.status?.mode || 'scan');
+                    setError(null);
+                } catch (err) {
+                    console.error('Fetch error:', err);
+                    setError('Failed to fetch data');
+                }
+            };
+
+            // Poll for updates
+            useEffect(() => {
+                fetchData();
+                const interval = setInterval(fetchData, 2000);
+                return () => clearInterval(interval);
+            }, []);
+
+            // Start/Stop scanner
+            const toggleScanner = async () => {
+                try {
+                    const endpoint = isRunning ? '/api/stop' : '/api/start';
+                    const response = await fetch(endpoint, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ mode })
+                    });
+                    const result = await response.json();
+                    if (result.success) {
+                        setIsRunning(!isRunning);
+                    } else if (result.error) {
+                        setError(result.error);
+                    }
+                } catch (err) {
+                    setError('Failed to toggle scanner');
+                }
+            };
+
+            // Change mode
+            const handleModeChange = async (newMode) => {
+                if (isRunning) {
+                    await fetch('/api/stop', { method: 'POST' });
+                    setIsRunning(false);
+                }
+                setMode(newMode);
+            };
+
+            const scanHistory = data.scanHistory || [];
+            const exclusionFunnel = data.exclusionFunnel || [];
+            const priceSlipHistory = data.priceSlipHistory || [];
+            const opportunities = data.opportunities || [];
+            const closestMisses = data.closestMisses || [];
+            const trades = data.trades || [];
+            const status = data.status || {};
+
+            const totalExcluded = exclusionFunnel.reduce((sum, e) => sum + (e.count || 0), 0);
+            const avgSlip = priceSlipHistory.length > 0
+                ? priceSlipHistory.reduce((sum, p) => sum + (p.slipBps || 0), 0) / priceSlipHistory.length
+                : 0;
+
+            return (
+                <div className="min-h-screen bg-gray-900 text-white p-4">
+                    {/* Header */}
+                    <div className="flex items-center justify-between mb-6">
+                        <div>
+                            <h1 className="text-2xl font-bold">Polymarket Arbitrage Scanner</h1>
+                            <p className="text-gray-400 text-sm">Research Dashboard</p>
+                        </div>
+                        <div className="flex items-center gap-4">
+                            {error && (
+                                <span className="text-red-400 text-sm">{error}</span>
+                            )}
+                            <select
+                                value={mode}
+                                onChange={(e) => handleModeChange(e.target.value)}
+                                className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm"
+                            >
+                                <option value="scan">Scan Mode</option>
+                                <option value="paper">Paper Trading</option>
+                            </select>
+                            <button
+                                onClick={toggleScanner}
+                                className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
+                                    isRunning
+                                        ? 'bg-red-500/20 text-red-400 hover:bg-red-500/30'
+                                        : 'bg-green-500/20 text-green-400 hover:bg-green-500/30'
+                                }`}
+                            >
+                                {isRunning ? 'Stop' : 'Start'}
+                            </button>
+                            <div className={`flex items-center gap-2 px-3 py-2 rounded-lg ${
+                                isRunning ? 'bg-green-500/20' : 'bg-gray-700'
+                            }`}>
+                                <div className={`w-2 h-2 rounded-full ${isRunning ? 'bg-green-400 animate-pulse' : 'bg-gray-500'}`} />
+                                <span className="text-sm">{isRunning ? 'Running' : 'Stopped'}</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    {/* Stats Row */}
+                    <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-4 mb-6">
+                        <StatCard icon={Activity} label="Scans" value={status.scanCount || 0} subValue="5s interval" color="blue" />
+                        <StatCard icon={Eye} label="Markets Scanned" value={scanHistory[scanHistory.length - 1]?.marketsScanned || 0} subValue="Last scan" color="purple" />
+                        <StatCard icon={Target} label="Gamma Opportunities" value={opportunities.length} subValue="Indicative" color="yellow" />
+                        <StatCard icon={Zap} label="Executable" value={opportunities.filter(o => o.status === 'executable').length} subValue="CLOB validated" color="green" />
+                        <StatCard icon={TrendingUp} label="Avg Price Slip" value={`${avgSlip.toFixed(0)}bps`} subValue="Gamma -> CLOB" color="orange" />
+                        <StatCard icon={DollarSign} label="Paper Balance" value={`$${(status.paperBalance || 10000).toLocaleString()}`} subValue="Simulated" color="blue" />
+                    </div>
+
+                    {/* Main Grid */}
+                    <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+
+                        {/* Left Column */}
+                        <div className="lg:col-span-2 space-y-6">
+
+                            {/* Active Opportunities */}
+                            <div className="bg-gray-800 rounded-lg border border-gray-700 p-4">
+                                <h2 className="text-lg font-semibold mb-4 flex items-center gap-2">
+                                    <span className="text-green-400"><Target /></span>
+                                    Active Opportunities
+                                </h2>
+                                <div className="space-y-3">
+                                    {opportunities.length > 0 ? (
+                                        opportunities.map((opp, i) => <OpportunityRow key={i} opp={opp} />)
+                                    ) : (
+                                        <p className="text-gray-500 text-center py-8">No opportunities found. Markets are efficient.</p>
+                                    )}
+                                </div>
+                            </div>
+
+                            {/* Price Slip Chart */}
+                            <div className="bg-gray-800 rounded-lg border border-gray-700 p-4">
+                                <h2 className="text-lg font-semibold mb-4">Gamma vs CLOB Price Sum</h2>
+                                <p className="text-xs text-gray-500 mb-4">Shows how indicative Gamma marks differ from executable CLOB prices</p>
+                                {priceSlipHistory.length > 0 ? (
+                                    <ResponsiveContainer width="100%" height={200}>
+                                        <LineChart data={priceSlipHistory}>
+                                            <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
+                                            <XAxis dataKey="time" tick={{ fill: '#9ca3af', fontSize: 10 }} />
+                                            <YAxis domain={[0.94, 1.0]} tick={{ fill: '#9ca3af', fontSize: 10 }} />
+                                            <Tooltip contentStyle={{ backgroundColor: '#1f2937', border: '1px solid #374151' }} />
+                                            <Line type="monotone" dataKey="gammaSum" stroke="#3b82f6" strokeWidth={2} dot={false} name="Gamma" />
+                                            <Line type="monotone" dataKey="clobSum" stroke="#ef4444" strokeWidth={2} dot={false} name="CLOB" />
+                                        </LineChart>
+                                    </ResponsiveContainer>
+                                ) : (
+                                    <p className="text-gray-500 text-center py-8">Start scanner to see price slip data</p>
+                                )}
+                            </div>
+
+                            {/* Scan Activity */}
+                            <div className="bg-gray-800 rounded-lg border border-gray-700 p-4">
+                                <h2 className="text-lg font-semibold mb-4">Scan Activity</h2>
+                                {scanHistory.length > 0 ? (
+                                    <ResponsiveContainer width="100%" height={150}>
+                                        <BarChart data={scanHistory.slice(-10)}>
+                                            <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
+                                            <XAxis dataKey="timestamp" tick={false} />
+                                            <YAxis tick={{ fill: '#9ca3af', fontSize: 10 }} />
+                                            <Tooltip contentStyle={{ backgroundColor: '#1f2937', border: '1px solid #374151' }} />
+                                            <Bar dataKey="gammaOpportunities" fill="#eab308" name="Gamma Opps" />
+                                            <Bar dataKey="executable" fill="#22c55e" name="Executable" />
+                                        </BarChart>
+                                    </ResponsiveContainer>
+                                ) : (
+                                    <p className="text-gray-500 text-center py-8">Start scanner to see activity</p>
+                                )}
+                            </div>
+                        </div>
+
+                        {/* Right Column */}
+                        <div className="space-y-6">
+
+                            {/* Exclusion Funnel */}
+                            <div className="bg-gray-800 rounded-lg border border-gray-700 p-4">
+                                <h2 className="text-lg font-semibold mb-4 flex items-center gap-2">
+                                    <span className="text-yellow-400"><AlertTriangle /></span>
+                                    Exclusion Funnel
+                                </h2>
+                                <p className="text-xs text-gray-500 mb-4">Why markets get filtered out ({totalExcluded} excluded)</p>
+                                <div className="space-y-2">
+                                    {exclusionFunnel.map((item, i) => (
+                                        <div key={i} className="flex items-center gap-2">
+                                            <div className="w-24 text-xs text-gray-400 truncate" title={item.reason}>
+                                                {(item.reason || '').replace(/_/g, ' ')}
+                                            </div>
+                                            <div className="flex-1 bg-gray-700 rounded-full h-4 overflow-hidden">
+                                                <div
+                                                    className="h-full rounded-full transition-all duration-500"
+                                                    style={{ width: `${item.pct || 0}%`, backgroundColor: COLORS[i % COLORS.length] }}
+                                                />
+                                            </div>
+                                            <div className="w-12 text-xs text-right text-gray-400">
+                                                {(item.pct || 0).toFixed(1)}%
+                                            </div>
+                                        </div>
+                                    ))}
+                                </div>
+                            </div>
+
+                            {/* Closest Misses */}
+                            <div className="bg-gray-800 rounded-lg border border-gray-700 p-4">
+                                <h2 className="text-lg font-semibold mb-4 flex items-center gap-2">
+                                    <span className="text-orange-400"><Clock /></span>
+                                    Closest Misses
+                                </h2>
+                                <p className="text-xs text-gray-500 mb-4">Markets just above threshold</p>
+                                <div className="space-y-3">
+                                    {closestMisses.length > 0 ? closestMisses.map((miss, i) => (
+                                        <div key={i} className="bg-gray-700/50 rounded p-3">
+                                            <p className="text-sm text-white truncate">{miss.slug}</p>
+                                            <div className="flex items-center justify-between mt-2 text-xs">
+                                                <span className="text-gray-400">Sum: ${(miss.sum || 0).toFixed(3)}</span>
+                                                <span className="text-orange-400">+{miss.gapBps || 0}bps</span>
+                                                <span className="text-gray-400">{miss.minutes || 0}m</span>
+                                            </div>
+                                        </div>
+                                    )) : (
+                                        <p className="text-gray-500 text-center py-4">No close misses</p>
+                                    )}
+                                </div>
+                            </div>
+
+                            {/* Trade History */}
+                            {mode !== 'scan' && (
+                                <div className="bg-gray-800 rounded-lg border border-gray-700 p-4">
+                                    <h2 className="text-lg font-semibold mb-4 flex items-center gap-2">
+                                        <span className="text-green-400"><DollarSign /></span>
+                                        Recent Trades
+                                    </h2>
+                                    <div className="space-y-2">
+                                        {trades.length > 0 ? trades.map((trade, i) => (
+                                            <div key={i} className="flex items-center justify-between text-xs py-2 border-b border-gray-700 last:border-0">
+                                                <div>
+                                                    <p className="text-white">{trade.market}</p>
+                                                    <p className="text-gray-500">{trade.time}</p>
+                                                </div>
+                                                <div className="text-right">
+                                                    <p className="text-gray-400">${(trade.cost || 0).toFixed(2)}</p>
+                                                    <p className={(trade.pnl || 0) >= 0 ? 'text-green-400' : 'text-red-400'}>
+                                                        {(trade.pnl || 0) >= 0 ? '+' : ''}{(trade.pnl || 0).toFixed(2)}
+                                                    </p>
+                                                </div>
+                                            </div>
+                                        )) : (
+                                            <p className="text-gray-500 text-center py-4">No trades yet</p>
+                                        )}
+                                    </div>
+                                </div>
+                            )}
+
+                            {/* Config Summary */}
+                            <div className="bg-gray-800 rounded-lg border border-gray-700 p-4">
+                                <h2 className="text-lg font-semibold mb-4">Config</h2>
+                                <div className="space-y-2 text-xs">
+                                    <div className="flex justify-between">
+                                        <span className="text-gray-400">Max Resolution</span>
+                                        <span className="text-white">24 hours</span>
+                                    </div>
+                                    <div className="flex justify-between">
+                                        <span className="text-gray-400">Min Volume 24h</span>
+                                        <span className="text-white">$1,000</span>
+                                    </div>
+                                    <div className="flex justify-between">
+                                        <span className="text-gray-400">Total Friction</span>
+                                        <span className="text-white">3.0%</span>
+                                    </div>
+                                    <div className="flex justify-between">
+                                        <span className="text-gray-400">Max Price Sum</span>
+                                        <span className="text-white">$0.970</span>
+                                    </div>
+                                    <div className="flex justify-between">
+                                        <span className="text-gray-400">Max Position</span>
+                                        <span className="text-white">$50</span>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    {/* Footer */}
+                    <div className="mt-6 text-center text-xs text-gray-500">
+                        <p>Research tool only. Gamma prices are indicative, not executable.</p>
+                        <p className="mt-1">For white paper data collection. Not financial advice.</p>
+                    </div>
+                </div>
+            );
+        }
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<Dashboard />);
+    </script>
+</body>
+</html>
