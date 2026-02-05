@@ -286,7 +286,7 @@ def discover_markets() -> list[dict]:
 
         # ============================================================
         # FETCH LIVE SPORTS MARKETS
-        # Parse date from slug (e.g., cbb-team1-team2-2025-11-24) - only include TODAY's games
+        # Query ALL events, filter by sports slug prefix + today's date + not ended
         # ============================================================
         print("[HFT] Fetching live sports events...", flush=True)
 
@@ -300,53 +300,86 @@ def discover_markets() -> list[dict]:
         yesterday_str = (now_pst - timedelta(days=1)).strftime("%Y-%m-%d")  # Yesterday in PST
         print(f"[HFT] Today (PST): {today_str}", flush=True)
 
+        # Sports slug prefixes - comprehensive list
+        SPORTS_PREFIXES = [
+            "nba-", "nfl-", "nhl-", "mlb-", "ncaa-", "cbb-", "cfb-", "wnba-",
+            "ufc-", "mma-", "boxing-", "pfl-",
+            "epl-", "laliga-", "bundesliga-", "seriea-", "ligue1-", "mls-", "ucl-",
+            "scop-", "bra-", "arg-", "liga-",  # Scottish, Brazilian, Argentine leagues
+            "atp-", "wta-", "tennis-",
+            "pga-", "lpga-", "golf-",
+            "f1-", "nascar-", "indycar-",
+            "cricket-", "ipl-", "rugby-",
+        ]
+
+        def is_sports_slug(slug: str) -> bool:
+            """Check if slug starts with a known sports prefix"""
+            slug_lower = slug.lower()
+            return any(slug_lower.startswith(prefix) for prefix in SPORTS_PREFIXES)
+
         def extract_date_from_slug(slug: str) -> str | None:
             """Extract YYYY-MM-DD date from slug if present"""
-            # Match patterns like 2025-11-24 or 2026-02-05
             match = re.search(r'(\d{4}-\d{2}-\d{2})', slug)
             if match:
                 return match.group(1)
             return None
 
         try:
-            # Query /events with sports tag_id
+            # Query ALL active events (no tag filter)
             resp = requests.get(
                 f"{GAMMA_API}/events",
                 params={
-                    "tag_id": SPORTS_TAG_ID,  # 100639
                     "active": "true",
                     "closed": "false",
-                    "limit": 500,
+                    "limit": 1000,  # Get more to find all sports
                 },
                 timeout=30
             )
 
             if resp.status_code == 200:
                 events = resp.json()
-                print(f"[HFT] Sports tag returned {len(events)} events", flush=True)
+                print(f"[HFT] Total active events: {len(events)}", flush=True)
 
                 live_events = 0
+                sports_checked = 0
                 for event in events:
                     event_slug = event.get("slug", "")
                     event_title = event.get("title", "")
 
-                    # Extract date from slug - only include TODAY's games
+                    # Filter 1: Must be a sports slug
+                    if not is_sports_slug(event_slug):
+                        continue
+                    sports_checked += 1
+
+                    # Filter 2: Extract date from slug - must be today or yesterday
                     slug_date = extract_date_from_slug(event_slug)
                     if slug_date is None:
-                        continue  # No date in slug = not a sports game (e.g., Ubisoft, Half-Life)
+                        continue
 
-                    # Only include if date is today or yesterday (timezone buffer)
                     if slug_date != today_str and slug_date != yesterday_str:
                         continue  # Old game or future game
 
-                    # Check if not closed
+                    # Filter 3: Check if not closed
                     if event.get("closed") == True:
                         continue
 
-                    # This is a live/today's event - add all its markets
+                    # Filter 4: Check if game has ended (endDate in the past)
+                    event_end_str = event.get("endDate") or event.get("endDateIso")
+                    if event_end_str:
+                        try:
+                            if "T" in str(event_end_str):
+                                event_end = datetime.fromisoformat(event_end_str.replace("Z", "+00:00"))
+                                minutes_until_end = (event_end - now).total_seconds() / 60
+                                # Skip if game ended more than 30 min ago
+                                if minutes_until_end < -30:
+                                    continue  # Game is over
+                        except:
+                            pass
+
+                    # This is a live sports event!
                     live_events += 1
-                    if live_events <= 5:
-                        print(f"[LIVE] {event_title[:60]}... (date: {slug_date})", flush=True)
+                    if live_events <= 10:
+                        print(f"[LIVE] {event_slug[:50]}... (date: {slug_date})", flush=True)
 
                     event_markets = event.get("markets", [])
                     for mkt in event_markets:
@@ -368,13 +401,13 @@ def discover_markets() -> list[dict]:
                             markets.append(market_data)
                             sports_found += 1
 
-                print(f"[HFT] Found {live_events} today's events with {sports_found} markets", flush=True)
+                print(f"[HFT] Checked {sports_checked} sports events, found {live_events} live with {sports_found} markets", flush=True)
 
         except Exception as e:
             print(f"[HFT] Sports discovery error: {e}", flush=True)
 
         if sports_found == 0:
-            print("[HFT] No live sports events found for today", flush=True)
+            print("[HFT] No live sports events found right now", flush=True)
 
         print(f"[HFT] Total: {crypto_found} crypto, {sports_found} sports = {len(markets)} markets", flush=True)
         return markets
