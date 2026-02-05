@@ -39,8 +39,13 @@ from hft_client import (
     HFTScanner,
     TradingMode,
     Trade,
-    ArbOpportunity,
     OrderStatus,
+)
+from arb_engines import (
+    EngineType,
+    EngineSignal,
+    SumToOneConfig,
+    TailEndConfig,
 )
 from step_c_scanner_v4 import ScanConfig as GammaConfig, MarketScanner as GammaScanner
 
@@ -74,6 +79,9 @@ opportunity_history: deque[ArbOpportunity] = deque(maxlen=100)
 # Active markets being monitored
 active_markets: list[dict] = []
 
+# Signal history (by engine)
+signal_history: deque[dict] = deque(maxlen=200)
+
 # Threading
 scanner_thread: Optional[threading.Thread] = None
 stop_scanner = threading.Event()
@@ -94,9 +102,9 @@ def on_trade_callback(trade: Trade):
     log_trade(trade)
 
 
-def on_opportunity_callback(opp: ArbOpportunity):
-    """Handle detected opportunity"""
-    opportunity_history.append(opp)
+def on_signal_callback(signal: EngineSignal):
+    """Handle detected signal from any engine"""
+    signal_history.append(signal.to_dict())
 
 
 def log_trade(trade: Trade):
@@ -160,8 +168,13 @@ def discover_markets() -> list[dict]:
 # SCANNER MANAGEMENT
 # =============================================================================
 
-def start_hft_scanner(mode: str, scan_interval_ms: int = 500):
-    """Start the HFT scanner"""
+def start_hft_scanner(
+    mode: str,
+    scan_interval_ms: int = 500,
+    enable_sum_to_one: bool = True,
+    enable_tail_end: bool = True,
+):
+    """Start the HFT scanner with configurable engines"""
     global hft_client, hft_scanner, active_markets, server_state
 
     if server_state["is_running"]:
@@ -176,19 +189,47 @@ def start_hft_scanner(mode: str, scan_interval_ms: int = 500):
 
     print(f"[HFT] Found {len(active_markets)} markets to monitor")
 
+    # Configure engines
+    sum_to_one_config = SumToOneConfig(
+        max_price_sum=0.97,
+        min_edge_after_fees=0.005,
+        max_position_usd=100.0,
+    )
+
+    tail_end_config = TailEndConfig(
+        min_probability=0.95,
+        max_probability=0.995,
+        min_price=0.95,
+        max_price=0.99,
+        max_minutes_until_resolution=60,
+        min_minutes_until_resolution=1,
+        min_volume_24h=5000.0,
+        max_position_usd=50.0,
+    )
+
     # Create HFT client
     config = HFTConfig.from_env()
     trading_mode = TradingMode.LIVE if mode == "live" else TradingMode.DEMO
 
-    hft_client = HFTClient(config, mode=trading_mode)
+    hft_client = HFTClient(
+        config,
+        mode=trading_mode,
+        sum_to_one_config=sum_to_one_config,
+        tail_end_config=tail_end_config,
+    )
     hft_client.on_trade(on_trade_callback)
-    hft_client.on_opportunity(on_opportunity_callback)
+    hft_client.on_signal(on_signal_callback)
+
+    # Enable/disable engines based on config
+    if not enable_sum_to_one:
+        hft_client.disable_engine(EngineType.SUM_TO_ONE)
+    if not enable_tail_end:
+        hft_client.disable_engine(EngineType.TAIL_END)
 
     # Create scanner
     hft_scanner = HFTScanner(
         client=hft_client,
         markets=active_markets,
-        threshold=0.97,
         scan_interval_ms=scan_interval_ms,
     )
 
@@ -199,7 +240,8 @@ def start_hft_scanner(mode: str, scan_interval_ms: int = 500):
     server_state["is_running"] = True
     server_state["started_at"] = datetime.now(timezone.utc).isoformat()
 
-    return True, f"Started in {mode} mode with {len(active_markets)} markets"
+    enabled = hft_client.get_enabled_engines()
+    return True, f"Started in {mode} mode with {len(active_markets)} markets. Engines: {', '.join(enabled)}"
 
 
 def stop_hft_scanner():
@@ -254,6 +296,8 @@ def api_start():
     data = request.get_json() or {}
     mode = data.get('mode', 'demo')
     scan_interval_ms = data.get('scan_interval_ms', 500)
+    enable_sum_to_one = data.get('enable_sum_to_one', True)
+    enable_tail_end = data.get('enable_tail_end', True)
 
     if mode == 'live':
         # Require explicit confirmation for live mode
@@ -263,11 +307,80 @@ def api_start():
                 "message": "Set confirm_live=true to enable live trading"
             }), 403
 
-    success, message = start_hft_scanner(mode, scan_interval_ms)
+    success, message = start_hft_scanner(
+        mode,
+        scan_interval_ms,
+        enable_sum_to_one=enable_sum_to_one,
+        enable_tail_end=enable_tail_end,
+    )
 
     if success:
         return jsonify({"success": True, "message": message})
     return jsonify({"error": message}), 400
+
+
+@app.route('/api/engines', methods=['GET'])
+def api_engines():
+    """Get engine status"""
+    if hft_client is None:
+        return jsonify({
+            "sum_to_one": {"enabled": True, "stats": {}},
+            "tail_end": {"enabled": True, "stats": {}},
+        })
+
+    stats = hft_client.engine_manager.get_stats()
+    return jsonify(stats)
+
+
+@app.route('/api/engines/toggle', methods=['POST'])
+def api_toggle_engine():
+    """Toggle an engine on/off"""
+    if hft_client is None:
+        return jsonify({"error": "Scanner not initialized"}), 400
+
+    data = request.get_json() or {}
+    engine_name = data.get('engine')
+
+    if engine_name == 'sum_to_one':
+        new_state = hft_client.toggle_engine(EngineType.SUM_TO_ONE)
+        return jsonify({"engine": "sum_to_one", "enabled": new_state})
+    elif engine_name == 'tail_end':
+        new_state = hft_client.toggle_engine(EngineType.TAIL_END)
+        return jsonify({"engine": "tail_end", "enabled": new_state})
+    else:
+        return jsonify({"error": f"Unknown engine: {engine_name}"}), 400
+
+
+@app.route('/api/engines/<engine_name>/enable', methods=['POST'])
+def api_enable_engine(engine_name):
+    """Enable a specific engine"""
+    if hft_client is None:
+        return jsonify({"error": "Scanner not initialized"}), 400
+
+    if engine_name == 'sum_to_one':
+        hft_client.enable_engine(EngineType.SUM_TO_ONE)
+        return jsonify({"engine": "sum_to_one", "enabled": True})
+    elif engine_name == 'tail_end':
+        hft_client.enable_engine(EngineType.TAIL_END)
+        return jsonify({"engine": "tail_end", "enabled": True})
+    else:
+        return jsonify({"error": f"Unknown engine: {engine_name}"}), 400
+
+
+@app.route('/api/engines/<engine_name>/disable', methods=['POST'])
+def api_disable_engine(engine_name):
+    """Disable a specific engine"""
+    if hft_client is None:
+        return jsonify({"error": "Scanner not initialized"}), 400
+
+    if engine_name == 'sum_to_one':
+        hft_client.disable_engine(EngineType.SUM_TO_ONE)
+        return jsonify({"engine": "sum_to_one", "enabled": False})
+    elif engine_name == 'tail_end':
+        hft_client.disable_engine(EngineType.TAIL_END)
+        return jsonify({"engine": "tail_end", "enabled": False})
+    else:
+        return jsonify({"error": f"Unknown engine: {engine_name}"}), 400
 
 
 @app.route('/api/stop', methods=['POST'])
@@ -380,10 +493,12 @@ def api_data():
     stats = {}
     scanner_stats = {}
     latency = {}
+    engine_stats = {}
 
     if hft_client:
         stats = hft_client.get_stats()
         latency = hft_client.latency_stats.to_dict()
+        engine_stats = hft_client.engine_manager.get_stats()
 
     if hft_scanner:
         scanner_stats = hft_scanner.get_stats()
@@ -398,6 +513,12 @@ def api_data():
     live_filled = [t for t in live_trades if t.status == OrderStatus.FILLED]
     live_resolved = [t for t in live_trades if t.resolved]
 
+    # Trades by engine
+    demo_s2o = [t for t in demo_filled if t.engine == "sum_to_one"]
+    demo_tail = [t for t in demo_filled if t.engine == "tail_end"]
+    live_s2o = [t for t in live_filled if t.engine == "sum_to_one"]
+    live_tail = [t for t in live_filled if t.engine == "tail_end"]
+
     return jsonify({
         "status": {
             "mode": server_state["mode"],
@@ -407,13 +528,36 @@ def api_data():
         "scanner": {
             "markets_monitored": len(active_markets),
             "scans_completed": scanner_stats.get("scans_completed", 0),
-            "opportunities_detected": scanner_stats.get("opportunities_detected", 0),
+            "signals_detected": scanner_stats.get("signals_detected", 0),
             "trades_executed": scanner_stats.get("trades_executed", 0),
+            "signals_by_engine": scanner_stats.get("signals_by_engine", {}),
+        },
+        "engines": {
+            "sum_to_one": {
+                "enabled": engine_stats.get("sum_to_one", {}).get("enabled", True),
+                "signals": engine_stats.get("sum_to_one", {}).get("signals_generated", 0),
+            },
+            "tail_end": {
+                "enabled": engine_stats.get("tail_end", {}).get("enabled", True),
+                "signals": engine_stats.get("tail_end", {}).get("signals_generated", 0),
+                "avg_probability": engine_stats.get("tail_end", {}).get("avg_probability", 0),
+            },
+            "enabled_list": stats.get("enabled_engines", []),
         },
         "latency": latency,
         "trades": {
             "demo": recent_demo,
             "live": recent_live,
+        },
+        "trades_by_engine": {
+            "demo": {
+                "sum_to_one": len(demo_s2o),
+                "tail_end": len(demo_tail),
+            },
+            "live": {
+                "sum_to_one": len(live_s2o),
+                "tail_end": len(live_tail),
+            },
         },
         "pnl": {
             "demo": {
@@ -430,6 +574,7 @@ def api_data():
                 "total_pnl": sum(t.pnl or 0 for t in live_resolved),
             },
         },
+        "signals": list(signal_history)[-20:],
         "markets": active_markets[:10],  # Top 10 markets
     })
 

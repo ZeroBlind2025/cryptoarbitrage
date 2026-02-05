@@ -8,6 +8,10 @@ Optimized for QuantVPS deployment with:
 - Minimal processing overhead
 - Real-time latency tracking
 
+Arbitrage Engines:
+- SUM-TO-ONE: Buy YES+NO when combined < $1.00 (guaranteed profit)
+- TAIL-END: Buy 95-99% outcomes near resolution (directional bet)
+
 Modes:
 - DEMO: Paper trades with real price feeds, tracks what would have happened
 - LIVE: Actual order execution on Polygon
@@ -32,6 +36,15 @@ from collections import deque
 import uuid
 
 import requests
+
+from arb_engines import (
+    EngineType,
+    EngineManager,
+    EngineSignal,
+    MarketState,
+    SumToOneConfig,
+    TailEndConfig,
+)
 
 try:
     from dotenv import load_dotenv
@@ -152,6 +165,9 @@ class Trade:
     mode: TradingMode
     timestamp: datetime
 
+    # Engine that triggered this trade
+    engine: str  # "sum_to_one" or "tail_end"
+
     # Market info
     market_slug: str
     token_a_id: str
@@ -163,9 +179,15 @@ class Trade:
     size: float
     total_cost: float
 
+    # Trade type
+    trade_type: str = "buy_both"  # "buy_both", "buy_yes", "buy_no"
+
     # Outcome
-    status: OrderStatus
-    expected_edge: float
+    status: OrderStatus = OrderStatus.PENDING
+    expected_edge: float = 0.0
+
+    # For tail-end trades
+    target_probability: Optional[float] = None
 
     # Timing (microseconds)
     detection_to_submit_us: int = 0
@@ -182,6 +204,7 @@ class Trade:
         return {
             "trade_id": self.trade_id,
             "mode": self.mode.value,
+            "engine": self.engine,
             "timestamp": self.timestamp.isoformat(),
             "market_slug": self.market_slug,
             "token_a_id": self.token_a_id,
@@ -190,8 +213,10 @@ class Trade:
             "token_b_price": self.token_b_price,
             "size": self.size,
             "total_cost": self.total_cost,
+            "trade_type": self.trade_type,
             "status": self.status.value,
             "expected_edge": self.expected_edge,
+            "target_probability": self.target_probability,
             "detection_to_submit_us": self.detection_to_submit_us,
             "submit_to_fill_us": self.submit_to_fill_us,
             "total_latency_us": self.total_latency_us,
@@ -275,9 +300,19 @@ class HFTClient:
     - Sub-100ms detection to execution
     - FOK orders for guaranteed fills
     - Real-time latency monitoring
+
+    Supports multiple arbitrage engines:
+    - Sum-to-One: Buy both sides when price < $1.00
+    - Tail-End: Buy high-probability outcomes near resolution
     """
 
-    def __init__(self, config: HFTConfig, mode: TradingMode = TradingMode.DEMO):
+    def __init__(
+        self,
+        config: HFTConfig,
+        mode: TradingMode = TradingMode.DEMO,
+        sum_to_one_config: Optional[SumToOneConfig] = None,
+        tail_end_config: Optional[TailEndConfig] = None,
+    ):
         self.config = config
         self.mode = mode
 
@@ -287,6 +322,12 @@ class HFTClient:
             "Accept": "application/json",
             "Content-Type": "application/json",
         })
+
+        # Initialize arbitrage engines
+        self.engine_manager = EngineManager(
+            sum_to_one_config=sum_to_one_config,
+            tail_end_config=tail_end_config,
+        )
 
         # Order book cache
         self._order_books: dict[str, OrderBook] = {}
@@ -314,7 +355,7 @@ class HFTClient:
 
         # Callbacks
         self._on_trade: Optional[Callable[[Trade], None]] = None
-        self._on_opportunity: Optional[Callable[[ArbOpportunity], None]] = None
+        self._on_signal: Optional[Callable[[EngineSignal], None]] = None
 
     def _init_clob_client(self) -> bool:
         """Initialize py-clob-client for live FOK orders"""
@@ -427,8 +468,78 @@ class HFTClient:
         return book_a, book_b
 
     # -------------------------------------------------------------------------
-    # Opportunity Detection
+    # Engine Management
     # -------------------------------------------------------------------------
+
+    def enable_engine(self, engine_type: EngineType):
+        """Enable an arbitrage engine"""
+        self.engine_manager.enable_engine(engine_type)
+
+    def disable_engine(self, engine_type: EngineType):
+        """Disable an arbitrage engine"""
+        self.engine_manager.disable_engine(engine_type)
+
+    def toggle_engine(self, engine_type: EngineType) -> bool:
+        """Toggle engine state, returns new state"""
+        return self.engine_manager.toggle_engine(engine_type)
+
+    def is_engine_enabled(self, engine_type: EngineType) -> bool:
+        """Check if engine is enabled"""
+        return self.engine_manager.is_enabled(engine_type)
+
+    def get_enabled_engines(self) -> list[str]:
+        """Get list of enabled engine names"""
+        return self.engine_manager.get_enabled_engines()
+
+    # -------------------------------------------------------------------------
+    # Opportunity Detection (Multi-Engine)
+    # -------------------------------------------------------------------------
+
+    def check_market(
+        self,
+        market_slug: str,
+        question: str,
+        token_a_id: str,
+        token_b_id: str,
+        minutes_until_resolution: Optional[float] = None,
+        volume_24h: Optional[float] = None,
+    ) -> list[EngineSignal]:
+        """
+        Check market with all enabled engines.
+        Returns list of signals from triggered engines.
+        """
+        # Fetch order books
+        book_a, book_b = self.fetch_paired_books(token_a_id, token_b_id)
+
+        if book_a is None or book_b is None:
+            return []
+
+        # Build market state
+        market_state = MarketState(
+            market_slug=market_slug,
+            question=question,
+            token_a_id=token_a_id,
+            token_b_id=token_b_id,
+            token_a_bid=book_a.best_bid,
+            token_a_ask=book_a.best_ask,
+            token_b_bid=book_b.best_bid,
+            token_b_ask=book_b.best_ask,
+            token_a_ask_depth=book_a.asks[0].size if book_a.asks else 0,
+            token_b_ask_depth=book_b.asks[0].size if book_b.asks else 0,
+            minutes_until_resolution=minutes_until_resolution,
+            volume_24h=volume_24h,
+            timestamp_us=time.perf_counter_ns() // 1000,
+        )
+
+        # Run through all engines
+        signals = self.engine_manager.analyze(market_state)
+
+        # Fire callbacks
+        for signal in signals:
+            if self._on_signal:
+                self._on_signal(signal)
+
+        return signals
 
     def check_opportunity(
         self,
@@ -438,8 +549,10 @@ class HFTClient:
         threshold: float = 0.97,
     ) -> Optional[ArbOpportunity]:
         """
-        Check for arbitrage opportunity.
+        Legacy method: Check for sum-to-one arbitrage opportunity.
         Returns opportunity if price_sum < threshold.
+
+        For multi-engine support, use check_market() instead.
         """
         detect_start_us = time.perf_counter_ns() // 1000
 
@@ -478,9 +591,6 @@ class HFTClient:
             token_b_depth=b_depth,
             max_executable_size=max_size,
         )
-
-        if self._on_opportunity:
-            self._on_opportunity(opp)
 
         return opp
 
@@ -641,6 +751,197 @@ class HFTClient:
         return trade
 
     # -------------------------------------------------------------------------
+    # Signal Execution (Multi-Engine)
+    # -------------------------------------------------------------------------
+
+    def execute_signal(self, signal: EngineSignal) -> Trade:
+        """
+        Execute a signal from any engine.
+
+        For SUM_TO_ONE: Buys both tokens
+        For TAIL_END: Buys single high-probability token
+        """
+        exec_start_us = time.perf_counter_ns() // 1000
+        market = signal.market_state
+
+        # Create trade record
+        trade = Trade(
+            trade_id=f"trade_{uuid.uuid4().hex[:12]}",
+            mode=self.mode,
+            timestamp=datetime.now(timezone.utc),
+            engine=signal.engine.value,
+            market_slug=signal.market_slug,
+            token_a_id=market.token_a_id,
+            token_b_id=market.token_b_id,
+            token_a_price=market.token_a_ask or 0,
+            token_b_price=market.token_b_ask or 0,
+            size=signal.recommended_size,
+            total_cost=0,
+            trade_type=signal.action,
+            status=OrderStatus.PENDING,
+            expected_edge=signal.arb_edge or (1.0 - (signal.target_price or 0)),
+            target_probability=signal.implied_probability,
+            detection_to_submit_us=exec_start_us - signal.detected_at_us,
+        )
+
+        # Calculate cost based on trade type
+        if signal.action == "buy_both":
+            trade.total_cost = signal.recommended_size * (
+                (market.token_a_ask or 0) + (market.token_b_ask or 0)
+            )
+        elif signal.action == "buy_yes":
+            trade.total_cost = signal.recommended_size * (market.token_a_ask or 0)
+        elif signal.action == "buy_no":
+            trade.total_cost = signal.recommended_size * (market.token_b_ask or 0)
+
+        # Execute based on mode
+        if self.mode == TradingMode.DEMO:
+            trade = self._execute_signal_demo(trade, signal)
+        else:
+            trade = self._execute_signal_live(trade, signal)
+
+        # Calculate total latency
+        trade.total_latency_us = (time.perf_counter_ns() // 1000) - signal.detected_at_us
+
+        # Track latency
+        if self.config.track_latency:
+            self.latency_stats.add(trade.total_latency_us)
+
+        # Store trade
+        with self._trades_lock:
+            self.trades.append(trade)
+
+        # Callback
+        if self._on_trade:
+            self._on_trade(trade)
+
+        # Register position for tail-end engine
+        if signal.engine == EngineType.TAIL_END and trade.status == OrderStatus.FILLED:
+            self.engine_manager.tail_end.register_position(
+                signal.market_slug,
+                signal.recommended_size
+            )
+
+        return trade
+
+    def _execute_signal_demo(self, trade: Trade, signal: EngineSignal) -> Trade:
+        """Execute signal in demo mode"""
+        submit_start_us = time.perf_counter_ns() // 1000
+
+        # Check demo balance
+        if trade.total_cost > self._demo_balance:
+            trade.status = OrderStatus.REJECTED
+            return trade
+
+        # Check exposure limit
+        if self._demo_exposure + trade.total_cost > self.config.max_total_exposure:
+            trade.status = OrderStatus.REJECTED
+            return trade
+
+        # Simulate instant fill
+        trade.status = OrderStatus.FILLED
+        trade.submit_to_fill_us = (time.perf_counter_ns() // 1000) - submit_start_us
+
+        # Update demo state
+        self._demo_balance -= trade.total_cost
+        self._demo_exposure += trade.total_cost
+
+        # Track positions based on trade type
+        if signal.action == "buy_both":
+            self._demo_positions[signal.market_state.token_a_id] = \
+                self._demo_positions.get(signal.market_state.token_a_id, 0) + trade.size
+            self._demo_positions[signal.market_state.token_b_id] = \
+                self._demo_positions.get(signal.market_state.token_b_id, 0) + trade.size
+        elif signal.action == "buy_yes":
+            self._demo_positions[signal.market_state.token_a_id] = \
+                self._demo_positions.get(signal.market_state.token_a_id, 0) + trade.size
+        elif signal.action == "buy_no":
+            self._demo_positions[signal.market_state.token_b_id] = \
+                self._demo_positions.get(signal.market_state.token_b_id, 0) + trade.size
+
+        return trade
+
+    def _execute_signal_live(self, trade: Trade, signal: EngineSignal) -> Trade:
+        """Execute signal in live mode"""
+        submit_start_us = time.perf_counter_ns() // 1000
+
+        if self._clob_client is None:
+            trade.status = OrderStatus.FAILED
+            return trade
+
+        # Check exposure limit
+        if self._live_exposure + trade.total_cost > self.config.max_total_exposure:
+            trade.status = OrderStatus.REJECTED
+            return trade
+
+        try:
+            from py_clob_client.order_builder.constants import BUY
+
+            buffer = self.config.price_buffer_bps / 10000
+            market = signal.market_state
+
+            if signal.action == "buy_both":
+                # Buy both tokens (sum-to-one)
+                price_a = min((market.token_a_ask or 0) * (1 + buffer), 0.99)
+                price_b = min((market.token_b_ask or 0) * (1 + buffer), 0.99)
+
+                order_a = self._clob_client.create_order(
+                    token_id=market.token_a_id,
+                    price=price_a,
+                    size=trade.size,
+                    side=BUY,
+                )
+                order_b = self._clob_client.create_order(
+                    token_id=market.token_b_id,
+                    price=price_b,
+                    size=trade.size,
+                    side=BUY,
+                )
+
+                result_a = self._clob_client.post_order(order_a)
+                result_b = self._clob_client.post_order(order_b)
+
+                success_a = result_a.get("success") or result_a.get("status") == "matched"
+                success_b = result_b.get("success") or result_b.get("status") == "matched"
+
+                if success_a and success_b:
+                    trade.status = OrderStatus.FILLED
+                    self._live_exposure += trade.total_cost
+                elif success_a or success_b:
+                    trade.status = OrderStatus.PARTIALLY_FILLED
+                else:
+                    trade.status = OrderStatus.REJECTED
+
+            else:
+                # Buy single token (tail-end)
+                token_id = signal.target_token
+                price = min((signal.target_price or 0) * (1 + buffer), 0.99)
+
+                order = self._clob_client.create_order(
+                    token_id=token_id,
+                    price=price,
+                    size=trade.size,
+                    side=BUY,
+                )
+
+                result = self._clob_client.post_order(order)
+                success = result.get("success") or result.get("status") == "matched"
+
+                if success:
+                    trade.status = OrderStatus.FILLED
+                    self._live_exposure += trade.total_cost
+                else:
+                    trade.status = OrderStatus.REJECTED
+
+            trade.submit_to_fill_us = (time.perf_counter_ns() // 1000) - submit_start_us
+
+        except Exception as e:
+            print(f"[HFT] Live execution failed: {e}")
+            trade.status = OrderStatus.FAILED
+
+        return trade
+
+    # -------------------------------------------------------------------------
     # Trade Resolution
     # -------------------------------------------------------------------------
 
@@ -700,6 +1001,10 @@ class HFTClient:
         total_pnl = sum(t.pnl or 0 for t in resolved)
         win_rate = len([t for t in resolved if (t.pnl or 0) > 0]) / len(resolved) if resolved else 0
 
+        # Stats by engine
+        sum_to_one_trades = [t for t in filled if t.engine == "sum_to_one"]
+        tail_end_trades = [t for t in filled if t.engine == "tail_end"]
+
         return {
             "mode": self.mode.value,
             "balance": self.get_balance(),
@@ -710,6 +1015,12 @@ class HFTClient:
             "total_pnl": total_pnl,
             "win_rate": win_rate,
             "latency": self.latency_stats.to_dict(),
+            "engines": self.engine_manager.get_stats(),
+            "enabled_engines": self.get_enabled_engines(),
+            "trades_by_engine": {
+                "sum_to_one": len(sum_to_one_trades),
+                "tail_end": len(tail_end_trades),
+            },
         }
 
     # -------------------------------------------------------------------------
@@ -720,9 +1031,9 @@ class HFTClient:
         """Register trade callback"""
         self._on_trade = callback
 
-    def on_opportunity(self, callback: Callable[[ArbOpportunity], None]):
-        """Register opportunity callback"""
-        self._on_opportunity = callback
+    def on_signal(self, callback: Callable[[EngineSignal], None]):
+        """Register signal callback"""
+        self._on_signal = callback
 
 
 # =============================================================================
@@ -731,21 +1042,21 @@ class HFTClient:
 
 class HFTScanner:
     """
-    High-frequency arbitrage scanner.
+    High-frequency arbitrage scanner with multi-engine support.
 
-    Continuously monitors markets for opportunities and executes trades.
+    Continuously monitors markets and routes to enabled engines:
+    - Sum-to-One: Detects price_sum < $1.00 opportunities
+    - Tail-End: Detects high-probability outcomes near resolution
     """
 
     def __init__(
         self,
         client: HFTClient,
-        markets: list[dict],  # List of {slug, token_a_id, token_b_id}
-        threshold: float = 0.97,
-        scan_interval_ms: int = 100,  # 100ms = 10 scans/second
+        markets: list[dict],  # List of {slug, question, token_a_id, token_b_id, minutes_until, volume_24h}
+        scan_interval_ms: int = 500,  # 500ms default for multi-engine
     ):
         self.client = client
         self.markets = markets
-        self.threshold = threshold
         self.scan_interval_ms = scan_interval_ms
 
         self._running = False
@@ -753,8 +1064,12 @@ class HFTScanner:
 
         # Stats
         self.scans_completed = 0
-        self.opportunities_detected = 0
+        self.signals_detected = 0
         self.trades_executed = 0
+
+        # Stats by engine
+        self.sum_to_one_signals = 0
+        self.tail_end_signals = 0
 
     def start(self):
         """Start the HFT scanner"""
@@ -764,7 +1079,10 @@ class HFTScanner:
         self._running = True
         self._thread = threading.Thread(target=self._scan_loop, daemon=True)
         self._thread.start()
+
+        enabled = self.client.get_enabled_engines()
         print(f"[HFT] Scanner started - {len(self.markets)} markets, {self.scan_interval_ms}ms interval")
+        print(f"[HFT] Enabled engines: {', '.join(enabled) if enabled else 'None'}")
 
     def stop(self):
         """Stop the HFT scanner"""
@@ -774,7 +1092,7 @@ class HFTScanner:
         print("[HFT] Scanner stopped")
 
     def _scan_loop(self):
-        """Main scanning loop"""
+        """Main scanning loop with multi-engine support"""
         while self._running:
             cycle_start = time.perf_counter()
 
@@ -782,23 +1100,36 @@ class HFTScanner:
                 if not self._running:
                     break
 
-                opp = self.client.check_opportunity(
-                    market_slug=market["slug"],
-                    token_a_id=market["token_a_id"],
-                    token_b_id=market["token_b_id"],
-                    threshold=self.threshold,
+                # Check market with all enabled engines
+                signals = self.client.check_market(
+                    market_slug=market.get("slug", ""),
+                    question=market.get("question", ""),
+                    token_a_id=market.get("token_a_id", ""),
+                    token_b_id=market.get("token_b_id", ""),
+                    minutes_until_resolution=market.get("minutes_until"),
+                    volume_24h=market.get("volume_24h"),
                 )
 
-                if opp:
-                    self.opportunities_detected += 1
-                    print(f"[HFT] Opportunity: {opp.market_slug} - {opp.edge*100:.2f}% edge")
+                # Process each signal
+                for signal in signals:
+                    self.signals_detected += 1
 
-                    # Execute immediately
-                    trade = self.client.execute_arb(opp)
+                    # Track by engine
+                    if signal.engine == EngineType.SUM_TO_ONE:
+                        self.sum_to_one_signals += 1
+                        edge_str = f"{signal.arb_edge*100:.2f}% edge" if signal.arb_edge else ""
+                        print(f"[S2O] {signal.market_slug[:30]} - {edge_str}")
+                    else:
+                        self.tail_end_signals += 1
+                        prob_str = f"{signal.implied_probability*100:.1f}% prob" if signal.implied_probability else ""
+                        print(f"[TAIL] {signal.market_slug[:30]} - {signal.action} @ ${signal.target_price:.3f} ({prob_str})")
+
+                    # Execute signal
+                    trade = self.client.execute_signal(signal)
 
                     if trade.status == OrderStatus.FILLED:
                         self.trades_executed += 1
-                        print(f"[HFT] FILLED: {trade.trade_id} - ${trade.total_cost:.2f} @ {trade.total_latency_us/1000:.1f}ms")
+                        print(f"[HFT] FILLED: {trade.trade_id} [{trade.engine}] ${trade.total_cost:.2f} @ {trade.total_latency_us/1000:.1f}ms")
                     else:
                         print(f"[HFT] {trade.status.value}: {trade.trade_id}")
 
@@ -815,11 +1146,15 @@ class HFTScanner:
         return {
             "running": self._running,
             "scans_completed": self.scans_completed,
-            "opportunities_detected": self.opportunities_detected,
+            "signals_detected": self.signals_detected,
             "trades_executed": self.trades_executed,
             "markets_monitored": len(self.markets),
             "scan_interval_ms": self.scan_interval_ms,
-            "client_stats": self.client.get_stats(),
+            "signals_by_engine": {
+                "sum_to_one": self.sum_to_one_signals,
+                "tail_end": self.tail_end_signals,
+            },
+            "enabled_engines": self.client.get_enabled_engines(),
         }
 
 
