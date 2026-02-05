@@ -286,157 +286,105 @@ def discover_markets() -> list[dict]:
 
         # ============================================================
         # FETCH LIVE SPORTS MARKETS
-        # Only actual sports (NBA, NFL, MLB, NHL, UFC, etc.) - not crypto/fed/entertainment
+        # Simple approach: Query /events with sports tag, filter by slug pattern + startDate
         # ============================================================
         print("[HFT] Fetching live sports events...", flush=True)
 
-        # Only these are actual sports leagues
-        REAL_SPORTS_KEYWORDS = [
-            "nba", "nfl", "mlb", "nhl", "ncaa", "college",
-            "ufc", "mma", "boxing", "pfl",
-            "soccer", "football", "premier league", "la liga", "bundesliga", "serie a", "ligue 1", "mls",
-            "tennis", "atp", "wta",
-            "golf", "pga",
-            "f1", "formula", "nascar",
-            "cricket", "ipl",
-            "rugby",
+        # Sports slug patterns that indicate actual games (not futures/props)
+        SPORTS_GAME_PATTERNS = [
+            # Team vs Team patterns
+            "-vs-", "-v-",
+            # League prefixes
+            "nba-", "nfl-", "mlb-", "nhl-", "ncaa-", "cfb-", "cbb-",
+            "ufc-", "mma-", "boxing-", "pfl-",
+            "epl-", "laliga-", "bundesliga-", "seriea-", "ligue1-", "mls-", "ucl-",
+            "atp-", "wta-",
+            "pga-", "lpga-",
+            "f1-", "nascar-",
         ]
 
-        def is_real_sports_league(name: str, slug: str) -> bool:
-            """Check if this is an actual sports league (not Fed rates, crypto, box office, etc.)"""
-            combined = (name + " " + slug).lower()
-            return any(kw in combined for kw in REAL_SPORTS_KEYWORDS)
+        def is_sports_game_slug(slug: str) -> bool:
+            """Check if slug looks like an actual sports game"""
+            slug_lower = slug.lower()
+            return any(pattern in slug_lower for pattern in SPORTS_GAME_PATTERNS)
 
-        def is_game_live(event: dict) -> bool:
-            """Check if a sports game is actually live (started but not ended)"""
-            # REQUIRE startDate to be present and in the past
-            start_date_str = event.get("startDate") or event.get("startDateIso")
-            if not start_date_str:
-                return False  # No start date = can't verify it's live
-
+        def parse_event_start(event: dict) -> datetime | None:
+            """Parse event start date, return None if not parseable"""
+            start_str = event.get("startDate") or event.get("startDateIso")
+            if not start_str or "T" not in str(start_str):
+                return None
             try:
-                if "T" in str(start_date_str):
-                    start_date = datetime.fromisoformat(start_date_str.replace("Z", "+00:00"))
-                    if start_date > now:
-                        return False  # Game hasn't started yet
-                else:
-                    return False  # Can't parse date
+                return datetime.fromisoformat(str(start_str).replace("Z", "+00:00"))
             except:
-                return False  # Can't parse date
-
-            # Check end time - game shouldn't be over
-            end_date_str = event.get("endDate") or event.get("endDateIso")
-            if end_date_str:
-                try:
-                    if "T" in str(end_date_str):
-                        end_date = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
-                        if end_date < now:
-                            return False  # Game already ended
-                except:
-                    pass  # If can't parse end date, assume still in progress
-
-            # Must be active and not closed
-            if event.get("closed") == True:
-                return False
-            if event.get("active") == False:
-                return False
-
-            return True
+                return None
 
         try:
-            # Step 1: Get list of series from /sports
-            resp = requests.get(f"{GAMMA_API}/sports", timeout=30)
+            # Query /events with sports tag_id
+            resp = requests.get(
+                f"{GAMMA_API}/events",
+                params={
+                    "tag_id": SPORTS_TAG_ID,  # 100639
+                    "active": "true",
+                    "closed": "false",
+                    "limit": 200,
+                },
+                timeout=30
+            )
+
             if resp.status_code == 200:
-                all_series = resp.json()
-                print(f"[HFT] Found {len(all_series)} series total", flush=True)
+                events = resp.json()
+                print(f"[HFT] Sports tag returned {len(events)} events", flush=True)
 
-                # Filter to only real sports leagues
-                sports_leagues = []
-                for league in all_series:
-                    league_name = league.get("name") or league.get("title", "")
-                    league_slug = league.get("slug", "")
-                    if is_real_sports_league(league_name, league_slug):
-                        sports_leagues.append(league)
+                for event in events:
+                    event_slug = event.get("slug", "")
+                    event_title = event.get("title", "")
 
-                print(f"[HFT] Filtered to {len(sports_leagues)} actual sports leagues", flush=True)
-
-                # Step 2: Query each sports league for live events
-                for league in sports_leagues:
-                    series_id = (
-                        league.get("series_id") or
-                        league.get("seriesId") or
-                        league.get("id")
-                    )
-                    league_name = league.get("name") or league.get("title", "Unknown")
-
-                    if not series_id:
+                    # Filter 1: Must have sports game slug pattern
+                    if not is_sports_game_slug(event_slug):
                         continue
 
-                    try:
-                        events_resp = requests.get(
-                            f"{GAMMA_API}/events",
-                            params={
-                                "series_id": series_id,
-                                "active": "true",
-                                "closed": "false",
-                                "limit": 100,
-                            },
-                            timeout=10
-                        )
+                    # Filter 2: Must have startDate that's in the past (game started)
+                    start_dt = parse_event_start(event)
+                    if start_dt is None:
+                        continue
+                    if start_dt > now:
+                        continue  # Game hasn't started yet
 
-                        if events_resp.status_code == 200:
-                            events = events_resp.json()
-                            live_count = 0
+                    # Filter 3: Check if not closed/ended
+                    if event.get("closed") == True:
+                        continue
 
-                            for event in events:
-                                # Only include games that are actually LIVE
-                                if not is_game_live(event):
-                                    continue
+                    # This is a live game!
+                    if sports_found < 5:
+                        print(f"[LIVE] {event_title[:60]}... (started: {start_dt})", flush=True)
 
-                                live_count += 1
-                                event_markets = event.get("markets", [])
-                                event_title = event.get("title", "")
+                    event_markets = event.get("markets", [])
+                    for mkt in event_markets:
+                        market_data = parse_market_data(mkt)
+                        if market_data:
+                            market_data["category"] = "sports"
+                            market_data["event_title"] = event_title
 
-                                # Debug live events
-                                if sports_found < 10:
-                                    start_str = event.get("startDate", "?")
-                                    print(f"[LIVE] {league_name}: {event_title[:50]}... (started: {start_str})", flush=True)
+                            # Calculate time until resolution
+                            end_date_str = mkt.get("endDate") or event.get("endDate")
+                            if end_date_str:
+                                try:
+                                    if "T" in str(end_date_str):
+                                        end_date = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
+                                        market_data["minutes_until"] = (end_date - now).total_seconds() / 60
+                                except:
+                                    market_data["minutes_until"] = None
 
-                                for mkt in event_markets:
-                                    market_data = parse_market_data(mkt)
-                                    if market_data:
-                                        market_data["category"] = "sports"
-                                        market_data["league"] = league_name
-                                        market_data["event_title"] = event_title
-
-                                        # Calculate time until resolution
-                                        end_date_str = mkt.get("endDate") or event.get("endDate")
-                                        if end_date_str:
-                                            try:
-                                                if "T" in str(end_date_str):
-                                                    end_date = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
-                                                    market_data["minutes_until"] = (end_date - now).total_seconds() / 60
-                                            except:
-                                                market_data["minutes_until"] = None
-
-                                        markets.append(market_data)
-                                        sports_found += 1
-
-                            if live_count > 0:
-                                print(f"[HFT] {league_name}: {live_count} live games", flush=True)
-
-                    except Exception as e:
-                        print(f"[DEBUG] Error querying {league_name}: {e}", flush=True)
-
-                    time_module.sleep(0.05)  # Rate limiting
+                            markets.append(market_data)
+                            sports_found += 1
 
         except Exception as e:
-            import traceback
-            print(f"[HFT] Error fetching sports: {e}", flush=True)
-            traceback.print_exc()
+            print(f"[HFT] Sports discovery error: {e}", flush=True)
 
         if sports_found == 0:
-            print("[HFT] No live sports games currently in progress", flush=True)
+            print("[HFT] No live sports games found (this is normal if no games are in progress)", flush=True)
+        else:
+            print(f"[HFT] Found {sports_found} live sports markets", flush=True)
 
         print(f"[HFT] Total: {crypto_found} crypto, {sports_found} sports = {len(markets)} markets", flush=True)
         return markets
