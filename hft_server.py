@@ -422,13 +422,13 @@ def start_hft_scanner(
     )
 
     tail_end_config = TailEndConfig(
-        min_probability=0.95,
-        max_probability=0.995,
-        min_price=0.95,
-        max_price=0.99,
-        max_minutes_until_resolution=60,
-        min_minutes_until_resolution=1,
-        min_volume_24h=5000.0,
+        min_probability=0.90,       # 90% = execute
+        max_probability=1.0,        # No max
+        min_price=0.90,             # 90¢ = execute
+        max_price=1.0,              # No max
+        max_minutes_until_resolution=10000,  # Ignore time
+        min_minutes_until_resolution=0,      # Ignore time
+        min_volume_24h=0.0,         # No volume requirement for demo
         max_position_usd=50.0,
     )
 
