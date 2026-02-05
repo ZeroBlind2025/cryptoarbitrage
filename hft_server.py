@@ -186,9 +186,9 @@ def discover_markets() -> list[dict]:
         gamma_scanner = GammaScanner(config)
 
     try:
-        print("[HFT] Calling Gamma API...")
+        print("[HFT] Calling Gamma API...", flush=True)
         result = gamma_scanner.scan()
-        print(f"[HFT] Gamma returned {len(result.targets)} targets")
+        print(f"[HFT] Gamma returned {len(result.targets)} targets", flush=True)
 
         markets = []
         skipped_no_tokens = 0
@@ -214,14 +214,14 @@ def discover_markets() -> list[dict]:
             else:
                 skipped_no_tokens += 1
 
-        print(f"[HFT] Markets with token IDs: {len(markets)}, skipped (no tokens): {skipped_no_tokens}")
+        print(f"[HFT] Markets with token IDs: {len(markets)}, skipped (no tokens): {skipped_no_tokens}", flush=True)
 
         # Log category breakdown
         categories = {}
         for m in markets:
             cat = m.get("category", "unknown")
             categories[cat] = categories.get(cat, 0) + 1
-        print(f"[HFT] Category breakdown: {categories}")
+        print(f"[HFT] Category breakdown: {categories}", flush=True)
 
         return markets
 
@@ -714,8 +714,17 @@ def main():
         print(f"Auto-starting HFT scanner in {args.mode} mode...")
         # Delay to allow Flask to start
         def delayed_start():
+            import sys
             time.sleep(2)
-            start_hft_scanner(args.mode, args.scan_interval)
+            try:
+                print("[AUTO-START] Starting scanner...", flush=True)
+                success, message = start_hft_scanner(args.mode, args.scan_interval)
+                print(f"[AUTO-START] Result: success={success}, message={message}", flush=True)
+            except Exception as e:
+                import traceback
+                print(f"[AUTO-START] ERROR: {e}", flush=True)
+                traceback.print_exc()
+                sys.stdout.flush()
 
         threading.Thread(target=delayed_start, daemon=True).start()
 
