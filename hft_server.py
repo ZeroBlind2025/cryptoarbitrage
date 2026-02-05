@@ -190,6 +190,17 @@ def discover_markets() -> list[dict]:
         result = gamma_scanner.scan()
         print(f"[HFT] Gamma returned {len(result.targets)} targets", flush=True)
 
+        # Debug: show funnel stats to understand where markets are filtered
+        funnel = result.funnel
+        print(f"[HFT] Funnel: fetched={funnel.total_fetched}, active={funnel.passed_active}, "
+              f"binary={funnel.passed_binary}, priced={funnel.passed_priced}, "
+              f"window={funnel.passed_window}, volume={funnel.passed_volume}, "
+              f"threshold={funnel.passed_threshold}", flush=True)
+        print(f"[HFT] Exclusions: inactive={funnel.excluded_inactive}, "
+              f"not_binary={funnel.excluded_not_binary}, no_prices={funnel.excluded_missing_prices}, "
+              f"window={funnel.excluded_outside_window}, volume={funnel.excluded_low_volume}, "
+              f"above_thresh={funnel.excluded_above_threshold}", flush=True)
+
         markets = []
         skipped_no_tokens = 0
         for target in result.targets:
