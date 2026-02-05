@@ -29,10 +29,22 @@ from typing import Optional, Generator
 from flask import Flask, jsonify, render_template, Response, request
 from flask_cors import CORS
 
-# Import scanner components
-from step_c_scanner_v4 import ScanConfig as GammaConfig, MarketScanner as GammaScanner
-from step_d_clob_client import CLOBConfig, CLOBClient
-from step_e_integrated_scanner import IntegratedConfig, IntegratedScanner
+# Import scanner components (with graceful fallback)
+SCANNER_AVAILABLE = False
+try:
+    from step_c_scanner_v4 import ScanConfig as GammaConfig, MarketScanner as GammaScanner
+    from step_d_clob_client import CLOBConfig, CLOBClient
+    from step_e_integrated_scanner import IntegratedConfig, IntegratedScanner
+    SCANNER_AVAILABLE = True
+except ImportError as e:
+    print(f"Warning: Scanner imports failed: {e}")
+    print("Dashboard will run in display-only mode")
+    GammaConfig = None
+    GammaScanner = None
+    CLOBConfig = None
+    CLOBClient = None
+    IntegratedConfig = None
+    IntegratedScanner = None
 
 # =============================================================================
 # APP CONFIGURATION
@@ -40,6 +52,14 @@ from step_e_integrated_scanner import IntegratedConfig, IntegratedScanner
 
 app = Flask(__name__, static_folder='static', template_folder='templates')
 CORS(app)
+
+@app.errorhandler(Exception)
+def handle_exception(e):
+    """Log all errors for debugging"""
+    import traceback
+    print(f"ERROR: {type(e).__name__}: {e}")
+    traceback.print_exc()
+    return jsonify({"error": str(e), "type": type(e).__name__}), 500
 
 # Scanner state
 scanner_state = {
@@ -173,6 +193,10 @@ def start_scanner(mode: str = "scan"):
     """Start the scanner in a background thread"""
     global scanner_thread, stop_scanner
 
+    if not SCANNER_AVAILABLE:
+        print("Scanner not available - imports failed")
+        return False
+
     if scanner_state["is_running"]:
         return False
 
@@ -208,7 +232,8 @@ def stop_scanner_thread():
 @app.route('/')
 def index():
     """Serve the dashboard"""
-    return render_template('index.html')
+    # Serve as static file to avoid Jinja2 interpreting React's {{ }} syntax
+    return app.send_static_file('index.html')
 
 
 @app.route('/api/status')
