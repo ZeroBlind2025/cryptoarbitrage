@@ -174,19 +174,25 @@ def discover_markets() -> list[dict]:
     global gamma_scanner
 
     if gamma_scanner is None:
+        # Use relaxed config to get more markets (not just arb opportunities)
         config = GammaConfig(
             max_resolution_hours=24,
-            min_volume_24h=1000.0,
+            min_volume_24h=500.0,  # Lower volume threshold
             fee_buffer=0.02,
             slippage_buffer=0.005,
             risk_buffer=0.005,
         )
+        # Override the price sum threshold to get ALL markets, not just arb opps
+        config.max_price_sum_threshold = 1.05  # Get everything under $1.05
         gamma_scanner = GammaScanner(config)
 
     try:
+        print("[HFT] Calling Gamma API...")
         result = gamma_scanner.scan()
+        print(f"[HFT] Gamma returned {len(result.targets)} targets")
 
         markets = []
+        skipped_no_tokens = 0
         for target in result.targets:
             token_a_id = target.get("token_a_id")
             token_b_id = target.get("token_b_id")
@@ -206,11 +212,24 @@ def discover_markets() -> list[dict]:
                     "volume_24h": target.get("volume_24h"),
                     "category": category,
                 })
+            else:
+                skipped_no_tokens += 1
+
+        print(f"[HFT] Markets with token IDs: {len(markets)}, skipped (no tokens): {skipped_no_tokens}")
+
+        # Log category breakdown
+        categories = {}
+        for m in markets:
+            cat = m.get("category", "unknown")
+            categories[cat] = categories.get(cat, 0) + 1
+        print(f"[HFT] Category breakdown: {categories}")
 
         return markets
 
     except Exception as e:
+        import traceback
         print(f"[HFT] Market discovery failed: {e}")
+        traceback.print_exc()
         return []
 
 
