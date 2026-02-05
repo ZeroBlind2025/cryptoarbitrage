@@ -286,22 +286,43 @@ def discover_markets() -> list[dict]:
 
         # ============================================================
         # FETCH LIVE SPORTS MARKETS
-        # Use /sports -> /events flow to find games actually in progress
+        # Only actual sports (NBA, NFL, MLB, NHL, UFC, etc.) - not crypto/fed/entertainment
         # ============================================================
         print("[HFT] Fetching live sports events...", flush=True)
 
-        def is_event_live(event: dict) -> bool:
-            """Check if a sports event is actually live (game in progress)"""
-            # Check start time - game must have started
+        # Only these are actual sports leagues
+        REAL_SPORTS_KEYWORDS = [
+            "nba", "nfl", "mlb", "nhl", "ncaa", "college",
+            "ufc", "mma", "boxing", "pfl",
+            "soccer", "football", "premier league", "la liga", "bundesliga", "serie a", "ligue 1", "mls",
+            "tennis", "atp", "wta",
+            "golf", "pga",
+            "f1", "formula", "nascar",
+            "cricket", "ipl",
+            "rugby",
+        ]
+
+        def is_real_sports_league(name: str, slug: str) -> bool:
+            """Check if this is an actual sports league (not Fed rates, crypto, box office, etc.)"""
+            combined = (name + " " + slug).lower()
+            return any(kw in combined for kw in REAL_SPORTS_KEYWORDS)
+
+        def is_game_live(event: dict) -> bool:
+            """Check if a sports game is actually live (started but not ended)"""
+            # REQUIRE startDate to be present and in the past
             start_date_str = event.get("startDate") or event.get("startDateIso")
-            if start_date_str:
-                try:
-                    if "T" in str(start_date_str):
-                        start_date = datetime.fromisoformat(start_date_str.replace("Z", "+00:00"))
-                        if start_date > now:
-                            return False  # Game hasn't started yet
-                except:
-                    pass
+            if not start_date_str:
+                return False  # No start date = can't verify it's live
+
+            try:
+                if "T" in str(start_date_str):
+                    start_date = datetime.fromisoformat(start_date_str.replace("Z", "+00:00"))
+                    if start_date > now:
+                        return False  # Game hasn't started yet
+                else:
+                    return False  # Can't parse date
+            except:
+                return False  # Can't parse date
 
             # Check end time - game shouldn't be over
             end_date_str = event.get("endDate") or event.get("endDateIso")
@@ -312,7 +333,7 @@ def discover_markets() -> list[dict]:
                         if end_date < now:
                             return False  # Game already ended
                 except:
-                    pass
+                    pass  # If can't parse end date, assume still in progress
 
             # Must be active and not closed
             if event.get("closed") == True:
@@ -323,34 +344,35 @@ def discover_markets() -> list[dict]:
             return True
 
         try:
-            # Step 1: Get list of sports leagues from /sports
+            # Step 1: Get list of series from /sports
             resp = requests.get(f"{GAMMA_API}/sports", timeout=30)
             if resp.status_code == 200:
-                leagues = resp.json()
-                print(f"[HFT] Found {len(leagues)} sports leagues", flush=True)
+                all_series = resp.json()
+                print(f"[HFT] Found {len(all_series)} series total", flush=True)
 
-                # Debug: Show league structure
-                if leagues:
-                    sample = leagues[0]
-                    print(f"[DEBUG] League fields: {list(sample.keys())}", flush=True)
+                # Filter to only real sports leagues
+                sports_leagues = []
+                for league in all_series:
+                    league_name = league.get("name") or league.get("title", "")
+                    league_slug = league.get("slug", "")
+                    if is_real_sports_league(league_name, league_slug):
+                        sports_leagues.append(league)
 
-                # Step 2: Query each league for live events
-                for league in leagues:
-                    # Polymarket uses different field names - try common ones
+                print(f"[HFT] Filtered to {len(sports_leagues)} actual sports leagues", flush=True)
+
+                # Step 2: Query each sports league for live events
+                for league in sports_leagues:
                     series_id = (
                         league.get("series_id") or
                         league.get("seriesId") or
                         league.get("id")
                     )
                     league_name = league.get("name") or league.get("title", "Unknown")
-                    league_slug = league.get("slug", "")
 
                     if not series_id:
-                        print(f"[DEBUG] No series_id for league: {league}", flush=True)
                         continue
 
                     try:
-                        # Get events for this league
                         events_resp = requests.get(
                             f"{GAMMA_API}/events",
                             params={
@@ -367,19 +389,18 @@ def discover_markets() -> list[dict]:
                             live_count = 0
 
                             for event in events:
-                                # Only include events where game is actually live
-                                if not is_event_live(event):
+                                # Only include games that are actually LIVE
+                                if not is_game_live(event):
                                     continue
 
                                 live_count += 1
                                 event_markets = event.get("markets", [])
-                                event_slug = event.get("slug", "")
                                 event_title = event.get("title", "")
 
-                                # Debug first few live events
+                                # Debug live events
                                 if sports_found < 10:
                                     start_str = event.get("startDate", "?")
-                                    print(f"[LIVE] {league_name}: {event_title[:40]}... (started: {start_str})", flush=True)
+                                    print(f"[LIVE] {league_name}: {event_title[:50]}... (started: {start_str})", flush=True)
 
                                 for mkt in event_markets:
                                     market_data = parse_market_data(mkt)
@@ -402,7 +423,7 @@ def discover_markets() -> list[dict]:
                                         sports_found += 1
 
                             if live_count > 0:
-                                print(f"[HFT] {league_name}: {live_count} live events", flush=True)
+                                print(f"[HFT] {league_name}: {live_count} live games", flush=True)
 
                     except Exception as e:
                         print(f"[DEBUG] Error querying {league_name}: {e}", flush=True)
@@ -411,8 +432,11 @@ def discover_markets() -> list[dict]:
 
         except Exception as e:
             import traceback
-            print(f"[HFT] Error fetching sports leagues: {e}", flush=True)
+            print(f"[HFT] Error fetching sports: {e}", flush=True)
             traceback.print_exc()
+
+        if sports_found == 0:
+            print("[HFT] No live sports games currently in progress", flush=True)
 
         print(f"[HFT] Total: {crypto_found} crypto, {sports_found} sports = {len(markets)} markets", flush=True)
         return markets
