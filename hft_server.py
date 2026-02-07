@@ -345,8 +345,16 @@ def discover_markets() -> list[dict]:
                 events = resp.json()
                 print(f"[HFT] Total active events: {len(events)}", flush=True)
 
+                # Debug: show some event slugs to see what we're getting
+                sample_slugs = [e.get("slug", "")[:40] for e in events[:10]]
+                print(f"[DEBUG] Sample slugs: {sample_slugs}", flush=True)
+
                 live_events = 0
                 sports_checked = 0
+                skipped_no_date = 0
+                skipped_wrong_date = 0
+                skipped_ended = 0
+
                 for event in events:
                     event_slug = event.get("slug", "")
                     event_title = event.get("title", "")
@@ -359,9 +367,11 @@ def discover_markets() -> list[dict]:
                     # Filter 2: Extract date from slug - must be today or yesterday
                     slug_date = extract_date_from_slug(event_slug)
                     if slug_date is None:
+                        skipped_no_date += 1
                         continue
 
                     if slug_date != today_str and slug_date != yesterday_str:
+                        skipped_wrong_date += 1
                         continue  # Old game or future game
 
                     # Filter 3: Check if not closed
@@ -377,6 +387,7 @@ def discover_markets() -> list[dict]:
                                 minutes_until_end = (event_end - now).total_seconds() / 60
                                 # Skip if game ended more than 30 min ago
                                 if minutes_until_end < -30:
+                                    skipped_ended += 1
                                     continue  # Game is over
                         except:
                             pass
@@ -406,7 +417,8 @@ def discover_markets() -> list[dict]:
                             markets.append(market_data)
                             sports_found += 1
 
-                print(f"[HFT] Checked {sports_checked} sports events, found {live_events} live with {sports_found} markets", flush=True)
+                print(f"[HFT] Sports: {sports_checked} checked, {skipped_no_date} no date, {skipped_wrong_date} wrong date, {skipped_ended} ended", flush=True)
+                print(f"[HFT] Found {live_events} live events with {sports_found} markets", flush=True)
 
         except Exception as e:
             print(f"[HFT] Sports discovery error: {e}", flush=True)
