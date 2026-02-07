@@ -317,6 +317,11 @@ class TailEndConfig:
     # Risk management
     max_concurrent_positions: int = 5
 
+    # Minimum risk-adjusted EV (set to 0 for sports where game state > market price)
+    # Default 0.5% EV requirement - but for sports tail-end this should be 0
+    # because we're betting on game state (score/time), not market efficiency
+    min_risk_adjusted_ev: float = 0.005
+
     # Market type filter: only analyze these categories
     # Default: focus on sports markets for tail-end
     sports_only: bool = True
@@ -437,9 +442,12 @@ class TailEndEngine:
         expected_profit = 1.0 - ask
 
         # Risk-adjusted profit (probability of winning * profit - probability of losing * cost)
+        # NOTE: For sports, prob comes from market price, so risk_adjusted ≈ 0 on efficient markets
+        # The real edge comes from game state (score/time) which isn't captured here
+        # Set min_risk_adjusted_ev=0 in config to disable this filter for sports
         risk_adjusted = (prob * expected_profit) - ((1 - prob) * ask)
 
-        if risk_adjusted < 0.005:  # Minimum 0.5% expected value
+        if risk_adjusted < self.config.min_risk_adjusted_ev:
             return None
 
         # Calculate sizing

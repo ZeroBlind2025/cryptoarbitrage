@@ -882,6 +882,8 @@ def start_hft_scanner(
         min_minutes_until_resolution=0,      # Ignore time
         min_volume_24h=0.0,         # No volume requirement for demo
         max_position_usd=50.0,
+        min_risk_adjusted_ev=0.0,   # Disable EV filter - sports edge comes from game state, not market price
+        min_depth_usd=5.0,          # Lower depth requirement to catch more opportunities
     )
 
     # Create HFT client
