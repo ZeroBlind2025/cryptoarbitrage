@@ -384,8 +384,27 @@ def discover_markets() -> list[dict]:
 
             return True
 
+        # First try querying sports tag directly (tag_id 100639 is sports)
+        sports_tag_events = []
         try:
-            # Query ALL active events (no tag filter)
+            resp_tag = requests.get(
+                f"{GAMMA_API}/events",
+                params={
+                    "tag_id": 100639,  # Sports tag
+                    "active": "true",
+                    "closed": "false",
+                    "limit": 500,
+                },
+                timeout=30
+            )
+            if resp_tag.status_code == 200:
+                sports_tag_events = resp_tag.json()
+                print(f"[HFT] Sports tag query returned: {len(sports_tag_events)} events", flush=True)
+        except Exception as e:
+            print(f"[HFT] Sports tag query error: {e}", flush=True)
+
+        try:
+            # Query ALL active events (no tag filter) - to catch any we might have missed
             resp = requests.get(
                 f"{GAMMA_API}/events",
                 params={
@@ -395,10 +414,21 @@ def discover_markets() -> list[dict]:
                 },
                 timeout=30
             )
+            # Combine with sports tag events
+            all_tag_slugs = {e.get("slug") for e in sports_tag_events}
 
             if resp.status_code == 200:
                 events = resp.json()
                 print(f"[HFT] Total active events: {len(events)}", flush=True)
+
+                # Merge sports tag events that aren't already in the general events
+                for tag_event in sports_tag_events:
+                    if tag_event.get("slug") not in all_tag_slugs:
+                        events.append(tag_event)
+
+                # Add sports tag events to beginning (they're more likely to be sports)
+                events = sports_tag_events + [e for e in events if e.get("slug") not in all_tag_slugs]
+                print(f"[HFT] Combined events to check: {len(events)}", flush=True)
 
                 # Debug: show sports events we're finding (by slug or title)
                 sports_sample = []
@@ -407,7 +437,7 @@ def discover_markets() -> list[dict]:
                     title = e.get("title", "")
                     if is_sports_event(slug, title):
                         sports_sample.append(f"{slug[:40]}|{title[:30]}")
-                        if len(sports_sample) >= 10:
+                        if len(sports_sample) >= 15:
                             break
                 print(f"[DEBUG] Sports sample (slug|title): {sports_sample}", flush=True)
 
