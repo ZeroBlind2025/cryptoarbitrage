@@ -319,10 +319,34 @@ def discover_markets() -> list[dict]:
             "cricket-", "ipl-", "rugby-",
         ]
 
+        # Sports title keywords for fallback matching
+        SPORTS_KEYWORDS = [
+            "nba", "nfl", "nhl", "mlb", "ncaa", "wnba", "cbb", "cfb",
+            "ufc", "mma", "boxing",
+            "premier league", "la liga", "bundesliga", "serie a", "ligue 1", "mls", "champions league",
+            "atp", "wta", "tennis",
+            "pga", "lpga", "golf",
+            "formula 1", "f1", "nascar", "indycar",
+            "clippers", "lakers", "celtics", "warriors", "nets", "bulls", "heat", "knicks", "76ers", "bucks",
+            "kings", "grizzlies", "blazers", "trail blazers", "suns", "mavericks", "nuggets", "spurs", "rockets",
+            "patriots", "cowboys", "chiefs", "eagles", "49ers", "bills", "ravens", "dolphins", "jets", "giants",
+            "bruins", "rangers", "maple leafs", "penguins", "blackhawks", "flyers", "capitals", "avalanche",
+            "vs.", " v ", " vs "
+        ]
+
         def is_sports_slug(slug: str) -> bool:
             """Check if slug starts with a known sports prefix"""
             slug_lower = slug.lower()
             return any(slug_lower.startswith(prefix) for prefix in SPORTS_PREFIXES)
+
+        def is_sports_event(slug: str, title: str) -> bool:
+            """Check if event is sports-related by slug prefix OR title keywords"""
+            # First check slug prefix
+            if is_sports_slug(slug):
+                return True
+            # Fallback: check title for sports keywords
+            title_lower = title.lower()
+            return any(kw in title_lower for kw in SPORTS_KEYWORDS)
 
         def extract_date_from_slug(slug: str) -> str | None:
             """Extract YYYY-MM-DD date from slug if present"""
@@ -330,6 +354,35 @@ def discover_markets() -> list[dict]:
             if match:
                 return match.group(1)
             return None
+
+        def is_event_live_or_upcoming(event: dict, max_hours_ahead: int = 24) -> bool:
+            """Check if event is live or starting within max_hours_ahead hours"""
+            now_utc = datetime.now(timezone.utc)
+
+            # Check endDate - if ended more than 30 min ago, skip
+            end_str = event.get("endDate") or event.get("endDateIso")
+            if end_str:
+                try:
+                    if "T" in str(end_str):
+                        end_dt = datetime.fromisoformat(end_str.replace("Z", "+00:00"))
+                        if (end_dt - now_utc).total_seconds() < -1800:  # Ended 30+ min ago
+                            return False
+                except:
+                    pass
+
+            # Check startDate - if more than max_hours_ahead in future, skip
+            start_str = event.get("startDate") or event.get("startDateIso") or event.get("createdAt")
+            if start_str:
+                try:
+                    if "T" in str(start_str):
+                        start_dt = datetime.fromisoformat(start_str.replace("Z", "+00:00"))
+                        hours_until_start = (start_dt - now_utc).total_seconds() / 3600
+                        if hours_until_start > max_hours_ahead:
+                            return False  # Too far in future
+                except:
+                    pass
+
+            return True
 
         try:
             # Query ALL active events (no tag filter)
@@ -347,57 +400,61 @@ def discover_markets() -> list[dict]:
                 events = resp.json()
                 print(f"[HFT] Total active events: {len(events)}", flush=True)
 
-                # Debug: show some event slugs to see what we're getting
-                sample_slugs = [e.get("slug", "")[:40] for e in events[:10]]
-                print(f"[DEBUG] Sample slugs: {sample_slugs}", flush=True)
+                # Debug: show sports events we're finding (by slug or title)
+                sports_sample = []
+                for e in events:
+                    slug = e.get("slug", "")
+                    title = e.get("title", "")
+                    if is_sports_event(slug, title):
+                        sports_sample.append(f"{slug[:40]}|{title[:30]}")
+                        if len(sports_sample) >= 10:
+                            break
+                print(f"[DEBUG] Sports sample (slug|title): {sports_sample}", flush=True)
 
                 live_events = 0
                 sports_checked = 0
-                skipped_no_date = 0
-                skipped_wrong_date = 0
+                skipped_not_live = 0
                 skipped_ended = 0
 
                 for event in events:
                     event_slug = event.get("slug", "")
                     event_title = event.get("title", "")
 
-                    # Filter 1: Must be a sports slug
-                    if not is_sports_slug(event_slug):
+                    # Filter 1: Must be a sports event (by slug OR title)
+                    if not is_sports_event(event_slug, event_title):
                         continue
                     sports_checked += 1
 
-                    # Filter 2: Extract date from slug - must be today or yesterday
-                    slug_date = extract_date_from_slug(event_slug)
-                    if slug_date is None:
-                        skipped_no_date += 1
-                        continue
-
-                    if slug_date not in valid_dates:
-                        skipped_wrong_date += 1
-                        continue  # Old game or future game
-
-                    # Filter 3: Check if not closed
+                    # Filter 2: Check if not closed
                     if event.get("closed") == True:
                         continue
 
-                    # Filter 4: Check if game has ended (endDate in the past)
-                    event_end_str = event.get("endDate") or event.get("endDateIso")
-                    if event_end_str:
-                        try:
-                            if "T" in str(event_end_str):
-                                event_end = datetime.fromisoformat(event_end_str.replace("Z", "+00:00"))
-                                minutes_until_end = (event_end - now).total_seconds() / 60
-                                # Skip if game ended more than 30 min ago
-                                if minutes_until_end < -30:
-                                    skipped_ended += 1
-                                    continue  # Game is over
-                        except:
-                            pass
+                    # Filter 3: Check if live or upcoming (within 24 hours)
+                    # This replaces the strict date-in-slug check
+                    if not is_event_live_or_upcoming(event, max_hours_ahead=24):
+                        skipped_not_live += 1
+                        continue
+
+                    # Optional: If there IS a date in slug, verify it's valid
+                    slug_date = extract_date_from_slug(event_slug)
+                    if slug_date and slug_date not in valid_dates:
+                        # Date in slug but it's old - check endDate as fallback
+                        event_end_str = event.get("endDate") or event.get("endDateIso")
+                        if event_end_str:
+                            try:
+                                if "T" in str(event_end_str):
+                                    event_end = datetime.fromisoformat(event_end_str.replace("Z", "+00:00"))
+                                    minutes_until_end = (event_end - now).total_seconds() / 60
+                                    if minutes_until_end < -30:
+                                        skipped_ended += 1
+                                        continue  # Game is definitely over
+                            except:
+                                pass
 
                     # This is a live sports event!
                     live_events += 1
-                    if live_events <= 10:
-                        print(f"[LIVE] {event_slug[:50]}... (date: {slug_date})", flush=True)
+                    if live_events <= 15:
+                        print(f"[LIVE] {event_slug[:60]} (title: {event_title[:30]})", flush=True)
 
                     event_markets = event.get("markets", [])
                     for mkt in event_markets:
@@ -419,7 +476,7 @@ def discover_markets() -> list[dict]:
                             markets.append(market_data)
                             sports_found += 1
 
-                print(f"[HFT] Sports: {sports_checked} checked, {skipped_no_date} no date, {skipped_wrong_date} wrong date, {skipped_ended} ended", flush=True)
+                print(f"[HFT] Sports: {sports_checked} checked, {skipped_not_live} not live/upcoming, {skipped_ended} ended", flush=True)
                 print(f"[HFT] Found {live_events} live events with {sports_found} markets from /events", flush=True)
 
         except Exception as e:
@@ -443,14 +500,23 @@ def discover_markets() -> list[dict]:
                     fallback_found = 0
                     for mkt in all_markets:
                         slug = mkt.get("slug", "")
-                        if not is_sports_slug(slug):
-                            continue
-                        slug_date = extract_date_from_slug(slug)
-                        if slug_date is None or slug_date not in valid_dates:
+                        question = mkt.get("question", "")
+                        # Check by slug prefix OR question keywords
+                        if not is_sports_event(slug, question):
                             continue
                         # Check if already added
                         if any(m["slug"] == slug for m in markets):
                             continue
+                        # Check if market appears active (not ended)
+                        end_str = mkt.get("endDate") or mkt.get("endDateIso")
+                        if end_str:
+                            try:
+                                if "T" in str(end_str):
+                                    end_dt = datetime.fromisoformat(end_str.replace("Z", "+00:00"))
+                                    if (end_dt - now).total_seconds() < -1800:  # Ended 30+ min ago
+                                        continue
+                            except:
+                                pass
                         market_data = parse_market_data(mkt)
                         if market_data:
                             market_data["category"] = "sports"
