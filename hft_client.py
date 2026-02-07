@@ -416,7 +416,18 @@ class HFTClient:
             return book
 
         except Exception as e:
-            print(f"[HFT] Order book fetch failed: {e}")
+            # Only log first few errors per token to avoid spam
+            if not hasattr(self, '_book_errors'):
+                self._book_errors = {}
+
+            if token_id not in self._book_errors:
+                self._book_errors[token_id] = 0
+            self._book_errors[token_id] += 1
+
+            # Log first error for each token, then suppress
+            if self._book_errors[token_id] == 1:
+                print(f"[HFT] Order book 404: {token_id[:20]}... (market may not have CLOB liquidity)")
+
             return None
 
     def _parse_order_book(self, token_id: str, data: dict) -> OrderBook:
