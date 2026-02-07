@@ -384,6 +384,26 @@ def discover_markets() -> list[dict]:
 
             return True
 
+        def is_short_term_game(event: dict) -> bool:
+            """Check if event is a short-term game (resolves within 48 hours) vs season-long future"""
+            now_utc = datetime.now(timezone.utc)
+            end_str = event.get("endDate") or event.get("endDateIso")
+            if end_str:
+                try:
+                    if "T" in str(end_str):
+                        end_dt = datetime.fromisoformat(end_str.replace("Z", "+00:00"))
+                        hours_until_end = (end_dt - now_utc).total_seconds() / 3600
+                        # Short-term = resolves within 48 hours
+                        return hours_until_end < 48 and hours_until_end > -0.5
+                except:
+                    pass
+            # If no endDate, check if slug has today's date (indicates daily game)
+            slug = event.get("slug", "")
+            slug_date = extract_date_from_slug(slug)
+            if slug_date and slug_date in valid_dates:
+                return True
+            return False
+
         # First try querying sports tag directly (tag_id 100639 is sports)
         sports_tag_events = []
         try:
@@ -442,6 +462,8 @@ def discover_markets() -> list[dict]:
                 print(f"[DEBUG] Sports sample (slug|title): {sports_sample}", flush=True)
 
                 live_events = 0
+                short_term_games = 0
+                long_term_futures = 0
                 sports_checked = 0
                 skipped_not_live = 0
                 skipped_ended = 0
@@ -481,10 +503,19 @@ def discover_markets() -> list[dict]:
                             except:
                                 pass
 
+                    # Categorize: short-term game vs long-term future
+                    is_short = is_short_term_game(event)
+                    if is_short:
+                        short_term_games += 1
+
                     # This is a live sports event!
                     live_events += 1
-                    if live_events <= 15:
-                        print(f"[LIVE] {event_slug[:60]} (title: {event_title[:30]})", flush=True)
+                    # Log short-term games (live games) more prominently
+                    if is_short and short_term_games <= 15:
+                        print(f"[LIVE GAME] {event_slug[:55]} ({event_title[:25]})", flush=True)
+                    elif not is_short and long_term_futures <= 5:
+                        long_term_futures += 1
+                        print(f"[FUTURE] {event_slug[:55]} ({event_title[:25]})", flush=True)
 
                     event_markets = event.get("markets", [])
                     for mkt in event_markets:
@@ -506,8 +537,8 @@ def discover_markets() -> list[dict]:
                             markets.append(market_data)
                             sports_found += 1
 
-                print(f"[HFT] Sports: {sports_checked} checked, {skipped_not_live} not live/upcoming, {skipped_ended} ended", flush=True)
-                print(f"[HFT] Found {live_events} live events with {sports_found} markets from /events", flush=True)
+                print(f"[HFT] Sports: {sports_checked} total, {short_term_games} live games, {live_events - short_term_games} futures", flush=True)
+                print(f"[HFT] Found {live_events} events with {sports_found} markets ({skipped_not_live} skipped not live, {skipped_ended} ended)", flush=True)
 
         except Exception as e:
             print(f"[HFT] Sports /events error: {e}", flush=True)
