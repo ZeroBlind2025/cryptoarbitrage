@@ -347,6 +347,7 @@ def discover_markets() -> list[dict]:
             "ufc-", "mma-", "boxing-", "pfl-",
             "epl-", "laliga-", "bundesliga-", "seriea-", "ligue1-", "mls-", "ucl-",
             "scop-", "bra-", "arg-", "liga-",  # Scottish, Brazilian, Argentine leagues
+            "ligamx-", "mexico-", "mex-", "clausura-", "apertura-",  # Liga MX / Mexican soccer
             "atp-", "wta-", "tennis-",
             "pga-", "lpga-", "golf-",
             "f1-", "nascar-", "indycar-",
@@ -358,11 +359,19 @@ def discover_markets() -> list[dict]:
             "nba", "nfl", "nhl", "mlb", "ncaa", "wnba", "cbb", "cfb",
             "ufc", "mma", "boxing",
             "premier league", "la liga", "bundesliga", "serie a", "ligue 1", "mls", "champions league",
+            # Liga MX / Mexican soccer teams and keywords
+            "liga mx", "ligamx", "clausura", "apertura",
+            "america", "chivas", "cruz azul", "pumas", "tigres", "monterrey", "santos laguna",
+            "toluca", "leon", "pachuca", "atlas", "guadalajara", "necaxa", "queretaro", "puebla",
+            "mazatlan", "juarez", "tijuana", "san luis", "atletico san luis",
             "atp", "wta", "tennis",
             "pga", "lpga", "golf",
             "formula 1", "f1", "nascar", "indycar",
+            # NBA teams
             "clippers", "lakers", "celtics", "warriors", "nets", "bulls", "heat", "knicks", "76ers", "bucks",
             "kings", "grizzlies", "blazers", "trail blazers", "suns", "mavericks", "nuggets", "spurs", "rockets",
+            "timberwolves", "pelicans", "thunder", "jazz", "pistons", "pacers", "hornets", "magic", "hawks", "cavaliers", "raptors", "wizards",
+            # NFL teams
             "patriots", "cowboys", "chiefs", "eagles", "49ers", "bills", "ravens", "dolphins", "jets", "giants",
             "bruins", "rangers", "maple leafs", "penguins", "blackhawks", "flyers", "capitals", "avalanche",
             "vs.", " v ", " vs "
@@ -654,6 +663,50 @@ def discover_markets() -> list[dict]:
                         print(f"[HFT] NBA search '{nba_search}' found {nba_found} markets", flush=True)
             except Exception as e:
                 pass  # NBA search is optional
+
+        # ADDITIONAL: Direct search for Liga MX (Mexican soccer) games
+        for ligamx_search in ["ligamx-", "mexico-", "clausura-", "apertura-", "chivas", "tigres", "america-", "cruz-azul"]:
+            try:
+                resp_mx = requests.get(
+                    f"{GAMMA_API}/markets",
+                    params={
+                        "slug_contains": ligamx_search,
+                        "active": "true",
+                        "closed": "false",
+                        "limit": 50,
+                    },
+                    timeout=15
+                )
+                if resp_mx.status_code == 200:
+                    mx_markets = resp_mx.json()
+                    mx_found = 0
+                    for mkt in mx_markets:
+                        slug = mkt.get("slug", "")
+                        if any(m["slug"] == slug for m in markets):
+                            continue
+                        # Check if it's a short-term game
+                        end_str = mkt.get("endDate") or mkt.get("endDateIso")
+                        if end_str:
+                            try:
+                                if "T" in str(end_str):
+                                    end_dt = datetime.fromisoformat(end_str.replace("Z", "+00:00"))
+                                    hours_until = (end_dt - now).total_seconds() / 3600
+                                    if hours_until < -0.5 or hours_until > 48:
+                                        continue  # Not a current game
+                            except:
+                                pass
+                        market_data = parse_market_data(mkt)
+                        if market_data:
+                            market_data["category"] = "sports"
+                            markets.append(market_data)
+                            sports_found += 1
+                            mx_found += 1
+                            if mx_found <= 5:
+                                print(f"[LIGA MX] Found: {slug[:50]}", flush=True)
+                    if mx_found > 0:
+                        print(f"[HFT] Liga MX search '{ligamx_search}' found {mx_found} markets", flush=True)
+            except Exception as e:
+                pass  # Liga MX search is optional
 
         # FALLBACK: Also try /markets directly if /events didn't find much
         if sports_found < 10:
