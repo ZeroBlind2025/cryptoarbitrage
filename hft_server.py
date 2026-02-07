@@ -49,6 +49,8 @@ from arb_engines import (
     SumToOneConfig,
     TailEndConfig,
 )
+from sports_ws import SportsWebSocket
+
 # Note: Using direct API calls for market discovery instead of GammaScanner
 # to be more targeted (only crypto 15-min and live sports markets)
 
@@ -93,6 +95,10 @@ MARKET_REFRESH_INTERVAL_MINUTES = 15
 refresh_thread: Optional[threading.Thread] = None
 stop_refresh = threading.Event()
 
+# Sports WebSocket for real-time game data
+sports_ws: Optional[SportsWebSocket] = None
+live_sports_data: dict[str, dict] = {}  # event_id -> data from WebSocket
+
 
 # =============================================================================
 # CALLBACKS
@@ -122,6 +128,30 @@ def log_trade(trade: Trade):
     log_file = log_dir / f"trades_{trade.mode.value}.jsonl"
     with open(log_file, "a") as f:
         f.write(json.dumps(trade.to_dict()) + "\n")
+
+
+def on_sports_update(data: dict):
+    """Handle real-time sports update from WebSocket"""
+    global live_sports_data
+    event_id = data.get("eventId") or data.get("event_id") or data.get("id") or data.get("gameId")
+    if event_id:
+        live_sports_data[event_id] = {
+            "data": data,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        # Log significant updates (score changes, period changes)
+        if data.get("type") in ["score", "period_change", "game_end"]:
+            print(f"[SPORTS WS] {data.get('type')}: {data}", flush=True)
+
+
+def on_sports_connect():
+    """Handle sports WebSocket connection"""
+    print("[SPORTS WS] Connected to real-time sports feed!", flush=True)
+
+
+def on_sports_disconnect():
+    """Handle sports WebSocket disconnection"""
+    print("[SPORTS WS] Disconnected from sports feed", flush=True)
 
 
 # =============================================================================
@@ -294,6 +324,10 @@ def discover_markets() -> list[dict]:
         # Query ALL events, filter by sports slug prefix + today's date + not ended
         # ============================================================
         print("[HFT] Fetching live sports events...", flush=True)
+
+        # Check if we have real-time data from Sports WebSocket
+        if live_sports_data:
+            print(f"[HFT] Sports WebSocket has {len(live_sports_data)} live events tracked", flush=True)
 
         import re
         from zoneinfo import ZoneInfo
@@ -543,6 +577,39 @@ def discover_markets() -> list[dict]:
         except Exception as e:
             print(f"[HFT] Sports /events error: {e}", flush=True)
 
+        # ADDITIONAL: Search for today's games by date in slug
+        # This specifically targets "nba-xxx-xxx-2026-02-07" style slugs
+        for date_to_search in [today_str, yesterday_str]:
+            try:
+                resp_date = requests.get(
+                    f"{GAMMA_API}/markets",
+                    params={
+                        "slug_contains": date_to_search,
+                        "active": "true",
+                        "closed": "false",
+                        "limit": 100,
+                    },
+                    timeout=15
+                )
+                if resp_date.status_code == 200:
+                    date_markets = resp_date.json()
+                    date_found = 0
+                    for mkt in date_markets:
+                        slug = mkt.get("slug", "")
+                        if any(m["slug"] == slug for m in markets):
+                            continue
+                        if is_sports_slug(slug):
+                            market_data = parse_market_data(mkt)
+                            if market_data:
+                                market_data["category"] = "sports"
+                                markets.append(market_data)
+                                sports_found += 1
+                                date_found += 1
+                    if date_found > 0:
+                        print(f"[HFT] Date search '{date_to_search}' found {date_found} additional markets", flush=True)
+            except Exception as e:
+                pass  # Date search is optional
+
         # FALLBACK: Also try /markets directly if /events didn't find much
         if sports_found < 10:
             print(f"[HFT] Trying /markets fallback...", flush=True)
@@ -650,10 +717,24 @@ def start_hft_scanner(
     enable_tail_end: bool = True,
 ):
     """Start the HFT scanner with configurable engines"""
-    global hft_client, hft_scanner, active_markets, server_state
+    global hft_client, hft_scanner, active_markets, server_state, sports_ws
 
     if server_state["is_running"]:
         return False, "Scanner already running"
+
+    # Start Sports WebSocket for real-time game data
+    print("[HFT] Starting Sports WebSocket...", flush=True)
+    try:
+        sports_ws = SportsWebSocket(
+            on_update=on_sports_update,
+            on_connect=on_sports_connect,
+            on_disconnect=on_sports_disconnect,
+        )
+        sports_ws.start()
+        # Give it a moment to connect and receive initial data
+        time.sleep(2)
+    except Exception as e:
+        print(f"[HFT] Sports WebSocket error (continuing without): {e}", flush=True)
 
     # Discover markets first
     print("[HFT] Discovering markets...")
@@ -727,7 +808,7 @@ def start_hft_scanner(
 
 def stop_hft_scanner():
     """Stop the HFT scanner"""
-    global hft_scanner, server_state, refresh_thread, stop_refresh
+    global hft_scanner, server_state, refresh_thread, stop_refresh, sports_ws
 
     if not server_state["is_running"]:
         return False, "Scanner not running"
@@ -736,6 +817,13 @@ def stop_hft_scanner():
     stop_refresh.set()
     if refresh_thread and refresh_thread.is_alive():
         refresh_thread.join(timeout=5)
+
+    # Stop sports WebSocket
+    if sports_ws:
+        try:
+            sports_ws.stop()
+        except:
+            pass
 
     if hft_scanner:
         hft_scanner.stop()
@@ -971,6 +1059,16 @@ def api_opportunities():
 def api_markets():
     """Get monitored markets"""
     return jsonify(active_markets)
+
+
+@app.route('/api/sports/live')
+def api_sports_live():
+    """Get live sports data from WebSocket"""
+    return jsonify({
+        "connected": sports_ws.connected if sports_ws else False,
+        "events_tracked": len(live_sports_data),
+        "events": list(live_sports_data.values())[:50],  # Last 50 events
+    })
 
 
 @app.route('/api/latency')
