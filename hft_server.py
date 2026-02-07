@@ -302,8 +302,10 @@ def discover_markets() -> list[dict]:
         pst = ZoneInfo("America/Los_Angeles")
         now_pst = datetime.now(pst)
         today_str = now_pst.strftime("%Y-%m-%d")  # Today in PST
-        yesterday_str = (now_pst - timedelta(days=1)).strftime("%Y-%m-%d")  # Yesterday in PST
-        print(f"[HFT] Today (PST): {today_str}", flush=True)
+        yesterday_str = (now_pst - timedelta(days=1)).strftime("%Y-%m-%d")
+        tomorrow_str = (now_pst + timedelta(days=1)).strftime("%Y-%m-%d")
+        valid_dates = {today_str, yesterday_str, tomorrow_str}  # Allow all 3 for timezone flexibility
+        print(f"[HFT] Valid dates (PST): {today_str}, {yesterday_str}, {tomorrow_str}", flush=True)
 
         # Sports slug prefixes - comprehensive list
         SPORTS_PREFIXES = [
@@ -370,7 +372,7 @@ def discover_markets() -> list[dict]:
                         skipped_no_date += 1
                         continue
 
-                    if slug_date != today_str and slug_date != yesterday_str:
+                    if slug_date not in valid_dates:
                         skipped_wrong_date += 1
                         continue  # Old game or future game
 
@@ -418,13 +420,49 @@ def discover_markets() -> list[dict]:
                             sports_found += 1
 
                 print(f"[HFT] Sports: {sports_checked} checked, {skipped_no_date} no date, {skipped_wrong_date} wrong date, {skipped_ended} ended", flush=True)
-                print(f"[HFT] Found {live_events} live events with {sports_found} markets", flush=True)
+                print(f"[HFT] Found {live_events} live events with {sports_found} markets from /events", flush=True)
 
         except Exception as e:
-            print(f"[HFT] Sports discovery error: {e}", flush=True)
+            print(f"[HFT] Sports /events error: {e}", flush=True)
+
+        # FALLBACK: Also try /markets directly if /events didn't find much
+        if sports_found < 10:
+            print(f"[HFT] Trying /markets fallback...", flush=True)
+            try:
+                resp2 = requests.get(
+                    f"{GAMMA_API}/markets",
+                    params={
+                        "active": "true",
+                        "closed": "false",
+                        "limit": 500,
+                    },
+                    timeout=30
+                )
+                if resp2.status_code == 200:
+                    all_markets = resp2.json()
+                    fallback_found = 0
+                    for mkt in all_markets:
+                        slug = mkt.get("slug", "")
+                        if not is_sports_slug(slug):
+                            continue
+                        slug_date = extract_date_from_slug(slug)
+                        if slug_date is None or slug_date not in valid_dates:
+                            continue
+                        # Check if already added
+                        if any(m["slug"] == slug for m in markets):
+                            continue
+                        market_data = parse_market_data(mkt)
+                        if market_data:
+                            market_data["category"] = "sports"
+                            markets.append(market_data)
+                            sports_found += 1
+                            fallback_found += 1
+                    print(f"[HFT] Fallback found {fallback_found} additional sports markets", flush=True)
+            except Exception as e:
+                print(f"[HFT] Fallback error: {e}", flush=True)
 
         if sports_found == 0:
-            print("[HFT] No live sports events found right now", flush=True)
+            print("[HFT] No live sports events found", flush=True)
 
         print(f"[HFT] Total: {crypto_found} crypto, {sports_found} sports = {len(markets)} markets", flush=True)
         return markets
