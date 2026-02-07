@@ -621,6 +621,9 @@ def discover_markets() -> list[dict]:
 
         # ADDITIONAL: Direct search for NBA games
         # NBA games might use different slug patterns
+        NBA_VALIDATORS = ["nba", "basketball", "lakers", "celtics", "warriors", "nets", "bulls", "heat",
+                          "knicks", "76ers", "bucks", "clippers", "suns", "mavericks", "nuggets", "grizzlies",
+                          "timberwolves", "pelicans", "thunder", "jazz", "kings", "blazers", "rockets", "spurs"]
         for nba_search in ["nba-", "basketball-"]:
             try:
                 resp_nba = requests.get(
@@ -637,8 +640,16 @@ def discover_markets() -> list[dict]:
                     nba_markets = resp_nba.json()
                     nba_found = 0
                     for mkt in nba_markets:
-                        slug = mkt.get("slug", "")
-                        if any(m["slug"] == slug for m in markets):
+                        slug = mkt.get("slug", "").lower()
+                        question = mkt.get("question", "").lower()
+                        # VALIDATE: Must actually be NBA-related (API returns garbage sometimes)
+                        is_nba = any(v in slug or v in question for v in NBA_VALIDATORS)
+                        if not is_nba:
+                            continue
+                        # Exclude NFL/Super Bowl false positives
+                        if "super-bowl" in slug or "super bowl" in question or "patriots" in slug or "seahawks" in slug:
+                            continue
+                        if any(m["slug"] == mkt.get("slug", "") for m in markets):
                             continue
                         # Check if it's a short-term game
                         end_str = mkt.get("endDate") or mkt.get("endDateIso")
@@ -658,14 +669,18 @@ def discover_markets() -> list[dict]:
                             sports_found += 1
                             nba_found += 1
                             if nba_found <= 5:
-                                print(f"[NBA] Found: {slug[:50]}", flush=True)
+                                print(f"[NBA] Found: {mkt.get('slug', '')[:50]}", flush=True)
                     if nba_found > 0:
                         print(f"[HFT] NBA search '{nba_search}' found {nba_found} markets", flush=True)
             except Exception as e:
                 pass  # NBA search is optional
 
         # ADDITIONAL: Direct search for Liga MX (Mexican soccer) games
-        for ligamx_search in ["ligamx-", "mexico-", "clausura-", "apertura-", "chivas", "tigres", "america-", "cruz-azul"]:
+        LIGAMX_VALIDATORS = ["liga mx", "ligamx", "clausura", "apertura", "mexico soccer",
+                             "chivas", "tigres", "america", "cruz azul", "pumas", "monterrey",
+                             "santos laguna", "toluca", "leon", "pachuca", "atlas", "necaxa",
+                             "queretaro", "puebla", "mazatlan", "juarez", "tijuana", "san luis"]
+        for ligamx_search in ["ligamx-", "clausura-", "apertura-", "chivas", "tigres", "cruz-azul", "pumas-"]:
             try:
                 resp_mx = requests.get(
                     f"{GAMMA_API}/markets",
@@ -681,8 +696,16 @@ def discover_markets() -> list[dict]:
                     mx_markets = resp_mx.json()
                     mx_found = 0
                     for mkt in mx_markets:
-                        slug = mkt.get("slug", "")
-                        if any(m["slug"] == slug for m in markets):
+                        slug = mkt.get("slug", "").lower()
+                        question = mkt.get("question", "").lower()
+                        # VALIDATE: Must actually be Liga MX-related (API returns garbage sometimes)
+                        is_ligamx = any(v in slug or v in question for v in LIGAMX_VALIDATORS)
+                        if not is_ligamx:
+                            continue
+                        # Exclude non-soccer false positives (e.g., "america" could match US politics)
+                        if "president" in slug or "election" in question or "trump" in slug or "biden" in slug:
+                            continue
+                        if any(m["slug"] == mkt.get("slug", "") for m in markets):
                             continue
                         # Check if it's a short-term game
                         end_str = mkt.get("endDate") or mkt.get("endDateIso")
@@ -702,7 +725,7 @@ def discover_markets() -> list[dict]:
                             sports_found += 1
                             mx_found += 1
                             if mx_found <= 5:
-                                print(f"[LIGA MX] Found: {slug[:50]}", flush=True)
+                                print(f"[LIGA MX] Found: {mkt.get('slug', '')[:50]}", flush=True)
                     if mx_found > 0:
                         print(f"[HFT] Liga MX search '{ligamx_search}' found {mx_found} markets", flush=True)
             except Exception as e:
