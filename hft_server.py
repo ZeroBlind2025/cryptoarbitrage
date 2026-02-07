@@ -49,6 +49,8 @@ from arb_engines import (
     SumToOneConfig,
     TailEndConfig,
 )
+from sports_ws import SportsWebSocket
+
 # Note: Using direct API calls for market discovery instead of GammaScanner
 # to be more targeted (only crypto 15-min and live sports markets)
 
@@ -93,6 +95,10 @@ MARKET_REFRESH_INTERVAL_MINUTES = 15
 refresh_thread: Optional[threading.Thread] = None
 stop_refresh = threading.Event()
 
+# Sports WebSocket for real-time game data
+sports_ws: Optional[SportsWebSocket] = None
+live_sports_data: dict[str, dict] = {}  # event_id -> data from WebSocket
+
 
 # =============================================================================
 # CALLBACKS
@@ -122,6 +128,30 @@ def log_trade(trade: Trade):
     log_file = log_dir / f"trades_{trade.mode.value}.jsonl"
     with open(log_file, "a") as f:
         f.write(json.dumps(trade.to_dict()) + "\n")
+
+
+def on_sports_update(data: dict):
+    """Handle real-time sports update from WebSocket"""
+    global live_sports_data
+    event_id = data.get("eventId") or data.get("event_id") or data.get("id") or data.get("gameId")
+    if event_id:
+        live_sports_data[event_id] = {
+            "data": data,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        # Log significant updates (score changes, period changes)
+        if data.get("type") in ["score", "period_change", "game_end"]:
+            print(f"[SPORTS WS] {data.get('type')}: {data}", flush=True)
+
+
+def on_sports_connect():
+    """Handle sports WebSocket connection"""
+    print("[SPORTS WS] Connected to real-time sports feed!", flush=True)
+
+
+def on_sports_disconnect():
+    """Handle sports WebSocket disconnection"""
+    print("[SPORTS WS] Disconnected from sports feed", flush=True)
 
 
 # =============================================================================
@@ -295,6 +325,10 @@ def discover_markets() -> list[dict]:
         # ============================================================
         print("[HFT] Fetching live sports events...", flush=True)
 
+        # Check if we have real-time data from Sports WebSocket
+        if live_sports_data:
+            print(f"[HFT] Sports WebSocket has {len(live_sports_data)} live events tracked", flush=True)
+
         import re
         from zoneinfo import ZoneInfo
 
@@ -384,8 +418,47 @@ def discover_markets() -> list[dict]:
 
             return True
 
+        def is_short_term_game(event: dict) -> bool:
+            """Check if event is a short-term game (resolves within 48 hours) vs season-long future"""
+            now_utc = datetime.now(timezone.utc)
+            end_str = event.get("endDate") or event.get("endDateIso")
+            if end_str:
+                try:
+                    if "T" in str(end_str):
+                        end_dt = datetime.fromisoformat(end_str.replace("Z", "+00:00"))
+                        hours_until_end = (end_dt - now_utc).total_seconds() / 3600
+                        # Short-term = resolves within 48 hours
+                        return hours_until_end < 48 and hours_until_end > -0.5
+                except:
+                    pass
+            # If no endDate, check if slug has today's date (indicates daily game)
+            slug = event.get("slug", "")
+            slug_date = extract_date_from_slug(slug)
+            if slug_date and slug_date in valid_dates:
+                return True
+            return False
+
+        # First try querying sports tag directly (tag_id 100639 is sports)
+        sports_tag_events = []
         try:
-            # Query ALL active events (no tag filter)
+            resp_tag = requests.get(
+                f"{GAMMA_API}/events",
+                params={
+                    "tag_id": 100639,  # Sports tag
+                    "active": "true",
+                    "closed": "false",
+                    "limit": 500,
+                },
+                timeout=30
+            )
+            if resp_tag.status_code == 200:
+                sports_tag_events = resp_tag.json()
+                print(f"[HFT] Sports tag query returned: {len(sports_tag_events)} events", flush=True)
+        except Exception as e:
+            print(f"[HFT] Sports tag query error: {e}", flush=True)
+
+        try:
+            # Query ALL active events (no tag filter) - to catch any we might have missed
             resp = requests.get(
                 f"{GAMMA_API}/events",
                 params={
@@ -395,10 +468,21 @@ def discover_markets() -> list[dict]:
                 },
                 timeout=30
             )
+            # Combine with sports tag events
+            all_tag_slugs = {e.get("slug") for e in sports_tag_events}
 
             if resp.status_code == 200:
                 events = resp.json()
                 print(f"[HFT] Total active events: {len(events)}", flush=True)
+
+                # Merge sports tag events that aren't already in the general events
+                for tag_event in sports_tag_events:
+                    if tag_event.get("slug") not in all_tag_slugs:
+                        events.append(tag_event)
+
+                # Add sports tag events to beginning (they're more likely to be sports)
+                events = sports_tag_events + [e for e in events if e.get("slug") not in all_tag_slugs]
+                print(f"[HFT] Combined events to check: {len(events)}", flush=True)
 
                 # Debug: show sports events we're finding (by slug or title)
                 sports_sample = []
@@ -407,11 +491,13 @@ def discover_markets() -> list[dict]:
                     title = e.get("title", "")
                     if is_sports_event(slug, title):
                         sports_sample.append(f"{slug[:40]}|{title[:30]}")
-                        if len(sports_sample) >= 10:
+                        if len(sports_sample) >= 15:
                             break
                 print(f"[DEBUG] Sports sample (slug|title): {sports_sample}", flush=True)
 
                 live_events = 0
+                short_term_games = 0
+                long_term_futures = 0
                 sports_checked = 0
                 skipped_not_live = 0
                 skipped_ended = 0
@@ -451,10 +537,19 @@ def discover_markets() -> list[dict]:
                             except:
                                 pass
 
+                    # Categorize: short-term game vs long-term future
+                    is_short = is_short_term_game(event)
+                    if is_short:
+                        short_term_games += 1
+
                     # This is a live sports event!
                     live_events += 1
-                    if live_events <= 15:
-                        print(f"[LIVE] {event_slug[:60]} (title: {event_title[:30]})", flush=True)
+                    # Log short-term games (live games) more prominently
+                    if is_short and short_term_games <= 15:
+                        print(f"[LIVE GAME] {event_slug[:55]} ({event_title[:25]})", flush=True)
+                    elif not is_short and long_term_futures <= 5:
+                        long_term_futures += 1
+                        print(f"[FUTURE] {event_slug[:55]} ({event_title[:25]})", flush=True)
 
                     event_markets = event.get("markets", [])
                     for mkt in event_markets:
@@ -476,11 +571,44 @@ def discover_markets() -> list[dict]:
                             markets.append(market_data)
                             sports_found += 1
 
-                print(f"[HFT] Sports: {sports_checked} checked, {skipped_not_live} not live/upcoming, {skipped_ended} ended", flush=True)
-                print(f"[HFT] Found {live_events} live events with {sports_found} markets from /events", flush=True)
+                print(f"[HFT] Sports: {sports_checked} total, {short_term_games} live games, {live_events - short_term_games} futures", flush=True)
+                print(f"[HFT] Found {live_events} events with {sports_found} markets ({skipped_not_live} skipped not live, {skipped_ended} ended)", flush=True)
 
         except Exception as e:
             print(f"[HFT] Sports /events error: {e}", flush=True)
+
+        # ADDITIONAL: Search for today's games by date in slug
+        # This specifically targets "nba-xxx-xxx-2026-02-07" style slugs
+        for date_to_search in [today_str, yesterday_str]:
+            try:
+                resp_date = requests.get(
+                    f"{GAMMA_API}/markets",
+                    params={
+                        "slug_contains": date_to_search,
+                        "active": "true",
+                        "closed": "false",
+                        "limit": 100,
+                    },
+                    timeout=15
+                )
+                if resp_date.status_code == 200:
+                    date_markets = resp_date.json()
+                    date_found = 0
+                    for mkt in date_markets:
+                        slug = mkt.get("slug", "")
+                        if any(m["slug"] == slug for m in markets):
+                            continue
+                        if is_sports_slug(slug):
+                            market_data = parse_market_data(mkt)
+                            if market_data:
+                                market_data["category"] = "sports"
+                                markets.append(market_data)
+                                sports_found += 1
+                                date_found += 1
+                    if date_found > 0:
+                        print(f"[HFT] Date search '{date_to_search}' found {date_found} additional markets", flush=True)
+            except Exception as e:
+                pass  # Date search is optional
 
         # FALLBACK: Also try /markets directly if /events didn't find much
         if sports_found < 10:
@@ -589,10 +717,24 @@ def start_hft_scanner(
     enable_tail_end: bool = True,
 ):
     """Start the HFT scanner with configurable engines"""
-    global hft_client, hft_scanner, active_markets, server_state
+    global hft_client, hft_scanner, active_markets, server_state, sports_ws
 
     if server_state["is_running"]:
         return False, "Scanner already running"
+
+    # Start Sports WebSocket for real-time game data
+    print("[HFT] Starting Sports WebSocket...", flush=True)
+    try:
+        sports_ws = SportsWebSocket(
+            on_update=on_sports_update,
+            on_connect=on_sports_connect,
+            on_disconnect=on_sports_disconnect,
+        )
+        sports_ws.start()
+        # Give it a moment to connect and receive initial data
+        time.sleep(2)
+    except Exception as e:
+        print(f"[HFT] Sports WebSocket error (continuing without): {e}", flush=True)
 
     # Discover markets first
     print("[HFT] Discovering markets...")
@@ -666,7 +808,7 @@ def start_hft_scanner(
 
 def stop_hft_scanner():
     """Stop the HFT scanner"""
-    global hft_scanner, server_state, refresh_thread, stop_refresh
+    global hft_scanner, server_state, refresh_thread, stop_refresh, sports_ws
 
     if not server_state["is_running"]:
         return False, "Scanner not running"
@@ -675,6 +817,13 @@ def stop_hft_scanner():
     stop_refresh.set()
     if refresh_thread and refresh_thread.is_alive():
         refresh_thread.join(timeout=5)
+
+    # Stop sports WebSocket
+    if sports_ws:
+        try:
+            sports_ws.stop()
+        except:
+            pass
 
     if hft_scanner:
         hft_scanner.stop()
@@ -910,6 +1059,16 @@ def api_opportunities():
 def api_markets():
     """Get monitored markets"""
     return jsonify(active_markets)
+
+
+@app.route('/api/sports/live')
+def api_sports_live():
+    """Get live sports data from WebSocket"""
+    return jsonify({
+        "connected": sports_ws.connected if sports_ws else False,
+        "events_tracked": len(live_sports_data),
+        "events": list(live_sports_data.values())[:50],  # Last 50 events
+    })
 
 
 @app.route('/api/latency')

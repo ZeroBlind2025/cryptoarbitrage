@@ -12,6 +12,7 @@ gunicorn>=21.0.0
 # Async/WebSocket support (for HFT)
 aiohttp>=3.9.0
 websockets>=12.0
+websocket-client>=1.6.0  # For Polymarket Sports WebSocket
 
 # Blockchain/Trading (install when ready for live trading)
 # py-clob-client  # Polymarket's official client
