@@ -610,6 +610,51 @@ def discover_markets() -> list[dict]:
             except Exception as e:
                 pass  # Date search is optional
 
+        # ADDITIONAL: Direct search for NBA games
+        # NBA games might use different slug patterns
+        for nba_search in ["nba-", "basketball-"]:
+            try:
+                resp_nba = requests.get(
+                    f"{GAMMA_API}/markets",
+                    params={
+                        "slug_contains": nba_search,
+                        "active": "true",
+                        "closed": "false",
+                        "limit": 50,
+                    },
+                    timeout=15
+                )
+                if resp_nba.status_code == 200:
+                    nba_markets = resp_nba.json()
+                    nba_found = 0
+                    for mkt in nba_markets:
+                        slug = mkt.get("slug", "")
+                        if any(m["slug"] == slug for m in markets):
+                            continue
+                        # Check if it's a short-term game
+                        end_str = mkt.get("endDate") or mkt.get("endDateIso")
+                        if end_str:
+                            try:
+                                if "T" in str(end_str):
+                                    end_dt = datetime.fromisoformat(end_str.replace("Z", "+00:00"))
+                                    hours_until = (end_dt - now).total_seconds() / 3600
+                                    if hours_until < -0.5 or hours_until > 48:
+                                        continue  # Not a current game
+                            except:
+                                pass
+                        market_data = parse_market_data(mkt)
+                        if market_data:
+                            market_data["category"] = "sports"
+                            markets.append(market_data)
+                            sports_found += 1
+                            nba_found += 1
+                            if nba_found <= 5:
+                                print(f"[NBA] Found: {slug[:50]}", flush=True)
+                    if nba_found > 0:
+                        print(f"[HFT] NBA search '{nba_search}' found {nba_found} markets", flush=True)
+            except Exception as e:
+                pass  # NBA search is optional
+
         # FALLBACK: Also try /markets directly if /events didn't find much
         if sports_found < 10:
             print(f"[HFT] Trying /markets fallback...", flush=True)
