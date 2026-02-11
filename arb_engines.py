@@ -355,6 +355,23 @@ class TailEndEngine:
         self.no_signals = 0
         self.avg_probability = 0.0
 
+        # Debug counters for rejection reasons
+        self.debug_not_sports = 0
+        self.debug_position_limit = 0
+        self.debug_already_positioned = 0
+        self.debug_no_resolution_time = 0
+        self.debug_resolution_too_far = 0
+        self.debug_resolution_too_close = 0
+        self.debug_low_volume = 0
+        self.debug_checked_tokens = 0
+        self.debug_low_prob = 0
+        self.debug_high_prob = 0
+        self.debug_low_price = 0
+        self.debug_high_price = 0
+        self.debug_low_depth = 0
+        self.debug_low_ev = 0
+        self.debug_passed_all = 0
+
     def analyze(self, market: MarketState) -> Optional[EngineSignal]:
         """
         Analyze market for tail-end opportunity.
@@ -366,28 +383,35 @@ class TailEndEngine:
 
         # Market type filter: only sports markets for tail-end
         if self.config.sports_only and not market.is_sports():
+            self.debug_not_sports += 1
             return None
 
         # Check concurrent position limit
         if len(self.active_positions) >= self.config.max_concurrent_positions:
+            self.debug_position_limit += 1
             return None
 
         # Already have position in this market?
         if market.market_slug in self.active_positions:
+            self.debug_already_positioned += 1
             return None
 
         # Check resolution timing
         if market.minutes_until_resolution is None:
+            self.debug_no_resolution_time += 1
             return None
 
         if market.minutes_until_resolution > self.config.max_minutes_until_resolution:
+            self.debug_resolution_too_far += 1
             return None
 
         if market.minutes_until_resolution < self.config.min_minutes_until_resolution:
+            self.debug_resolution_too_close += 1
             return None
 
         # Check volume
         if market.volume_24h and market.volume_24h < self.config.min_volume_24h:
+            self.debug_low_volume += 1
             return None
 
         # Analyze both sides for tail-end opportunity
@@ -403,6 +427,7 @@ class TailEndEngine:
         side: Literal["yes", "no"]
     ) -> Optional[EngineSignal]:
         """Check if a specific token qualifies for tail-end"""
+        self.debug_checked_tokens += 1
 
         if side == "yes":
             ask = market.token_a_ask
@@ -420,21 +445,26 @@ class TailEndEngine:
 
         # Check probability range (this token should be winning)
         if prob < self.config.min_probability:
+            self.debug_low_prob += 1
             return None
 
         if prob > self.config.max_probability:
+            self.debug_high_prob += 1
             return None  # Too certain, probably already priced in
 
         # Check price range
         if ask < self.config.min_price:
+            self.debug_low_price += 1
             return None  # Suspiciously cheap
 
         if ask > self.config.max_price:
+            self.debug_high_price += 1
             return None  # Not enough edge
 
         # Check depth
         depth_usd = depth * ask if depth else 0
         if depth_usd < self.config.min_depth_usd:
+            self.debug_low_depth += 1
             return None
 
         # Calculate expected profit
@@ -448,7 +478,11 @@ class TailEndEngine:
         risk_adjusted = (prob * expected_profit) - ((1 - prob) * ask)
 
         if risk_adjusted < self.config.min_risk_adjusted_ev:
+            self.debug_low_ev += 1
             return None
+
+        # PASSED ALL CHECKS!
+        self.debug_passed_all += 1
 
         # Calculate sizing
         max_size = depth
@@ -519,6 +553,24 @@ class TailEndEngine:
                 "min_probability": self.config.min_probability,
                 "max_probability": self.config.max_probability,
                 "max_minutes": self.config.max_minutes_until_resolution,
+                "min_risk_adjusted_ev": self.config.min_risk_adjusted_ev,
+            },
+            "debug_rejections": {
+                "not_sports": self.debug_not_sports,
+                "no_resolution_time": self.debug_no_resolution_time,
+                "position_limit": self.debug_position_limit,
+                "already_positioned": self.debug_already_positioned,
+                "resolution_too_far": self.debug_resolution_too_far,
+                "resolution_too_close": self.debug_resolution_too_close,
+                "low_volume": self.debug_low_volume,
+                "tokens_checked": self.debug_checked_tokens,
+                "low_probability": self.debug_low_prob,
+                "high_probability": self.debug_high_prob,
+                "low_price": self.debug_low_price,
+                "high_price": self.debug_high_price,
+                "low_depth": self.debug_low_depth,
+                "low_ev": self.debug_low_ev,
+                "passed_all_checks": self.debug_passed_all,
             }
         }
 

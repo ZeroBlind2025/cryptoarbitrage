@@ -1063,6 +1063,105 @@ def api_engines():
     return jsonify(stats)
 
 
+@app.route('/api/debug/tail-end')
+def api_debug_tail_end():
+    """Debug endpoint showing why tail-end signals aren't triggering"""
+    if hft_client is None:
+        return jsonify({"error": "Scanner not initialized"}), 400
+
+    te = hft_client.engine_manager.tail_end
+    return jsonify({
+        "tail_end_debug": {
+            "enabled": te.enabled,
+            "signals_generated": te.signals_generated,
+            "config": {
+                "min_probability": te.config.min_probability,
+                "max_probability": te.config.max_probability,
+                "min_price": te.config.min_price,
+                "max_price": te.config.max_price,
+                "min_depth_usd": te.config.min_depth_usd,
+                "min_risk_adjusted_ev": te.config.min_risk_adjusted_ev,
+                "sports_only": te.config.sports_only,
+            },
+            "rejection_counts": {
+                "not_sports_category": te.debug_not_sports,
+                "no_resolution_time": te.debug_no_resolution_time,
+                "position_limit_hit": te.debug_position_limit,
+                "already_have_position": te.debug_already_positioned,
+                "resolution_too_far": te.debug_resolution_too_far,
+                "resolution_too_close": te.debug_resolution_too_close,
+                "volume_too_low": te.debug_low_volume,
+                "tokens_checked": te.debug_checked_tokens,
+                "probability_too_low": te.debug_low_prob,
+                "probability_too_high": te.debug_high_prob,
+                "price_too_low": te.debug_low_price,
+                "price_too_high": te.debug_high_price,
+                "depth_too_low": te.debug_low_depth,
+                "risk_adjusted_ev_too_low": te.debug_low_ev,
+                "PASSED_ALL_CHECKS": te.debug_passed_all,
+            },
+            "interpretation": _interpret_debug_stats(te),
+        }
+    })
+
+
+def _interpret_debug_stats(te) -> str:
+    """Provide human-readable interpretation of debug stats"""
+    if te.debug_not_sports > 0 and te.debug_checked_tokens == 0:
+        return f"PROBLEM: {te.debug_not_sports} markets rejected because market_category != 'sports'. Check if markets are being labeled correctly."
+    if te.debug_no_resolution_time > 0 and te.debug_checked_tokens == 0:
+        return f"PROBLEM: {te.debug_no_resolution_time} markets have no resolution time set. Check minutes_until_resolution in market data."
+    if te.debug_checked_tokens == 0:
+        return "PROBLEM: No tokens are being checked at all. Markets are failing pre-checks before token analysis."
+    if te.debug_low_prob > te.debug_checked_tokens * 0.9:
+        return f"Most rejections ({te.debug_low_prob}) due to probability < {te.config.min_probability*100}%. Markets don't have high-confidence outcomes."
+    if te.debug_low_depth > 0:
+        return f"{te.debug_low_depth} rejections due to low depth (< ${te.config.min_depth_usd}). Check order book depth."
+    if te.debug_low_ev > 0:
+        return f"{te.debug_low_ev} rejections due to risk-adjusted EV < {te.config.min_risk_adjusted_ev}. This filter may be too strict."
+    if te.debug_passed_all > 0:
+        return f"SUCCESS: {te.debug_passed_all} opportunities passed all checks! Check why signals aren't executing."
+    return "Unknown issue - check individual rejection counts."
+
+
+@app.route('/api/debug/books')
+def api_debug_books():
+    """Debug endpoint showing order book fetch stats"""
+    if hft_client is None:
+        return jsonify({"error": "Scanner not initialized"}), 400
+
+    book_stats = getattr(hft_client, '_book_stats', {'success': 0, 'fail_404': 0, 'fail_other': 0})
+    book_errors = getattr(hft_client, '_book_errors', {})
+
+    return jsonify({
+        "order_book_stats": {
+            "successful_fetches": book_stats.get('success', 0),
+            "failed_404_no_liquidity": book_stats.get('fail_404', 0),
+            "failed_other_errors": book_stats.get('fail_other', 0),
+            "unique_tokens_with_errors": len(book_errors),
+            "success_rate_pct": round(
+                book_stats.get('success', 0) / max(1, sum(book_stats.values())) * 100, 1
+            ),
+        },
+        "interpretation": _interpret_book_stats(book_stats),
+    })
+
+
+def _interpret_book_stats(stats: dict) -> str:
+    """Interpret book stats"""
+    total = sum(stats.values())
+    if total == 0:
+        return "No order book fetches attempted yet."
+    success_rate = stats.get('success', 0) / total
+    if stats.get('fail_404', 0) > stats.get('success', 0):
+        return f"PROBLEM: More 404s than successes. Most markets don't have CLOB liquidity. Focus on markets with active trading."
+    if success_rate < 0.1:
+        return f"PROBLEM: Only {success_rate*100:.1f}% of book fetches succeed. API may be down or rate limited."
+    if stats.get('success', 0) > 0:
+        return f"Order books working: {stats.get('success', 0)} successful fetches at {success_rate*100:.1f}% success rate."
+    return "Check individual stats for details."
+
+
 @app.route('/api/engines/toggle', methods=['POST'])
 def api_toggle_engine():
     """Toggle an engine on/off"""

@@ -395,6 +395,10 @@ class HFTClient:
         """Fetch order book with minimal latency"""
         start_us = time.perf_counter_ns() // 1000
 
+        # Track stats
+        if not hasattr(self, '_book_stats'):
+            self._book_stats = {'success': 0, 'fail_404': 0, 'fail_other': 0}
+
         try:
             resp = self.session.get(
                 f"{self.config.clob_api_url}/book",
@@ -413,9 +417,17 @@ class HFTClient:
                 latency_us = (time.perf_counter_ns() // 1000) - start_us
                 self.latency_stats.add(latency_us)
 
+            self._book_stats['success'] += 1
             return book
 
         except Exception as e:
+            # Track error type
+            err_str = str(e)
+            if '404' in err_str:
+                self._book_stats['fail_404'] += 1
+            else:
+                self._book_stats['fail_other'] += 1
+
             # Only log first few errors per token to avoid spam
             if not hasattr(self, '_book_errors'):
                 self._book_errors = {}
@@ -426,7 +438,10 @@ class HFTClient:
 
             # Log first error for each token, then suppress
             if self._book_errors[token_id] == 1:
-                print(f"[HFT] Order book 404: {token_id[:20]}... (market may not have CLOB liquidity)")
+                if '404' in err_str:
+                    print(f"[HFT] Order book 404: {token_id[:20]}... (market may not have CLOB liquidity)")
+                else:
+                    print(f"[HFT] Order book error: {token_id[:20]}... ({err_str[:50]})")
 
             return None
 
