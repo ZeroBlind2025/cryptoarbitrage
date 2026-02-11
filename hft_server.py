@@ -1162,6 +1162,77 @@ def _interpret_book_stats(stats: dict) -> str:
     return "Check individual stats for details."
 
 
+@app.route('/api/debug/test-book/<slug>')
+def api_debug_test_book(slug):
+    """Test fetching order book for a specific market by slug"""
+    import requests as req
+
+    # Find market by slug
+    try:
+        resp = req.get(
+            f"{GAMMA_API}/markets",
+            params={"slug": slug, "limit": 1},
+            timeout=10
+        )
+        if resp.status_code != 200:
+            return jsonify({"error": f"Gamma API returned {resp.status_code}"}), 400
+
+        markets = resp.json()
+        if not markets:
+            return jsonify({"error": f"Market not found: {slug}"}), 404
+
+        market = markets[0] if isinstance(markets, list) else markets
+
+        # Extract token IDs
+        clob_ids_raw = market.get("clobTokenIds", "[]")
+        if isinstance(clob_ids_raw, str):
+            clob_ids = json.loads(clob_ids_raw)
+        else:
+            clob_ids = clob_ids_raw or []
+
+        result = {
+            "slug": slug,
+            "question": market.get("question", "")[:100],
+            "clobTokenIds_raw": clob_ids_raw,
+            "clobTokenIds_parsed": clob_ids,
+            "outcomes": market.get("outcomes"),
+            "token_tests": []
+        }
+
+        # Test fetching each token's order book
+        for i, token_id in enumerate(clob_ids):
+            token_result = {"token_id": str(token_id), "index": i}
+            try:
+                book_resp = req.get(
+                    "https://clob.polymarket.com/book",
+                    params={"token_id": str(token_id)},
+                    timeout=5
+                )
+                token_result["status_code"] = book_resp.status_code
+                if book_resp.status_code == 200:
+                    book_data = book_resp.json()
+                    token_result["success"] = True
+                    token_result["bids_count"] = len(book_data.get("bids", []))
+                    token_result["asks_count"] = len(book_data.get("asks", []))
+                    if book_data.get("bids"):
+                        token_result["best_bid"] = book_data["bids"][0]
+                    if book_data.get("asks"):
+                        token_result["best_ask"] = book_data["asks"][0]
+                else:
+                    token_result["success"] = False
+                    token_result["error"] = book_resp.text[:200]
+            except Exception as e:
+                token_result["success"] = False
+                token_result["error"] = str(e)
+
+            result["token_tests"].append(token_result)
+
+        return jsonify(result)
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route('/api/engines/toggle', methods=['POST'])
 def api_toggle_engine():
     """Toggle an engine on/off"""
