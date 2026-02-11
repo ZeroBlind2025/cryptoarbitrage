@@ -1063,6 +1063,54 @@ def api_engines():
     return jsonify(stats)
 
 
+@app.route('/api/debug/sum-to-one')
+def api_debug_sum_to_one():
+    """Debug endpoint showing why sum-to-one signals aren't triggering"""
+    if hft_client is None:
+        return jsonify({"error": "Scanner not initialized"}), 400
+
+    s2o = hft_client.engine_manager.sum_to_one
+    return jsonify({
+        "sum_to_one_debug": {
+            "enabled": s2o.enabled,
+            "signals_generated": s2o.signals_generated,
+            "config": {
+                "max_price_sum": s2o.config.max_price_sum,
+                "fee_rate": s2o.config.fee_rate,
+                "min_edge_after_fees": s2o.config.min_edge_after_fees,
+                "min_depth_usd": s2o.config.min_depth_usd,
+                "crypto_15min_only": s2o.config.crypto_15min_only,
+            },
+            "rejection_counts": {
+                "not_crypto_15min": s2o.debug_not_crypto,
+                "missing_asks_ORDERBOOK_FAILED": s2o.debug_missing_asks,
+                "price_sum_too_high_gte_1": s2o.debug_price_sum_high,
+                "edge_too_low_after_fees": s2o.debug_low_edge,
+                "depth_too_low": s2o.debug_low_depth,
+                "crypto_markets_checked": s2o.debug_markets_checked,
+                "PASSED_ALL_CHECKS": s2o.debug_passed,
+            },
+            "best_price_sum_seen": round(s2o.debug_best_price_sum, 4),
+            "interpretation": _interpret_s2o_stats(s2o),
+        }
+    })
+
+
+def _interpret_s2o_stats(s2o) -> str:
+    """Interpret sum-to-one debug stats"""
+    if s2o.debug_markets_checked == 0:
+        return f"PROBLEM: No crypto markets being checked! {s2o.debug_not_crypto} markets rejected as not crypto 15-min."
+    if s2o.debug_missing_asks > s2o.debug_markets_checked * 0.5:
+        return f"PROBLEM: {s2o.debug_missing_asks} order book fetches failed! Check CLOB API connectivity."
+    if s2o.debug_best_price_sum >= 1.0:
+        return f"Market is efficient. Best price_sum seen: {s2o.debug_best_price_sum:.4f} (need < 1.00 for opportunity)"
+    if s2o.debug_best_price_sum < 1.0 and s2o.debug_low_edge > 0:
+        return f"Opportunities exist but filtered by fees. Best: {s2o.debug_best_price_sum:.4f}, need < {1.0 - s2o.config.fee_rate:.2f} after {s2o.config.fee_rate*100}% fee"
+    if s2o.debug_passed > 0:
+        return f"SUCCESS: {s2o.debug_passed} opportunities passed all checks!"
+    return "Check individual rejection counts."
+
+
 @app.route('/api/debug/tail-end')
 def api_debug_tail_end():
     """Debug endpoint showing why tail-end signals aren't triggering"""
@@ -1160,6 +1208,77 @@ def _interpret_book_stats(stats: dict) -> str:
     if stats.get('success', 0) > 0:
         return f"Order books working: {stats.get('success', 0)} successful fetches at {success_rate*100:.1f}% success rate."
     return "Check individual stats for details."
+
+
+@app.route('/api/debug/test-book/<slug>')
+def api_debug_test_book(slug):
+    """Test fetching order book for a specific market by slug"""
+    import requests as req
+
+    # Find market by slug
+    try:
+        resp = req.get(
+            f"{GAMMA_API}/markets",
+            params={"slug": slug, "limit": 1},
+            timeout=10
+        )
+        if resp.status_code != 200:
+            return jsonify({"error": f"Gamma API returned {resp.status_code}"}), 400
+
+        markets = resp.json()
+        if not markets:
+            return jsonify({"error": f"Market not found: {slug}"}), 404
+
+        market = markets[0] if isinstance(markets, list) else markets
+
+        # Extract token IDs
+        clob_ids_raw = market.get("clobTokenIds", "[]")
+        if isinstance(clob_ids_raw, str):
+            clob_ids = json.loads(clob_ids_raw)
+        else:
+            clob_ids = clob_ids_raw or []
+
+        result = {
+            "slug": slug,
+            "question": market.get("question", "")[:100],
+            "clobTokenIds_raw": clob_ids_raw,
+            "clobTokenIds_parsed": clob_ids,
+            "outcomes": market.get("outcomes"),
+            "token_tests": []
+        }
+
+        # Test fetching each token's order book
+        for i, token_id in enumerate(clob_ids):
+            token_result = {"token_id": str(token_id), "index": i}
+            try:
+                book_resp = req.get(
+                    "https://clob.polymarket.com/book",
+                    params={"token_id": str(token_id)},
+                    timeout=5
+                )
+                token_result["status_code"] = book_resp.status_code
+                if book_resp.status_code == 200:
+                    book_data = book_resp.json()
+                    token_result["success"] = True
+                    token_result["bids_count"] = len(book_data.get("bids", []))
+                    token_result["asks_count"] = len(book_data.get("asks", []))
+                    if book_data.get("bids"):
+                        token_result["best_bid"] = book_data["bids"][0]
+                    if book_data.get("asks"):
+                        token_result["best_ask"] = book_data["asks"][0]
+                else:
+                    token_result["success"] = False
+                    token_result["error"] = book_resp.text[:200]
+            except Exception as e:
+                token_result["success"] = False
+                token_result["error"] = str(e)
+
+            result["token_tests"].append(token_result)
+
+        return jsonify(result)
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route('/api/engines/toggle', methods=['POST'])

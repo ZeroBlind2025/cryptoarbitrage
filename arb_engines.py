@@ -207,6 +207,16 @@ class SumToOneEngine:
         self.signals_generated = 0
         self.total_edge_detected = 0.0
 
+        # Debug counters
+        self.debug_not_crypto = 0
+        self.debug_missing_asks = 0
+        self.debug_price_sum_high = 0
+        self.debug_low_edge = 0
+        self.debug_low_depth = 0
+        self.debug_passed = 0
+        self.debug_best_price_sum = 2.0  # Track closest to opportunity
+        self.debug_markets_checked = 0
+
     def analyze(self, market: MarketState) -> Optional[EngineSignal]:
         """
         Analyze market for sum-to-one opportunity.
@@ -218,18 +228,27 @@ class SumToOneEngine:
 
         # Market type filter: only 15-min crypto markets (BTC, ETH, XRP, SOL)
         if self.config.crypto_15min_only and not market.is_crypto_15min():
+            self.debug_not_crypto += 1
             return None
+
+        self.debug_markets_checked += 1
 
         # Need both asks
         if market.token_a_ask is None or market.token_b_ask is None:
+            self.debug_missing_asks += 1
             return None
 
         price_sum = market.price_sum
         if price_sum is None:
             return None
 
+        # Track best price_sum seen (closest to opportunity)
+        if price_sum < self.debug_best_price_sum:
+            self.debug_best_price_sum = price_sum
+
         # Check threshold
         if price_sum >= self.config.max_price_sum:
+            self.debug_price_sum_high += 1
             return None
 
         # Calculate edge
@@ -237,6 +256,7 @@ class SumToOneEngine:
         net_edge = gross_edge - self.config.fee_rate
 
         if net_edge < self.config.min_edge_after_fees:
+            self.debug_low_edge += 1
             return None
 
         # Check depth
@@ -244,7 +264,10 @@ class SumToOneEngine:
         depth_usd = min_depth * price_sum
 
         if depth_usd < self.config.min_depth_usd:
+            self.debug_low_depth += 1
             return None
+
+        self.debug_passed += 1
 
         # Calculate sizing
         max_size = min_depth
@@ -281,6 +304,16 @@ class SumToOneEngine:
             "config": {
                 "max_price_sum": self.config.max_price_sum,
                 "min_edge_after_fees": self.config.min_edge_after_fees,
+            },
+            "debug_rejections": {
+                "not_crypto_15min": self.debug_not_crypto,
+                "missing_asks_orderbook_failed": self.debug_missing_asks,
+                "price_sum_too_high": self.debug_price_sum_high,
+                "edge_too_low_after_fees": self.debug_low_edge,
+                "depth_too_low": self.debug_low_depth,
+                "crypto_markets_checked": self.debug_markets_checked,
+                "PASSED_ALL_CHECKS": self.debug_passed,
+                "best_price_sum_seen": round(self.debug_best_price_sum, 4),
             }
         }
 
