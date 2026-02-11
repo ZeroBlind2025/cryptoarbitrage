@@ -47,6 +47,14 @@ from arb_engines import (
     TailEndConfig,
 )
 
+# Import WebSocket client
+try:
+    from clob_ws import CLOBWebSocket, OrderBookState
+    HAS_CLOB_WS = True
+except ImportError:
+    HAS_CLOB_WS = False
+    print("[HFT] Warning: clob_ws not found, WebSocket mode unavailable")
+
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -1191,6 +1199,278 @@ class HFTScanner:
                 "sum_to_one": self.sum_to_one_signals,
                 "tail_end": self.tail_end_signals,
             },
+            "enabled_engines": self.client.get_enabled_engines(),
+        }
+
+
+# =============================================================================
+# WEBSOCKET-BASED REAL-TIME SCANNER
+# =============================================================================
+
+class HFTWebSocketScanner:
+    """
+    Real-time HFT scanner using WebSocket price feeds.
+
+    Instead of polling markets every 500ms, this subscribes to real-time
+    price updates and triggers signal detection INSTANTLY when prices change.
+
+    This is how the bots making hundreds of sum-to-one trades daily operate.
+    """
+
+    def __init__(
+        self,
+        client: HFTClient,
+        markets: list[dict],
+    ):
+        if not HAS_CLOB_WS:
+            raise RuntimeError("clob_ws module not available. Cannot use WebSocket scanner.")
+
+        self.client = client
+        self.markets = markets
+        self._running = False
+
+        # Build token -> market lookup
+        self._token_to_market: dict[str, dict] = {}
+        for m in markets:
+            self._token_to_market[m.get("token_a_id", "")] = m
+            self._token_to_market[m.get("token_b_id", "")] = m
+
+        # Track paired tokens (YES/NO for same market)
+        self._market_tokens: dict[str, tuple[str, str]] = {}  # slug -> (token_a, token_b)
+        for m in markets:
+            self._market_tokens[m.get("slug", "")] = (
+                m.get("token_a_id", ""),
+                m.get("token_b_id", "")
+            )
+
+        # WebSocket client
+        self._ws: Optional[CLOBWebSocket] = None
+
+        # Stats
+        self.price_updates_received = 0
+        self.signals_detected = 0
+        self.trades_executed = 0
+        self.sum_to_one_signals = 0
+        self.tail_end_signals = 0
+
+        # Track last signal time to avoid duplicate signals
+        self._last_signal_time: dict[str, float] = {}
+        self._signal_cooldown_ms = 1000  # 1 second cooldown per market
+
+    def start(self):
+        """Start the WebSocket scanner"""
+        if self._running:
+            return
+
+        self._running = True
+
+        # Create WebSocket client with callbacks
+        self._ws = CLOBWebSocket(
+            on_price_change=self._on_price_change,
+            on_book_update=self._on_book_update,
+            on_connect=self._on_connect,
+            on_disconnect=self._on_disconnect,
+        )
+
+        # Start WebSocket connection
+        self._ws.start()
+
+        print(f"[HFT-WS] WebSocket scanner starting with {len(self.markets)} markets")
+
+    def stop(self):
+        """Stop the WebSocket scanner"""
+        self._running = False
+        if self._ws:
+            self._ws.stop()
+        print("[HFT-WS] WebSocket scanner stopped")
+
+    def _on_connect(self):
+        """Called when WebSocket connects"""
+        # Subscribe to all tokens
+        all_tokens = []
+        for m in self.markets:
+            token_a = m.get("token_a_id", "")
+            token_b = m.get("token_b_id", "")
+            if token_a:
+                all_tokens.append(token_a)
+            if token_b:
+                all_tokens.append(token_b)
+
+        # Subscribe in batches of 500 (max per connection)
+        batch_size = 450  # Leave some headroom
+        for i in range(0, len(all_tokens), batch_size):
+            batch = all_tokens[i:i + batch_size]
+            self._ws.subscribe(batch)
+
+        print(f"[HFT-WS] Subscribed to {len(all_tokens)} tokens")
+
+    def _on_disconnect(self):
+        """Called when WebSocket disconnects"""
+        print("[HFT-WS] Disconnected - will auto-reconnect")
+
+    def _on_book_update(self, token_id: str, book: OrderBookState):
+        """Called when full order book update received"""
+        self._check_for_signals(token_id, book.best_bid, book.best_ask)
+
+    def _on_price_change(self, token_id: str, best_bid: float, best_ask: float):
+        """
+        Called INSTANTLY when any price changes.
+
+        This is the key difference from polling - we react in <10ms vs 500ms+.
+        """
+        self.price_updates_received += 1
+        self._check_for_signals(token_id, best_bid, best_ask)
+
+    def _check_for_signals(self, token_id: str, best_bid: Optional[float], best_ask: Optional[float]):
+        """Check if price update triggers any signals"""
+        if not self._running:
+            return
+
+        # Find the market this token belongs to
+        market = self._token_to_market.get(token_id)
+        if not market:
+            return
+
+        slug = market.get("slug", "")
+
+        # Cooldown check to avoid duplicate signals
+        now_ms = time.time() * 1000
+        last_signal = self._last_signal_time.get(slug, 0)
+        if now_ms - last_signal < self._signal_cooldown_ms:
+            return
+
+        # Get both tokens for this market
+        token_a_id = market.get("token_a_id", "")
+        token_b_id = market.get("token_b_id", "")
+
+        # Get prices for both sides from WebSocket cache
+        if self._ws:
+            book_a = self._ws.get_book(token_a_id)
+            book_b = self._ws.get_book(token_b_id)
+
+            if book_a and book_b:
+                yes_ask = book_a.best_ask
+                yes_bid = book_a.best_bid
+                no_ask = book_b.best_ask
+                no_bid = book_b.best_bid
+
+                # Quick sum-to-one check
+                if yes_ask and no_ask:
+                    price_sum = yes_ask + no_ask
+                    if price_sum < 1.0:
+                        # OPPORTUNITY DETECTED! Run full signal check
+                        print(f"[HFT-WS] SUM<1 DETECTED: {slug[:30]} YES=${yes_ask:.3f} + NO=${no_ask:.3f} = ${price_sum:.4f}")
+                        self._run_full_signal_check(market, book_a, book_b)
+                        return
+
+                # Quick tail-end check (high probability)
+                yes_prob = (yes_bid + yes_ask) / 2 if yes_bid and yes_ask else yes_ask
+                no_prob = (no_bid + no_ask) / 2 if no_bid and no_ask else no_ask
+
+                if yes_prob and yes_prob >= 0.90:
+                    print(f"[HFT-WS] HIGH PROB DETECTED: {slug[:30]} YES={yes_prob*100:.1f}%")
+                    self._run_full_signal_check(market, book_a, book_b)
+                    return
+
+                if no_prob and no_prob >= 0.90:
+                    print(f"[HFT-WS] HIGH PROB DETECTED: {slug[:30]} NO={no_prob*100:.1f}%")
+                    self._run_full_signal_check(market, book_a, book_b)
+                    return
+
+    def _run_full_signal_check(self, market: dict, book_a: OrderBookState, book_b: OrderBookState):
+        """Run full signal detection through engine manager"""
+        slug = market.get("slug", "")
+
+        # Build market state
+        market_state = MarketState(
+            market_slug=slug,
+            question=market.get("question", ""),
+            token_a_id=market.get("token_a_id", ""),
+            token_b_id=market.get("token_b_id", ""),
+            token_a_bid=book_a.best_bid,
+            token_a_ask=book_a.best_ask,
+            token_b_bid=book_b.best_bid,
+            token_b_ask=book_b.best_ask,
+            token_a_ask_depth=book_a.ask_depth,
+            token_b_ask_depth=book_b.ask_depth,
+            minutes_until_resolution=market.get("minutes_until"),
+            volume_24h=market.get("volume_24h"),
+            market_category=market.get("category"),
+            timestamp_us=time.perf_counter_ns() // 1000,
+        )
+
+        # Run through engines
+        signals = self.client.engine_manager.analyze(market_state)
+
+        for signal in signals:
+            self.signals_detected += 1
+            self._last_signal_time[slug] = time.time() * 1000
+
+            if signal.engine == EngineType.SUM_TO_ONE:
+                self.sum_to_one_signals += 1
+                edge_str = f"{signal.arb_edge*100:.2f}% edge" if signal.arb_edge else ""
+                print(f"[HFT-WS] SUM-TO-ONE SIGNAL: {slug[:30]} {edge_str}")
+            else:
+                self.tail_end_signals += 1
+                prob_str = f"{signal.implied_probability*100:.1f}% prob" if signal.implied_probability else ""
+                print(f"[HFT-WS] TAIL-END SIGNAL: {slug[:30]} {signal.action} @ ${signal.target_price:.3f} ({prob_str})")
+
+            # Execute signal
+            trade = self.client.execute_signal(signal)
+
+            if trade.status == OrderStatus.FILLED:
+                self.trades_executed += 1
+                latency_ms = trade.total_latency_us / 1000 if trade.total_latency_us else 0
+                print(f"[HFT-WS] EXECUTED: {trade.trade_id} ${trade.total_cost:.2f} in {latency_ms:.1f}ms")
+            else:
+                print(f"[HFT-WS] FAILED: {trade.trade_id} - {trade.status.value}")
+
+    def update_markets(self, new_markets: list[dict]):
+        """Update market list and resubscribe"""
+        # Update lookup tables
+        self._token_to_market.clear()
+        self._market_tokens.clear()
+
+        for m in new_markets:
+            self._token_to_market[m.get("token_a_id", "")] = m
+            self._token_to_market[m.get("token_b_id", "")] = m
+            self._market_tokens[m.get("slug", "")] = (
+                m.get("token_a_id", ""),
+                m.get("token_b_id", "")
+            )
+
+        # Get new tokens to subscribe
+        new_tokens = set()
+        for m in new_markets:
+            new_tokens.add(m.get("token_a_id", ""))
+            new_tokens.add(m.get("token_b_id", ""))
+
+        # Subscribe to any new tokens
+        if self._ws and self._ws.connected:
+            current_tokens = self._ws._subscribed_tokens
+            tokens_to_add = list(new_tokens - current_tokens)
+            if tokens_to_add:
+                self._ws.subscribe(tokens_to_add)
+
+        old_count = len(self.markets)
+        self.markets = new_markets
+        print(f"[HFT-WS] Markets updated: {old_count} -> {len(new_markets)}")
+
+    def get_stats(self) -> dict:
+        """Get scanner statistics"""
+        ws_stats = self._ws.get_stats() if self._ws else {}
+        return {
+            "running": self._running,
+            "mode": "websocket",
+            "price_updates_received": self.price_updates_received,
+            "signals_detected": self.signals_detected,
+            "trades_executed": self.trades_executed,
+            "markets_monitored": len(self.markets),
+            "signals_by_engine": {
+                "sum_to_one": self.sum_to_one_signals,
+                "tail_end": self.tail_end_signals,
+            },
+            "websocket": ws_stats,
             "enabled_engines": self.client.get_enabled_engines(),
         }
 
