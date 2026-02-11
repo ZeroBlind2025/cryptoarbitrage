@@ -1124,6 +1124,44 @@ def _interpret_debug_stats(te) -> str:
     return "Unknown issue - check individual rejection counts."
 
 
+@app.route('/api/debug/books')
+def api_debug_books():
+    """Debug endpoint showing order book fetch stats"""
+    if hft_client is None:
+        return jsonify({"error": "Scanner not initialized"}), 400
+
+    book_stats = getattr(hft_client, '_book_stats', {'success': 0, 'fail_404': 0, 'fail_other': 0})
+    book_errors = getattr(hft_client, '_book_errors', {})
+
+    return jsonify({
+        "order_book_stats": {
+            "successful_fetches": book_stats.get('success', 0),
+            "failed_404_no_liquidity": book_stats.get('fail_404', 0),
+            "failed_other_errors": book_stats.get('fail_other', 0),
+            "unique_tokens_with_errors": len(book_errors),
+            "success_rate_pct": round(
+                book_stats.get('success', 0) / max(1, sum(book_stats.values())) * 100, 1
+            ),
+        },
+        "interpretation": _interpret_book_stats(book_stats),
+    })
+
+
+def _interpret_book_stats(stats: dict) -> str:
+    """Interpret book stats"""
+    total = sum(stats.values())
+    if total == 0:
+        return "No order book fetches attempted yet."
+    success_rate = stats.get('success', 0) / total
+    if stats.get('fail_404', 0) > stats.get('success', 0):
+        return f"PROBLEM: More 404s than successes. Most markets don't have CLOB liquidity. Focus on markets with active trading."
+    if success_rate < 0.1:
+        return f"PROBLEM: Only {success_rate*100:.1f}% of book fetches succeed. API may be down or rate limited."
+    if stats.get('success', 0) > 0:
+        return f"Order books working: {stats.get('success', 0)} successful fetches at {success_rate*100:.1f}% success rate."
+    return "Check individual stats for details."
+
+
 @app.route('/api/engines/toggle', methods=['POST'])
 def api_toggle_engine():
     """Toggle an engine on/off"""
