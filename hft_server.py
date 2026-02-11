@@ -43,6 +43,14 @@ from hft_client import (
     OrderStatus,
     ArbOpportunity,
 )
+
+# Import WebSocket scanner (optional - falls back to polling if not available)
+try:
+    from hft_client import HFTWebSocketScanner
+    HAS_WS_SCANNER = True
+except ImportError:
+    HAS_WS_SCANNER = False
+    print("[HFT] WebSocket scanner not available, will use polling mode")
 from arb_engines import (
     EngineType,
     EngineSignal,
@@ -836,8 +844,17 @@ def start_hft_scanner(
     scan_interval_ms: int = 500,
     enable_sum_to_one: bool = True,
     enable_tail_end: bool = True,
+    use_websocket: bool = True,  # Default to WebSocket for real-time detection
 ):
-    """Start the HFT scanner with configurable engines"""
+    """Start the HFT scanner with configurable engines
+
+    Args:
+        mode: Trading mode ('demo' or 'live')
+        scan_interval_ms: Polling interval (ignored in WebSocket mode)
+        enable_sum_to_one: Enable sum-to-one arbitrage engine
+        enable_tail_end: Enable tail-end arbitrage engine
+        use_websocket: Use WebSocket for real-time price feeds (recommended)
+    """
     global hft_client, hft_scanner, active_markets, server_state, sports_ws
 
     if server_state["is_running"]:
@@ -905,12 +922,26 @@ def start_hft_scanner(
     if not enable_tail_end:
         hft_client.disable_engine(EngineType.TAIL_END)
 
-    # Create scanner
-    hft_scanner = HFTScanner(
-        client=hft_client,
-        markets=active_markets,
-        scan_interval_ms=scan_interval_ms,
-    )
+    # Create scanner - WebSocket (real-time) or Polling mode
+    scanner_mode = "websocket" if use_websocket and HAS_WS_SCANNER else "polling"
+
+    if use_websocket and HAS_WS_SCANNER:
+        # WebSocket mode: Real-time price feeds, instant signal detection
+        print(f"[HFT] Starting WebSocket scanner (real-time mode)...", flush=True)
+        hft_scanner = HFTWebSocketScanner(
+            client=hft_client,
+            markets=active_markets,
+        )
+    else:
+        # Polling mode: Scan every N milliseconds
+        if use_websocket and not HAS_WS_SCANNER:
+            print(f"[HFT] WebSocket not available, falling back to polling mode", flush=True)
+        print(f"[HFT] Starting polling scanner ({scan_interval_ms}ms interval)...", flush=True)
+        hft_scanner = HFTScanner(
+            client=hft_client,
+            markets=active_markets,
+            scan_interval_ms=scan_interval_ms,
+        )
 
     # Start scanner
     hft_scanner.start()
@@ -922,11 +953,12 @@ def start_hft_scanner(
     refresh_thread.start()
 
     server_state["mode"] = mode
+    server_state["scanner_mode"] = scanner_mode
     server_state["is_running"] = True
     server_state["started_at"] = datetime.now(timezone.utc).isoformat()
 
     enabled = hft_client.get_enabled_engines()
-    return True, f"Started in {mode} mode with {len(active_markets)} markets. Engines: {', '.join(enabled)}. Market refresh every {MARKET_REFRESH_INTERVAL_MINUTES}min."
+    return True, f"Started in {mode} mode ({scanner_mode}) with {len(active_markets)} markets. Engines: {', '.join(enabled)}. Market refresh every {MARKET_REFRESH_INTERVAL_MINUTES}min."
 
 
 def stop_hft_scanner():
@@ -1013,6 +1045,7 @@ def api_status():
 
     return jsonify({
         "mode": server_state["mode"],
+        "scanner_mode": server_state.get("scanner_mode", "polling"),
         "is_running": server_state["is_running"],
         "started_at": server_state["started_at"],
         "markets_monitored": len(active_markets),
@@ -1029,6 +1062,7 @@ def api_start():
     scan_interval_ms = data.get('scan_interval_ms', 500)
     enable_sum_to_one = data.get('enable_sum_to_one', True)
     enable_tail_end = data.get('enable_tail_end', True)
+    use_websocket = data.get('use_websocket', True)  # Default to WebSocket mode
 
     if mode == 'live':
         # Require explicit confirmation for live mode
@@ -1043,6 +1077,7 @@ def api_start():
         scan_interval_ms,
         enable_sum_to_one=enable_sum_to_one,
         enable_tail_end=enable_tail_end,
+        use_websocket=use_websocket,
     )
 
     if success:
