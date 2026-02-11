@@ -1063,6 +1063,54 @@ def api_engines():
     return jsonify(stats)
 
 
+@app.route('/api/debug/sum-to-one')
+def api_debug_sum_to_one():
+    """Debug endpoint showing why sum-to-one signals aren't triggering"""
+    if hft_client is None:
+        return jsonify({"error": "Scanner not initialized"}), 400
+
+    s2o = hft_client.engine_manager.sum_to_one
+    return jsonify({
+        "sum_to_one_debug": {
+            "enabled": s2o.enabled,
+            "signals_generated": s2o.signals_generated,
+            "config": {
+                "max_price_sum": s2o.config.max_price_sum,
+                "fee_rate": s2o.config.fee_rate,
+                "min_edge_after_fees": s2o.config.min_edge_after_fees,
+                "min_depth_usd": s2o.config.min_depth_usd,
+                "crypto_15min_only": s2o.config.crypto_15min_only,
+            },
+            "rejection_counts": {
+                "not_crypto_15min": s2o.debug_not_crypto,
+                "missing_asks_ORDERBOOK_FAILED": s2o.debug_missing_asks,
+                "price_sum_too_high_gte_1": s2o.debug_price_sum_high,
+                "edge_too_low_after_fees": s2o.debug_low_edge,
+                "depth_too_low": s2o.debug_low_depth,
+                "crypto_markets_checked": s2o.debug_markets_checked,
+                "PASSED_ALL_CHECKS": s2o.debug_passed,
+            },
+            "best_price_sum_seen": round(s2o.debug_best_price_sum, 4),
+            "interpretation": _interpret_s2o_stats(s2o),
+        }
+    })
+
+
+def _interpret_s2o_stats(s2o) -> str:
+    """Interpret sum-to-one debug stats"""
+    if s2o.debug_markets_checked == 0:
+        return f"PROBLEM: No crypto markets being checked! {s2o.debug_not_crypto} markets rejected as not crypto 15-min."
+    if s2o.debug_missing_asks > s2o.debug_markets_checked * 0.5:
+        return f"PROBLEM: {s2o.debug_missing_asks} order book fetches failed! Check CLOB API connectivity."
+    if s2o.debug_best_price_sum >= 1.0:
+        return f"Market is efficient. Best price_sum seen: {s2o.debug_best_price_sum:.4f} (need < 1.00 for opportunity)"
+    if s2o.debug_best_price_sum < 1.0 and s2o.debug_low_edge > 0:
+        return f"Opportunities exist but filtered by fees. Best: {s2o.debug_best_price_sum:.4f}, need < {1.0 - s2o.config.fee_rate:.2f} after {s2o.config.fee_rate*100}% fee"
+    if s2o.debug_passed > 0:
+        return f"SUCCESS: {s2o.debug_passed} opportunities passed all checks!"
+    return "Check individual rejection counts."
+
+
 @app.route('/api/debug/tail-end')
 def api_debug_tail_end():
     """Debug endpoint showing why tail-end signals aren't triggering"""
