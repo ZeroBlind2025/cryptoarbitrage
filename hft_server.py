@@ -1210,6 +1210,102 @@ def _interpret_book_stats(stats: dict) -> str:
     return "Check individual stats for details."
 
 
+@app.route('/api/debug/scanner-view')
+def api_debug_scanner_view():
+    """Show exactly what the scanner sees - markets, prices, why rejected"""
+    if hft_scanner is None:
+        return jsonify({"error": "Scanner not running"}), 400
+
+    # Get current markets being scanned
+    markets = hft_scanner.markets[:20]  # First 20
+
+    results = []
+    for m in markets:
+        # Fetch live order book
+        token_a = m.get("token_a_id", "")
+        token_b = m.get("token_b_id", "")
+
+        book_a = hft_client.fetch_order_book(token_a) if token_a else None
+        book_b = hft_client.fetch_order_book(token_b) if token_b else None
+
+        yes_ask = book_a.best_ask if book_a else None
+        no_ask = book_b.best_ask if book_b else None
+        yes_bid = book_a.best_bid if book_a else None
+        no_bid = book_b.best_bid if book_b else None
+
+        # Calculate what scanner sees
+        yes_prob = (yes_bid + yes_ask) / 2 if yes_bid and yes_ask else yes_ask
+        no_prob = (no_bid + no_ask) / 2 if no_bid and no_ask else no_ask
+
+        results.append({
+            "slug": m.get("slug", "")[:50],
+            "category": m.get("category"),
+            "minutes_until": m.get("minutes_until"),
+            "YES_ask": yes_ask,
+            "YES_bid": yes_bid,
+            "YES_prob_calc": round(yes_prob, 4) if yes_prob else None,
+            "NO_ask": no_ask,
+            "NO_bid": no_bid,
+            "NO_prob_calc": round(no_prob, 4) if no_prob else None,
+            "would_trigger_90pct": (yes_prob and yes_prob >= 0.9) or (no_prob and no_prob >= 0.9),
+            "book_a_ok": book_a is not None,
+            "book_b_ok": book_b is not None,
+        })
+
+    # Count categories
+    sports_count = len([m for m in hft_scanner.markets if m.get("category") == "sports"])
+    crypto_count = len([m for m in hft_scanner.markets if m.get("category") == "crypto"])
+
+    return jsonify({
+        "total_markets_in_scanner": len(hft_scanner.markets),
+        "sports_markets": sports_count,
+        "crypto_markets": crypto_count,
+        "sample_markets": results,
+    })
+
+
+@app.route('/api/debug/find-game/<search>')
+def api_debug_find_game(search):
+    """Search for a specific game in scanner's market list"""
+    if hft_scanner is None:
+        return jsonify({"error": "Scanner not running"}), 400
+
+    search_lower = search.lower()
+    matches = []
+
+    for m in hft_scanner.markets:
+        slug = m.get("slug", "").lower()
+        question = m.get("question", "").lower()
+
+        if search_lower in slug or search_lower in question:
+            # Fetch live prices
+            token_a = m.get("token_a_id", "")
+            token_b = m.get("token_b_id", "")
+
+            book_a = hft_client.fetch_order_book(token_a) if token_a else None
+            book_b = hft_client.fetch_order_book(token_b) if token_b else None
+
+            matches.append({
+                "slug": m.get("slug"),
+                "question": m.get("question", "")[:80],
+                "category": m.get("category"),
+                "minutes_until": m.get("minutes_until"),
+                "token_a_id": token_a[:20] + "..." if token_a else None,
+                "token_b_id": token_b[:20] + "..." if token_b else None,
+                "YES_ask": book_a.best_ask if book_a else "BOOK_FAILED",
+                "YES_bid": book_a.best_bid if book_a else "BOOK_FAILED",
+                "NO_ask": book_b.best_ask if book_b else "BOOK_FAILED",
+                "NO_bid": book_b.best_bid if book_b else "BOOK_FAILED",
+            })
+
+    return jsonify({
+        "search": search,
+        "matches_found": len(matches),
+        "matches": matches[:10],
+        "hint": "If 0 matches, the game isn't in scanner's market list - that's the bug"
+    })
+
+
 @app.route('/api/debug/test-book/<slug>')
 def api_debug_test_book(slug):
     """Test fetching order book for a specific market by slug"""
