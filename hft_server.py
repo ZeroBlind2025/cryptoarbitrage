@@ -1210,6 +1210,41 @@ def _interpret_book_stats(stats: dict) -> str:
     return "Check individual stats for details."
 
 
+@app.route('/api/debug/crypto-raw')
+def api_debug_crypto_raw():
+    """Show ALL crypto markets in scanner with raw data - no filtering"""
+    if hft_scanner is None:
+        return jsonify({"error": "Scanner not running"}), 400
+
+    crypto_markets = [m for m in hft_scanner.markets if m.get("category") == "crypto"]
+
+    results = []
+    for m in crypto_markets:
+        token_a = m.get("token_a_id", "")
+        token_b = m.get("token_b_id", "")
+        book_a = hft_client.fetch_order_book(token_a) if token_a else None
+        book_b = hft_client.fetch_order_book(token_b) if token_b else None
+
+        results.append({
+            "slug": m.get("slug"),
+            "category": m.get("category"),
+            "minutes_until": m.get("minutes_until"),
+            "passes_20min_filter": m.get("minutes_until") is not None and m.get("minutes_until") <= 20,
+            "YES_ask": book_a.best_ask if book_a else "FAILED",
+            "YES_bid": book_a.best_bid if book_a else "FAILED",
+            "NO_ask": book_b.best_ask if book_b else "FAILED",
+            "NO_bid": book_b.best_bid if book_b else "FAILED",
+            "price_sum": round((book_a.best_ask or 0) + (book_b.best_ask or 0), 4) if book_a and book_b else "N/A",
+        })
+
+    return jsonify({
+        "total_crypto_in_scanner": len(crypto_markets),
+        "pass_20min_filter": len([r for r in results if r.get("passes_20min_filter")]),
+        "fail_20min_filter": len([r for r in results if not r.get("passes_20min_filter")]),
+        "crypto_markets": results,
+    })
+
+
 @app.route('/api/debug/scanner-view')
 def api_debug_scanner_view():
     """Show exactly what the scanner sees - markets, prices, why rejected"""
