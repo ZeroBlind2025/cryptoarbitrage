@@ -222,26 +222,38 @@ class CLOBWebSocket:
         try:
             data = json.loads(message)
 
-            # Handle different event types
-            event_type = data.get("event_type")
-
-            if event_type == "book":
-                self._handle_book(data)
-            elif event_type == "price_change":
-                self._handle_price_change(data)
-            elif event_type == "last_trade_price":
-                self._handle_last_trade(data)
-            elif event_type == "tick_size_change":
-                pass  # Ignore tick size changes
+            # Handle array of events (batch updates)
+            if isinstance(data, list):
+                for item in data:
+                    self._process_single_event(item)
             else:
-                # Unknown event type - might be initial snapshot
-                if "bids" in data or "asks" in data:
-                    self._handle_book(data)
+                self._process_single_event(data)
 
         except json.JSONDecodeError:
             print(f"[CLOB WS] Invalid JSON: {message[:100]}", flush=True)
         except Exception as e:
             print(f"[CLOB WS] Message error: {e}", flush=True)
+
+    def _process_single_event(self, data: dict):
+        """Process a single event message"""
+        if not isinstance(data, dict):
+            return
+
+        # Handle different event types
+        event_type = data.get("event_type")
+
+        if event_type == "book":
+            self._handle_book(data)
+        elif event_type == "price_change":
+            self._handle_price_change(data)
+        elif event_type == "last_trade_price":
+            self._handle_last_trade(data)
+        elif event_type == "tick_size_change":
+            pass  # Ignore tick size changes
+        else:
+            # Unknown event type - might be initial snapshot
+            if "bids" in data or "asks" in data:
+                self._handle_book(data)
 
     def _handle_book(self, data: dict):
         """Handle full book snapshot"""

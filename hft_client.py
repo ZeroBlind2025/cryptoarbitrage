@@ -1286,23 +1286,49 @@ class HFTWebSocketScanner:
 
     def _on_connect(self):
         """Called when WebSocket connects"""
-        # Subscribe to all tokens
-        all_tokens = []
+        # Prioritize crypto markets (sum-to-one opportunities), then sports
+        # WebSocket limit is 500 tokens per connection
+        MAX_TOKENS = 450  # Leave some headroom
+
+        crypto_tokens = []
+        sports_tokens = []
+
         for m in self.markets:
             token_a = m.get("token_a_id", "")
             token_b = m.get("token_b_id", "")
-            if token_a:
-                all_tokens.append(token_a)
-            if token_b:
-                all_tokens.append(token_b)
+            category = m.get("category", "")
+            slug = m.get("slug", "")
 
-        # Subscribe in batches of 500 (max per connection)
-        batch_size = 450  # Leave some headroom
-        for i in range(0, len(all_tokens), batch_size):
-            batch = all_tokens[i:i + batch_size]
-            self._ws.subscribe(batch)
+            # Detect crypto markets (15-min markets are the sum-to-one targets)
+            is_crypto = (
+                category == "crypto" or
+                "-updown-" in slug or
+                "btc-" in slug or "eth-" in slug or "sol-" in slug or "xrp-" in slug
+            )
 
-        print(f"[HFT-WS] Subscribed to {len(all_tokens)} tokens")
+            if is_crypto:
+                if token_a:
+                    crypto_tokens.append(token_a)
+                if token_b:
+                    crypto_tokens.append(token_b)
+            else:
+                if token_a:
+                    sports_tokens.append(token_a)
+                if token_b:
+                    sports_tokens.append(token_b)
+
+        # Subscribe crypto first (highest priority for sum-to-one)
+        tokens_to_sub = crypto_tokens[:MAX_TOKENS]
+        remaining_slots = MAX_TOKENS - len(tokens_to_sub)
+
+        # Add sports tokens if we have room
+        if remaining_slots > 0:
+            tokens_to_sub.extend(sports_tokens[:remaining_slots])
+
+        # Subscribe
+        self._ws.subscribe(tokens_to_sub)
+
+        print(f"[HFT-WS] Subscribed: {len(crypto_tokens)} crypto + {min(remaining_slots, len(sports_tokens))} sports = {len(tokens_to_sub)} tokens (max {MAX_TOKENS})")
 
     def _on_disconnect(self):
         """Called when WebSocket disconnects"""
