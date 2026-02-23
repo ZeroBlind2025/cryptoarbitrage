@@ -1545,6 +1545,9 @@ def copy_trader_loop():
             copied = copy_trader.check_and_copy()
             if copied > 0:
                 print(f"[COPY] Copied {copied} trade(s)", flush=True)
+
+            # Check for resolved positions (updates win/loss tracking)
+            copy_trader.check_resolutions()
         except Exception as e:
             print(f"[COPY] Error in loop: {e}", flush=True)
 
@@ -1836,10 +1839,18 @@ def api_data():
             "running": copy_trader_thread and copy_trader_thread.is_alive(),
             "target": TARGET_ADDRESS[:20] + "..." if TARGET_ADDRESS else "",
             "target_name": copy_trader.target_name if copy_trader else "",
-            "dry_run": copy_trader.dry_run if copy_trader else True,
-            "trades_copied": copy_trader.trades_copied if copy_trader else 0,
-            "trades_skipped": copy_trader.trades_skipped if copy_trader else 0,
-            "total_spent": copy_trader.total_spent if copy_trader else 0,
+            **(copy_trader.get_stats() if copy_trader else {
+                "dry_run": True,
+                "trades_copied": 0,
+                "trades_skipped": 0,
+                "total_spent": 0,
+                "open_positions": 0,
+                "resolved_positions": 0,
+                "wins": 0,
+                "losses": 0,
+                "win_rate": 0,
+                "total_pnl": 0,
+            }),
         },
         "trades_by_engine": {
             "demo": {
