@@ -103,6 +103,18 @@ MARKET_REFRESH_INTERVAL_MINUTES = 15
 refresh_thread: Optional[threading.Thread] = None
 stop_refresh = threading.Event()
 
+# Copy trader
+try:
+    from copy_trader import CopyTrader, TARGET_ADDRESS
+    HAS_COPY_TRADER = True
+except ImportError:
+    HAS_COPY_TRADER = False
+    TARGET_ADDRESS = ""
+
+copy_trader: Optional["CopyTrader"] = None
+copy_trader_thread: Optional[threading.Thread] = None
+stop_copy_trader = threading.Event()
+
 # Sports WebSocket for real-time game data
 sports_ws: Optional[SportsWebSocket] = None
 live_sports_data: dict[str, dict] = {}  # event_id -> data from WebSocket
@@ -1506,6 +1518,130 @@ def api_stop():
     if success:
         return jsonify({"success": True, "message": message})
     return jsonify({"error": message}), 400
+
+
+# =============================================================================
+# COPY TRADER ENDPOINTS
+# =============================================================================
+
+def copy_trader_loop():
+    """Background loop for copy trader"""
+    global copy_trader
+    if not copy_trader:
+        return
+
+    print(f"[COPY] Background monitoring started (every 10s)...", flush=True)
+
+    while not stop_copy_trader.is_set():
+        try:
+            copied = copy_trader.check_and_copy()
+            if copied > 0:
+                print(f"[COPY] Copied {copied} trade(s)", flush=True)
+        except Exception as e:
+            print(f"[COPY] Error in loop: {e}", flush=True)
+
+        stop_copy_trader.wait(timeout=10)  # Check every 10 seconds
+
+    print("[COPY] Background monitoring stopped", flush=True)
+
+
+@app.route('/api/copy-trader/start', methods=['POST'])
+def api_copy_trader_start():
+    """Start copy trading"""
+    global copy_trader, copy_trader_thread, stop_copy_trader
+
+    if not HAS_COPY_TRADER:
+        return jsonify({"error": "Copy trader module not available"}), 400
+
+    if copy_trader_thread and copy_trader_thread.is_alive():
+        return jsonify({"error": "Copy trader already running"}), 400
+
+    data = request.get_json() or {}
+    live_mode = data.get('live', False)
+    crypto_only = data.get('crypto_only', True)
+
+    # Require confirmation for live mode
+    if live_mode and not data.get('confirm_live'):
+        return jsonify({
+            "error": "Live mode requires confirmation",
+            "message": "Set confirm_live=true to enable live copy trading"
+        }), 403
+
+    # Create copy trader
+    copy_trader = CopyTrader(
+        dry_run=not live_mode,
+        crypto_only=crypto_only
+    )
+    copy_trader.start()
+
+    # Start background thread
+    stop_copy_trader.clear()
+    copy_trader_thread = threading.Thread(target=copy_trader_loop, daemon=True)
+    copy_trader_thread.start()
+
+    mode_str = "LIVE" if live_mode else "DRY RUN"
+    return jsonify({
+        "success": True,
+        "message": f"Copy trader started in {mode_str} mode, following {copy_trader.target_name}",
+        "target": TARGET_ADDRESS,
+    })
+
+
+@app.route('/api/copy-trader/stop', methods=['POST'])
+def api_copy_trader_stop():
+    """Stop copy trading"""
+    global copy_trader, copy_trader_thread, stop_copy_trader
+
+    if not copy_trader_thread or not copy_trader_thread.is_alive():
+        return jsonify({"error": "Copy trader not running"}), 400
+
+    stop_copy_trader.set()
+    copy_trader_thread.join(timeout=5)
+
+    stats = {
+        "trades_copied": copy_trader.trades_copied if copy_trader else 0,
+        "trades_skipped": copy_trader.trades_skipped if copy_trader else 0,
+        "total_spent": copy_trader.total_spent if copy_trader else 0,
+    }
+
+    copy_trader = None
+
+    return jsonify({
+        "success": True,
+        "message": "Copy trader stopped",
+        "stats": stats
+    })
+
+
+@app.route('/api/copy-trader/status')
+def api_copy_trader_status():
+    """Get copy trader status"""
+    if not HAS_COPY_TRADER:
+        return jsonify({
+            "available": False,
+            "running": False,
+            "error": "Copy trader module not available"
+        })
+
+    running = copy_trader_thread and copy_trader_thread.is_alive()
+
+    status = {
+        "available": True,
+        "running": running,
+        "target_address": TARGET_ADDRESS,
+    }
+
+    if copy_trader:
+        status.update({
+            "target_name": copy_trader.target_name,
+            "dry_run": copy_trader.dry_run,
+            "crypto_only": copy_trader.crypto_only,
+            "trades_copied": copy_trader.trades_copied,
+            "trades_skipped": copy_trader.trades_skipped,
+            "total_spent": copy_trader.total_spent,
+        })
+
+    return jsonify(status)
 
 
 @app.route('/api/trades')
