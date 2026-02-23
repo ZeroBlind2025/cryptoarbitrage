@@ -94,13 +94,22 @@ def save_positions(positions: dict):
         print(f"[COPY] Error saving positions: {e}")
 
 
-def get_market_resolution(condition_id: str) -> Optional[dict]:
+def get_market_resolution(condition_id: str = "", slug: str = "") -> Optional[dict]:
     """Check if a market has resolved and get the winning outcome"""
     try:
         # Try gamma API for market info
+        # Can query by condition_id or slug
+        params = {}
+        if condition_id:
+            params["condition_ids"] = condition_id
+        elif slug:
+            params["slug"] = slug
+        else:
+            return {"resolved": False}
+
         response = requests.get(
             f"{GAMMA_API}/markets",
-            params={"condition_ids": condition_id},
+            params=params,
             timeout=10
         )
         response.raise_for_status()
@@ -132,7 +141,8 @@ def get_market_resolution(condition_id: str) -> Optional[dict]:
         return {"resolved": False}
 
     except Exception as e:
-        print(f"[COPY] Error checking resolution for {condition_id[:20]}...: {e}")
+        identifier = condition_id[:20] if condition_id else slug[:20]
+        print(f"[COPY] Error checking resolution for {identifier}...: {e}")
         return {"resolved": False}
 
 
@@ -370,8 +380,9 @@ class CopyTrader:
                 continue
 
             # Check if we already have this position
-            condition_id = bet.get("conditionId", "")
-            outcome_index = bet.get("outcomeIndex", 0)
+            # Try multiple field names for condition_id (API may use camelCase or snake_case)
+            condition_id = bet.get("conditionId") or bet.get("condition_id") or bet.get("market_condition_id") or ""
+            outcome_index = bet.get("outcomeIndex") or bet.get("outcome_index") or 0
 
             if already_has_position(my_positions, condition_id, outcome_index):
                 print(f"[COPY] Skip (already own): {title}")
@@ -504,10 +515,13 @@ class CopyTrader:
 
         for position in open_positions[:]:  # Copy list to allow modification
             condition_id = position.get("condition_id", "")
-            if not condition_id:
+            slug = position.get("slug", "")
+
+            # Need either condition_id or slug to check resolution
+            if not condition_id and not slug:
                 continue
 
-            result = get_market_resolution(condition_id)
+            result = get_market_resolution(condition_id=condition_id, slug=slug)
 
             if result.get("resolved"):
                 # Position resolved!
@@ -530,7 +544,16 @@ class CopyTrader:
                     # Normalize for comparison (case insensitive, strip whitespace)
                     our_normalized = our_outcome.lower().strip()
                     winning_normalized = winning_outcome.lower().strip()
-                    won = (our_normalized == winning_normalized)
+
+                    # Handle truncated outcome names from gamma API
+                    # e.g., "U" should match "Up", "D" should match "Down"
+                    if our_normalized == winning_normalized:
+                        won = True
+                    elif our_normalized.startswith(winning_normalized) or winning_normalized.startswith(our_normalized):
+                        # "up".startswith("u") or "u".startswith("up") - partial match
+                        won = True
+                    else:
+                        won = False
                     print(f"       Name comparison: '{our_normalized}' vs '{winning_normalized}' => {won}")
                 elif winning_index is not None and our_index is not None:
                     # Fallback to index if names not available
