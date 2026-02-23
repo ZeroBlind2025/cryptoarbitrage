@@ -372,8 +372,15 @@ class CopyTrader:
             title = bet.get("title", "Unknown")[:50]
             outcome = bet.get("outcome", "?")
             size = bet.get("size", 0)
-            price = bet.get("price", 0)
             slug = bet.get("slug", "")
+
+            # Try multiple field names for price (API may vary)
+            price = bet.get("price") or bet.get("avgPrice") or bet.get("average_price") or bet.get("tradePrice") or 0
+            # Convert to float if string
+            try:
+                price = float(price) if price else 0
+            except (ValueError, TypeError):
+                price = 0
 
             # Filter for crypto markets only
             if self.crypto_only and not is_crypto_market(bet):
