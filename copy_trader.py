@@ -394,6 +394,11 @@ class CopyTrader:
                     except (ValueError, TypeError):
                         continue
 
+            # Normalize price if it looks like a percentage (>1) instead of decimal
+            if price and price > 1:
+                print(f"[COPY] Price looks like percentage ({price}), converting to decimal")
+                price = price / 100  # Convert 62.5 -> 0.625
+
             # Fallback: calculate price from usdcSize / size (if we have shares and dollar amount)
             if not price or price <= 0:
                 usdc_size = bet.get('usdcSize') or bet.get('usdc_size') or bet.get('amount')
