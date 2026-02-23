@@ -523,15 +523,19 @@ class CopyTrader:
                 print(f"       Our outcome: '{our_outcome}' (index {our_index})")
                 print(f"       Winning outcome: '{winning_outcome}' (index {winning_index})")
 
-                # Compare by index first (more reliable), then by name
-                if winning_index is not None and our_index is not None:
+                # Compare by NAME first (more reliable - activity API always has outcome name)
+                # Index comparison is unreliable because outcomeIndex may not be in activity API
+                won = None
+                if winning_outcome and our_outcome:
+                    # Normalize for comparison (case insensitive, strip whitespace)
+                    our_normalized = our_outcome.lower().strip()
+                    winning_normalized = winning_outcome.lower().strip()
+                    won = (our_normalized == winning_normalized)
+                    print(f"       Name comparison: '{our_normalized}' vs '{winning_normalized}' => {won}")
+                elif winning_index is not None and our_index is not None:
+                    # Fallback to index if names not available
                     won = (winning_index == our_index)
-                elif winning_outcome and our_outcome:
-                    # Normalize for comparison (case insensitive)
-                    won = winning_outcome.lower() == our_outcome.lower()
-                else:
-                    # Can't determine winner
-                    won = None
+                    print(f"       Index comparison: {our_index} vs {winning_index} => {won}")
 
                 if won is True:
                     payout = amount / entry_price if entry_price > 0 else 0
@@ -559,6 +563,8 @@ class CopyTrader:
                 # Move from open to resolved
                 position["resolved_at"] = datetime.now(timezone.utc).isoformat()
                 position["winning_outcome"] = winning_outcome
+                position["winning_index"] = winning_index
+                position["won"] = won
                 self.positions["open"].remove(position)
                 self.positions["resolved"].append(position)
                 resolved_this_check += 1
