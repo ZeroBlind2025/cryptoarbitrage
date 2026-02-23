@@ -94,16 +94,50 @@ def save_positions(positions: dict):
         print(f"[COPY] Error saving positions: {e}")
 
 
-def get_market_resolution(condition_id: str = "", slug: str = "") -> Optional[dict]:
+def check_token_resolution(token_id: str) -> Optional[dict]:
+    """Check if a specific token has resolved by checking its price on CLOB"""
+    if not token_id:
+        return None
+    try:
+        response = requests.get(
+            f"{CLOB_API}/price",
+            params={"token_id": token_id},
+            timeout=10
+        )
+        if response.status_code == 200:
+            data = response.json()
+            price = float(data.get("price", 0))
+            # If price is $1 or very close, this token won
+            # If price is $0 or very close, this token lost
+            if price >= 0.95:
+                return {"resolved": True, "won": True, "price": price}
+            elif price <= 0.05:
+                return {"resolved": True, "won": False, "price": price}
+        return None
+    except Exception:
+        return None
+
+
+def get_market_resolution(condition_id: str = "", slug: str = "", token_id: str = "", our_outcome: str = "") -> Optional[dict]:
     """Check if a market has resolved and get the winning outcome"""
     try:
-        # Try gamma API for market info
-        # Can query by condition_id or slug
+        # First try: Check token price directly (most reliable for resolved markets)
+        if token_id:
+            token_result = check_token_resolution(token_id)
+            if token_result and token_result.get("resolved"):
+                # We know if OUR token won or lost directly
+                return {
+                    "resolved": True,
+                    "our_token_won": token_result.get("won"),
+                    "winning_outcome": our_outcome if token_result.get("won") else None,
+                    "winning_index": None,  # Don't need index when we know directly
+                }
+
+        # Fallback: Try gamma API for market info
         params = {}
         if condition_id:
             params["condition_ids"] = condition_id
         elif slug:
-            # Try slug_contains for partial match
             params["slug_contains"] = slug
         else:
             return {"resolved": False}
@@ -121,23 +155,23 @@ def get_market_resolution(condition_id: str = "", slug: str = "") -> Optional[di
 
             # Check if resolved
             if market.get("closed") or market.get("resolved"):
-                # Get winning outcome
                 outcomes = market.get("outcomes", [])
                 outcome_prices = market.get("outcomePrices", [])
 
-                # If resolved, one outcome will be $1.00 and others $0.00
-                for i, price in enumerate(outcome_prices):
-                    try:
-                        if float(price) >= 0.99:  # Winner
-                            return {
-                                "resolved": True,
-                                "winning_outcome": outcomes[i] if i < len(outcomes) else f"outcome_{i}",
-                                "winning_index": i,
-                            }
-                    except (ValueError, TypeError):
-                        continue
+                # Only use gamma data if it looks valid (2 outcomes for binary market)
+                if len(outcomes) == 2 and len(outcome_prices) == 2:
+                    for i, price in enumerate(outcome_prices):
+                        try:
+                            if float(price) >= 0.99 and i < len(outcomes):
+                                return {
+                                    "resolved": True,
+                                    "winning_outcome": outcomes[i],
+                                    "winning_index": i,
+                                }
+                        except (ValueError, TypeError):
+                            continue
 
-                # Market closed but can't determine winner
+                # Market closed but can't determine winner reliably
                 return {"resolved": True, "winning_outcome": None, "winning_index": None}
 
         return {"resolved": False}
@@ -476,10 +510,12 @@ class CopyTrader:
 
             # Save position for tracking (if trade was successful or dry run)
             if trade_record["status"] in ["filled", "dry_run"]:
+                token_id = bet.get("asset", "")
                 position = {
                     "id": trade_record["id"],
                     "timestamp": trade_record["timestamp"],
                     "condition_id": condition_id,
+                    "token_id": token_id,  # Store token_id for direct resolution check
                     "outcome_index": outcome_index,
                     "outcome": outcome,
                     "market": title,
@@ -557,42 +593,49 @@ class CopyTrader:
         for position in open_positions[:]:  # Copy list to allow modification
             condition_id = position.get("condition_id", "")
             slug = position.get("slug", "")
+            token_id = position.get("token_id", "")
+            our_outcome = position.get("outcome")
 
-            # Need either condition_id or slug to check resolution
-            if not condition_id and not slug:
+            # Need either token_id, condition_id, or slug to check resolution
+            if not token_id and not condition_id and not slug:
                 continue
 
-            result = get_market_resolution(condition_id=condition_id, slug=slug)
+            result = get_market_resolution(
+                condition_id=condition_id,
+                slug=slug,
+                token_id=token_id,
+                our_outcome=our_outcome
+            )
 
             if result.get("resolved"):
                 # Position resolved!
-                winning_outcome = result.get("winning_outcome")
-                winning_index = result.get("winning_index")
-                our_outcome = position.get("outcome")
                 our_index = position.get("outcome_index")
                 entry_price = position.get("entry_price", 0)
                 amount = position.get("amount", 0)
 
-                # Compare by NAME first (more reliable - activity API always has outcome name)
-                # Index comparison is unreliable because outcomeIndex may not be in activity API
+                # Check if we got a direct win/loss result from token price check
                 won = None
-                if winning_outcome and our_outcome:
-                    # Normalize for comparison (case insensitive, strip whitespace)
-                    our_normalized = our_outcome.lower().strip()
-                    winning_normalized = winning_outcome.lower().strip()
+                if "our_token_won" in result:
+                    # Direct result from token price - most reliable
+                    won = result.get("our_token_won")
+                    print(f"[COPY] Token resolution: {position['market'][:30]} | won={won}")
+                else:
+                    # Fallback to outcome name comparison
+                    winning_outcome = result.get("winning_outcome")
+                    winning_index = result.get("winning_index")
 
-                    # Handle truncated outcome names from gamma API
-                    # e.g., "U" should match "Up", "D" should match "Down"
-                    if our_normalized == winning_normalized:
-                        won = True
-                    elif our_normalized.startswith(winning_normalized) or winning_normalized.startswith(our_normalized):
-                        # "up".startswith("u") or "u".startswith("up") - partial match
-                        won = True
-                    else:
-                        won = False
-                elif winning_index is not None and our_index is not None:
-                    # Fallback to index if names not available
-                    won = (winning_index == our_index)
+                    if winning_outcome and our_outcome:
+                        our_normalized = our_outcome.lower().strip()
+                        winning_normalized = winning_outcome.lower().strip()
+
+                        if our_normalized == winning_normalized:
+                            won = True
+                        elif our_normalized.startswith(winning_normalized) or winning_normalized.startswith(our_normalized):
+                            won = True
+                        else:
+                            won = False
+                    elif winning_index is not None and our_index is not None:
+                        won = (winning_index == our_index)
 
                 if won is True:
                     # Validate entry_price before calculating
