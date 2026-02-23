@@ -374,42 +374,32 @@ class CopyTrader:
             size = bet.get("size", 0)
             slug = bet.get("slug", "")
 
-            # Debug: log all bet keys and values to find price field
-            print(f"[COPY] Bet fields: {list(bet.keys())}")
-            print(f"[COPY] Bet values: price={bet.get('price')}, avgPrice={bet.get('avgPrice')}, "
-                  f"averagePrice={bet.get('averagePrice')}, tradePrice={bet.get('tradePrice')}, "
-                  f"size={bet.get('size')}, usdcSize={bet.get('usdcSize')}")
-
-            # Try multiple field names for price (API may vary)
-            # Check all common variations for entry price
+            # Calculate entry price from usdcSize / size (dollars spent / shares received)
+            # This is the TRUE entry price. The 'price' field from activity API is current price, not entry price!
             price = None
-            for price_field in ['price', 'avgPrice', 'averagePrice', 'average_price', 'tradePrice', 'entryPrice', 'entry_price']:
-                val = bet.get(price_field)
-                if val is not None and val != '' and val != 0:
-                    try:
-                        price = float(val)
-                        if price > 0:
-                            print(f"[COPY] Found price in field '{price_field}': {price}")
-                            break
-                    except (ValueError, TypeError):
-                        continue
+            usdc_size = bet.get('usdcSize') or bet.get('usdc_size') or bet.get('amount')
+            shares = bet.get('size')
 
-            # Normalize price if it looks like a percentage (>1) instead of decimal
-            if price and price > 1:
-                print(f"[COPY] Price looks like percentage ({price}), converting to decimal")
-                price = price / 100  # Convert 62.5 -> 0.625
+            print(f"[COPY] Bet fields: {list(bet.keys())}")
+            print(f"[COPY] Bet values: usdcSize={usdc_size}, size={shares}, price_field={bet.get('price')}")
 
-            # Fallback: calculate price from usdcSize / size (if we have shares and dollar amount)
+            if usdc_size and shares:
+                try:
+                    usdc_size = float(usdc_size)
+                    shares = float(shares)
+                    if shares > 0:
+                        price = usdc_size / shares
+                        print(f"[COPY] Entry price calculated: ${usdc_size} / {shares} shares = {price:.4f} ({price*100:.1f}¢)")
+                except (ValueError, TypeError):
+                    pass
+
+            # Fallback to price field only if calculation failed (shouldn't happen)
             if not price or price <= 0:
-                usdc_size = bet.get('usdcSize') or bet.get('usdc_size') or bet.get('amount')
-                shares = bet.get('size')
-                if usdc_size and shares:
+                raw_price = bet.get('price')
+                if raw_price:
                     try:
-                        usdc_size = float(usdc_size)
-                        shares = float(shares)
-                        if shares > 0:
-                            price = usdc_size / shares
-                            print(f"[COPY] Calculated price from usdcSize/size: ${usdc_size}/{shares} = {price:.4f}")
+                        price = float(raw_price)
+                        print(f"[COPY] WARNING: Using price field as fallback: {price}")
                     except (ValueError, TypeError):
                         pass
 
