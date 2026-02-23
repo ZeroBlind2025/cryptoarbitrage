@@ -229,6 +229,15 @@ class CopyTrader:
                 print("[COPY] Failed to initialize client. Running in dry-run mode.")
                 self.dry_run = True
 
+        # Snapshot existing trades so we don't copy historical trades
+        # Only copy NEW trades that happen AFTER we start monitoring
+        print("[COPY] Loading existing trades to avoid duplicates...")
+        existing_bets = get_latest_bets(TARGET_ADDRESS, limit=50)
+        for bet in existing_bets:
+            trade_id = bet.get("id") or f"{bet.get('conditionId')}_{bet.get('timestamp')}"
+            self.copied_trades.add(trade_id)
+        print(f"[COPY] Marked {len(self.copied_trades)} existing trades as seen. Waiting for NEW trades...")
+
     def check_and_copy(self) -> int:
         """Check for new trades and copy them. Returns number of trades copied."""
         copied = 0
