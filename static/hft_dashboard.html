@@ -155,6 +155,54 @@
             );
         };
 
+        // Copy Trade Row (for copy trader trades)
+        const CopyTradeRow = ({ trade, isNew }) => {
+            const time = new Date(trade.timestamp).toLocaleTimeString();
+
+            return (
+                <div className={`bg-slate-800/30 rounded-lg p-3 border border-slate-700/50 hover:border-slate-600/50 transition-all ${isNew ? 'flash-green' : ''}`}>
+                    <div className="flex items-center justify-between mb-2">
+                        <div className="flex items-center gap-2">
+                            <span className="px-2 py-0.5 text-xs rounded border font-medium bg-cyan-500/20 text-cyan-400 border-cyan-500/30">
+                                COPY
+                            </span>
+                            <span className={`px-2 py-0.5 text-xs rounded border ${
+                                trade.status === 'filled' ? 'bg-green-500/20 text-green-400 border-green-500/30' :
+                                trade.status === 'dry_run' ? 'bg-blue-500/20 text-blue-400 border-blue-500/30' :
+                                'bg-red-500/20 text-red-400 border-red-500/30'
+                            }`}>
+                                {trade.status?.toUpperCase()}
+                            </span>
+                        </div>
+                        <span className="text-xs text-slate-500">{time}</span>
+                    </div>
+                    <p className="text-sm text-white truncate mb-2" title={trade.market}>
+                        {trade.market || trade.slug}
+                    </p>
+                    <div className="grid grid-cols-4 gap-2 text-xs">
+                        <div>
+                            <p className="text-slate-500">Outcome</p>
+                            <p className="text-white font-mono">{trade.outcome}</p>
+                        </div>
+                        <div>
+                            <p className="text-slate-500">Amount</p>
+                            <p className="text-white font-mono">${trade.amount?.toFixed(2)}</p>
+                        </div>
+                        <div>
+                            <p className="text-slate-500">Price</p>
+                            <p className="text-cyan-400 font-mono">{(trade.price * 100).toFixed(1)}¢</p>
+                        </div>
+                        <div>
+                            <p className="text-slate-500">Following</p>
+                            <p className="text-yellow-400 font-mono truncate" title={trade.target_trader}>
+                                {trade.target_trader?.slice(0, 10)}...
+                            </p>
+                        </div>
+                    </div>
+                </div>
+            );
+        };
+
         // Latency Chart
         const LatencyDisplay = ({ latency }) => {
             if (!latency || !latency.count) {
@@ -407,10 +455,11 @@
             const scanner = data?.scanner || {};
             const latency = data?.latency || {};
             const pnl = data?.pnl || { demo: {}, live: {} };
-            const trades = data?.trades || { demo: [], live: [] };
+            const trades = data?.trades || { demo: [], live: [], copy: [] };
             const engines = data?.engines || { sum_to_one: {}, tail_end: {} };
             const tradesByEngine = data?.trades_by_engine || { demo: {}, live: {} };
-            const allTrades = [...(trades.demo || []), ...(trades.live || [])]
+            const copyTrader = data?.copy_trader || {};
+            const allTrades = [...(trades.demo || []), ...(trades.live || []), ...(trades.copy || [])]
                 .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
 
             // Toggle engine
@@ -582,7 +631,7 @@
                                     </h2>
                                     <div className="flex gap-2">
                                         <span className="text-xs text-slate-400">
-                                            {trades.demo?.length || 0} demo / {trades.live?.length || 0} live
+                                            {trades.demo?.length || 0} demo / {trades.live?.length || 0} live / {trades.copy?.length || 0} copy
                                         </span>
                                     </div>
                                 </div>
@@ -590,11 +639,19 @@
                                 <div className="space-y-3 max-h-[500px] overflow-y-auto">
                                     {allTrades.length > 0 ? (
                                         allTrades.slice(0, 20).map((trade) => (
-                                            <TradeRow
-                                                key={trade.trade_id}
-                                                trade={trade}
-                                                isNew={newTradeIds.has(trade.trade_id)}
-                                            />
+                                            trade.source === 'copy_trader' ? (
+                                                <CopyTradeRow
+                                                    key={trade.id}
+                                                    trade={trade}
+                                                    isNew={newTradeIds.has(trade.id)}
+                                                />
+                                            ) : (
+                                                <TradeRow
+                                                    key={trade.trade_id}
+                                                    trade={trade}
+                                                    isNew={newTradeIds.has(trade.trade_id)}
+                                                />
+                                            )
                                         ))
                                     ) : (
                                         <p className="text-slate-500 text-center py-12">
@@ -602,6 +659,60 @@
                                         </p>
                                     )}
                                 </div>
+                            </div>
+
+                            {/* Copy Trader Status */}
+                            <div className="bg-slate-800/50 backdrop-blur rounded-xl border border-slate-700/50 p-4">
+                                <div className="flex items-center justify-between mb-4">
+                                    <h2 className="text-lg font-semibold flex items-center gap-2">
+                                        <span className="text-cyan-400">👤</span>
+                                        Copy Trader
+                                    </h2>
+                                    <span className={`px-2 py-0.5 text-xs rounded border ${
+                                        copyTrader.running
+                                            ? 'bg-green-500/20 text-green-400 border-green-500/30'
+                                            : 'bg-slate-500/20 text-slate-400 border-slate-500/30'
+                                    }`}>
+                                        {copyTrader.running ? 'RUNNING' : 'STOPPED'}
+                                    </span>
+                                </div>
+                                {copyTrader.running ? (
+                                    <div className="space-y-2 text-sm">
+                                        <div className="flex justify-between">
+                                            <span className="text-slate-400">Following</span>
+                                            <span className="text-cyan-400 font-mono truncate max-w-[150px]" title={copyTrader.target_name}>
+                                                {copyTrader.target_name || copyTrader.target}
+                                            </span>
+                                        </div>
+                                        <div className="flex justify-between">
+                                            <span className="text-slate-400">Mode</span>
+                                            <span className={copyTrader.dry_run ? 'text-blue-400' : 'text-red-400'}>
+                                                {copyTrader.dry_run ? 'DRY RUN' : 'LIVE'}
+                                            </span>
+                                        </div>
+                                        <div className="flex justify-between">
+                                            <span className="text-slate-400">Trades Copied</span>
+                                            <span className="text-green-400 font-mono">{copyTrader.trades_copied || 0}</span>
+                                        </div>
+                                        <div className="flex justify-between">
+                                            <span className="text-slate-400">Trades Skipped</span>
+                                            <span className="text-yellow-400 font-mono">{copyTrader.trades_skipped || 0}</span>
+                                        </div>
+                                        {!copyTrader.dry_run && (
+                                            <div className="flex justify-between">
+                                                <span className="text-slate-400">Total Spent</span>
+                                                <span className="text-white font-mono">${copyTrader.total_spent?.toFixed(2) || '0.00'}</span>
+                                            </div>
+                                        )}
+                                    </div>
+                                ) : (
+                                    <p className="text-slate-500 text-sm">
+                                        Copy trader not running. Start via API:
+                                        <code className="block mt-1 text-xs bg-slate-900 p-2 rounded">
+                                            POST /api/copy-trader/start
+                                        </code>
+                                    </p>
+                                )}
                             </div>
 
                             {/* Latency Metrics */}
