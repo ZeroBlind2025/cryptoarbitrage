@@ -94,53 +94,14 @@ def save_positions(positions: dict):
         print(f"[COPY] Error saving positions: {e}")
 
 
-def check_token_resolution(token_id: str) -> Optional[dict]:
-    """Check if a specific token has resolved by checking last trade price"""
-    if not token_id:
-        return None
-    try:
-        # Try last-trade-price endpoint (works better for resolved markets)
-        response = requests.get(
-            f"{CLOB_API}/last-trade-price",
-            params={"token_id": token_id},
-            timeout=10
-        )
-        if response.status_code == 200:
-            data = response.json()
-            price = float(data.get("price", 0.5))
-            print(f"[COPY] Token {token_id[:20]}... last_trade_price = {price}")
-            if price >= 0.95:
-                return {"resolved": True, "won": True, "price": price}
-            elif price <= 0.05:
-                return {"resolved": True, "won": False, "price": price}
-
-        # Fallback: try regular price endpoint
-        response = requests.get(
-            f"{CLOB_API}/price",
-            params={"token_id": token_id},
-            timeout=10
-        )
-        if response.status_code == 200:
-            data = response.json()
-            price = float(data.get("price", 0.5))
-            print(f"[COPY] Token {token_id[:20]}... price = {price}")
-            if price >= 0.95:
-                return {"resolved": True, "won": True, "price": price}
-            elif price <= 0.05:
-                return {"resolved": True, "won": False, "price": price}
-
-        return None
-    except Exception as e:
-        print(f"[COPY] Token check error: {e}")
-        return None
-
-
 def check_target_position(token_id: str) -> Optional[dict]:
-    """Check target trader's position status for this token"""
+    """Check target trader's position status for this token - ONLY trust redeemable field"""
     if not token_id:
         return None
     try:
         # Check target trader's position to see if it's redeemable
+        # Redeemable = WON (can redeem for $1)
+        # NOT redeemable + market closed = LOST
         response = requests.get(
             f"{DATA_API}/positions",
             params={"user": TARGET_ADDRESS, "asset": token_id},
@@ -153,13 +114,15 @@ def check_target_position(token_id: str) -> Optional[dict]:
                 if str(pos.get("asset")) == str(token_id):
                     redeemable = pos.get("redeemable", False)
                     cur_price = float(pos.get("curPrice", 0.5))
-                    print(f"[COPY] Target position: redeemable={redeemable}, curPrice={cur_price}")
-                    if redeemable:
+                    size = float(pos.get("size", 0))
+                    print(f"[COPY] Target position: redeemable={redeemable}, curPrice={cur_price}, size={size}")
+
+                    # ONLY trust redeemable flag - price can be misleading
+                    if redeemable and size > 0:
                         return {"resolved": True, "won": True}
-                    elif cur_price <= 0.05:
+                    elif not redeemable and (cur_price >= 0.99 or cur_price <= 0.01):
+                        # Market resolved (extreme price) but not redeemable = lost
                         return {"resolved": True, "won": False}
-                    elif cur_price >= 0.95:
-                        return {"resolved": True, "won": True}
         return None
     except Exception as e:
         print(f"[COPY] Target position check error: {e}")
@@ -171,24 +134,17 @@ def get_market_resolution(condition_id: str = "", slug: str = "", token_id: str 
     try:
         print(f"[COPY] Checking resolution: token={token_id[:20] if token_id else 'none'}... cid={condition_id[:20] if condition_id else 'none'}...")
 
-        # First try: Check token price directly (most reliable for resolved markets)
+        # ONLY method that works: Check target trader's position redeemable status
+        # Token prices are unreliable (winners can show 0 due to no liquidity)
         if token_id:
-            token_result = check_token_resolution(token_id)
-            if token_result and token_result.get("resolved"):
-                return {
-                    "resolved": True,
-                    "our_token_won": token_result.get("won"),
-                    "winning_outcome": our_outcome if token_result.get("won") else None,
-                    "winning_index": None,
-                }
-
-            # Second try: Check target trader's position for this token
             target_result = check_target_position(token_id)
             if target_result and target_result.get("resolved"):
+                won = target_result.get("won")
+                print(f"[COPY] Target position resolved: won={won}")
                 return {
                     "resolved": True,
-                    "our_token_won": target_result.get("won"),
-                    "winning_outcome": our_outcome if target_result.get("won") else None,
+                    "our_token_won": won,
+                    "winning_outcome": our_outcome if won else None,
                     "winning_index": None,
                 }
 
