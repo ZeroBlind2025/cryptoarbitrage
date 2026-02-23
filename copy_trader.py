@@ -108,8 +108,6 @@ def get_market_resolution(condition_id: str = "", slug: str = "") -> Optional[di
         else:
             return {"resolved": False}
 
-        print(f"[COPY] Querying gamma API with params: {params}")
-
         response = requests.get(
             f"{GAMMA_API}/markets",
             params=params,
@@ -118,13 +116,8 @@ def get_market_resolution(condition_id: str = "", slug: str = "") -> Optional[di
         response.raise_for_status()
         markets = response.json()
 
-        print(f"[COPY] Gamma API returned {len(markets) if markets else 0} markets")
-
         if markets and len(markets) > 0:
             market = markets[0]
-            print(f"[COPY] Market closed={market.get('closed')}, resolved={market.get('resolved')}")
-            print(f"[COPY] Outcomes: {market.get('outcomes')}")
-            print(f"[COPY] OutcomePrices: {market.get('outcomePrices')}")
 
             # Check if resolved
             if market.get("closed") or market.get("resolved"):
@@ -522,22 +515,15 @@ class CopyTrader:
 
         resolved_this_check = 0
 
-        print(f"[COPY] Checking {len(open_positions)} open positions for resolution...")
-
         for position in open_positions[:]:  # Copy list to allow modification
             condition_id = position.get("condition_id", "")
             slug = position.get("slug", "")
 
-            print(f"[COPY] Position: {position.get('market', '?')[:40]}")
-            print(f"       condition_id='{condition_id}', slug='{slug}'")
-
             # Need either condition_id or slug to check resolution
             if not condition_id and not slug:
-                print(f"       SKIP: no condition_id or slug")
                 continue
 
             result = get_market_resolution(condition_id=condition_id, slug=slug)
-            print(f"       Resolution result: {result}")
 
             if result.get("resolved"):
                 # Position resolved!
@@ -547,11 +533,6 @@ class CopyTrader:
                 our_index = position.get("outcome_index")
                 entry_price = position.get("entry_price", 0)
                 amount = position.get("amount", 0)
-
-                # Debug logging
-                print(f"[COPY] Checking resolution for: {position.get('market', '?')[:30]}")
-                print(f"       Our outcome: '{our_outcome}' (index {our_index})")
-                print(f"       Winning outcome: '{winning_outcome}' (index {winning_index})")
 
                 # Compare by NAME first (more reliable - activity API always has outcome name)
                 # Index comparison is unreliable because outcomeIndex may not be in activity API
@@ -570,11 +551,9 @@ class CopyTrader:
                         won = True
                     else:
                         won = False
-                    print(f"       Name comparison: '{our_normalized}' vs '{winning_normalized}' => {won}")
                 elif winning_index is not None and our_index is not None:
                     # Fallback to index if names not available
                     won = (winning_index == our_index)
-                    print(f"       Index comparison: {our_index} vs {winning_index} => {won}")
 
                 if won is True:
                     payout = amount / entry_price if entry_price > 0 else 0
