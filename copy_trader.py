@@ -196,17 +196,21 @@ def place_bet(client: "ClobClient", token_id: str, amount: float) -> bool:
 class CopyTrader:
     """Copy trading engine"""
 
-    def __init__(self, dry_run: bool = True, crypto_only: bool = True):
+    def __init__(self, dry_run: bool = True, crypto_only: bool = True, on_trade: Optional[callable] = None):
         self.dry_run = dry_run
         self.crypto_only = crypto_only
         self.client: Optional["ClobClient"] = None
         self.copied_trades: set = set()  # Track copied trade IDs
         self.target_name = get_profile_name(TARGET_ADDRESS)
+        self.on_trade = on_trade  # Callback for dashboard integration
 
         # Stats
         self.trades_copied = 0
         self.trades_skipped = 0
         self.total_spent = 0.0
+
+        # Trade history (for dashboard)
+        self.trade_history: list = []
 
     def start(self):
         """Initialize the copy trader"""
@@ -274,8 +278,24 @@ class CopyTrader:
             print(f"       Target bought: {size:.1f} {outcome} @ {price*100:.1f}¢")
             print(f"       Copying: ${BET_AMOUNT:.2f} of {outcome}")
 
+            # Build trade record for dashboard
+            trade_record = {
+                "id": f"copy_{trade_id}",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "market": title,
+                "slug": slug,
+                "outcome": outcome,
+                "side": "BUY",
+                "amount": BET_AMOUNT,
+                "price": price,
+                "target_trader": self.target_name,
+                "target_size": size,
+                "source": "copy_trader",
+            }
+
             if self.dry_run:
                 print(f"       DRY RUN - would execute")
+                trade_record["status"] = "dry_run"
                 copied += 1
             else:
                 token_id = bet.get("asset", "")
@@ -283,12 +303,25 @@ class CopyTrader:
                     success = place_bet(self.client, token_id, BET_AMOUNT)
                     if success:
                         print(f"       EXECUTED!")
+                        trade_record["status"] = "filled"
                         copied += 1
                         self.total_spent += BET_AMOUNT
                     else:
                         print(f"       FAILED!")
+                        trade_record["status"] = "failed"
                 else:
                     print(f"       No token ID or client")
+                    trade_record["status"] = "error"
+
+            # Record trade
+            self.trade_history.append(trade_record)
+
+            # Call dashboard callback
+            if self.on_trade:
+                try:
+                    self.on_trade(trade_record)
+                except Exception as e:
+                    print(f"[COPY] Callback error: {e}")
 
             self.trades_copied += copied
 

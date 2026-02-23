@@ -114,6 +114,14 @@ except ImportError:
 copy_trader: Optional["CopyTrader"] = None
 copy_trader_thread: Optional[threading.Thread] = None
 stop_copy_trader = threading.Event()
+copy_trades: deque = deque(maxlen=100)  # Copy trader trade history
+
+
+def on_copy_trade(trade_record: dict):
+    """Callback when copy trader executes a trade"""
+    copy_trades.append(trade_record)
+    print(f"[COPY] Trade recorded: {trade_record.get('market', '?')[:30]} - {trade_record.get('status', '?')}", flush=True)
+
 
 # Sports WebSocket for real-time game data
 sports_ws: Optional[SportsWebSocket] = None
@@ -1567,10 +1575,11 @@ def api_copy_trader_start():
             "message": "Set confirm_live=true to enable live copy trading"
         }), 403
 
-    # Create copy trader
+    # Create copy trader with dashboard callback
     copy_trader = CopyTrader(
         dry_run=not live_mode,
-        crypto_only=crypto_only
+        crypto_only=crypto_only,
+        on_trade=on_copy_trade
     )
     copy_trader.start()
 
@@ -1658,10 +1667,22 @@ def api_trades():
     if mode in ['all', 'live']:
         trades.extend([t.to_dict() for t in list(live_trades)[-limit:]])
 
+    if mode in ['all', 'copy']:
+        trades.extend(list(copy_trades)[-limit:])
+
     # Sort by timestamp
     trades.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
 
     return jsonify(trades[:limit])
+
+
+@app.route('/api/copy-trader/trades')
+def api_copy_trades():
+    """Get copy trader trade history"""
+    limit = int(request.args.get('limit', 50))
+    trades = list(copy_trades)[-limit:]
+    trades.reverse()  # Most recent first
+    return jsonify(trades)
 
 
 @app.route('/api/trades/demo')
@@ -1809,6 +1830,16 @@ def api_data():
         "trades": {
             "demo": recent_demo,
             "live": recent_live,
+            "copy": list(copy_trades)[-20:],
+        },
+        "copy_trader": {
+            "running": copy_trader_thread and copy_trader_thread.is_alive(),
+            "target": TARGET_ADDRESS[:20] + "..." if TARGET_ADDRESS else "",
+            "target_name": copy_trader.target_name if copy_trader else "",
+            "dry_run": copy_trader.dry_run if copy_trader else True,
+            "trades_copied": copy_trader.trades_copied if copy_trader else 0,
+            "trades_skipped": copy_trader.trades_skipped if copy_trader else 0,
+            "total_spent": copy_trader.total_spent if copy_trader else 0,
         },
         "trades_by_engine": {
             "demo": {
