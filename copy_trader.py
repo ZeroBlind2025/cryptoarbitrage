@@ -631,6 +631,10 @@ class CopyTrader:
                 entry_price = position.get("entry_price", 0)
                 amount = position.get("amount", 0)
 
+                # Initialize these - may be set by gamma API fallback
+                winning_outcome = result.get("winning_outcome")
+                winning_index = result.get("winning_index")
+
                 # Check if we got a direct win/loss result from token price check
                 won = None
                 if "our_token_won" in result:
