@@ -414,6 +414,12 @@ class CopyTrader:
                 self.trades_skipped += 1
                 continue
 
+            # Filter: only copy trades with entry price >= 45¢ (higher probability)
+            if price < 0.45:
+                print(f"[COPY] Skip (price too low): {title} @ {price*100:.1f}¢")
+                self.trades_skipped += 1
+                continue
+
             # Check if we already have this position
             # Try multiple field names for condition_id (API may use camelCase or snake_case)
             condition_id = bet.get("conditionId") or bet.get("condition_id") or bet.get("market_condition_id") or ""
