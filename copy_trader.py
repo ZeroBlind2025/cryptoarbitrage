@@ -125,19 +125,45 @@ def get_market_resolution(condition_id: str = "", slug: str = "") -> Optional[di
                 outcomes = market.get("outcomes", [])
                 outcome_prices = market.get("outcomePrices", [])
 
+                # Log what we got for debugging
+                print(f"[COPY] Resolution data: outcomes={outcomes}, prices={outcome_prices}")
+
                 # If resolved, one outcome will be $1.00 and others $0.00
+                winning_index = None
+                winning_outcome = None
+
                 for i, price in enumerate(outcome_prices):
                     try:
                         if float(price) >= 0.99:  # Winner
-                            return {
-                                "resolved": True,
-                                "winning_outcome": outcomes[i] if i < len(outcomes) else f"outcome_{i}",
-                                "winning_index": i,
-                            }
+                            winning_index = i
+                            winning_outcome = outcomes[i] if i < len(outcomes) else None
+                            break
                     except (ValueError, TypeError):
                         continue
 
-                # Market closed but can't determine winner
+                # Validate the data - for binary Up/Down markets, index should be 0 or 1
+                if winning_index is not None and winning_index <= 1 and winning_outcome:
+                    # Valid binary market result
+                    return {
+                        "resolved": True,
+                        "winning_outcome": winning_outcome,
+                        "winning_index": winning_index,
+                    }
+                elif len(outcomes) == 2 and len(outcome_prices) == 2:
+                    # Binary market but maybe index is wrong - use outcome names directly
+                    for i, price in enumerate(outcome_prices):
+                        try:
+                            if float(price) >= 0.99 and i < len(outcomes):
+                                return {
+                                    "resolved": True,
+                                    "winning_outcome": outcomes[i],
+                                    "winning_index": i,
+                                }
+                        except (ValueError, TypeError):
+                            continue
+
+                # Market closed but data looks corrupted - log it
+                print(f"[COPY] WARNING: Corrupted resolution data - index={winning_index}, outcome={winning_outcome}")
                 return {"resolved": True, "winning_outcome": None, "winning_index": None}
 
         return {"resolved": False}
