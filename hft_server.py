@@ -1777,7 +1777,7 @@ def api_copy_download():
             "outcome": pos.get("outcome", ""),
             "outcome_index": pos.get("outcome_index", ""),
             "amount": pos.get("amount", 0),
-            "price": pos.get("price", 0),
+            "price": pos.get("entry_price") or pos.get("price", 0),
             "won": "YES" if pos.get("won") else "NO",
             "pnl": pos.get("pnl", 0),
             "winning_outcome": pos.get("winning_outcome", ""),
