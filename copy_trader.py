@@ -3,7 +3,8 @@
 COPY TRADER - Follow a specific trader's crypto bets
 =====================================================
 
-Monitors a target trader's activity and copies their trades on crypto 15-min markets.
+Monitors a target trader's activity and copies their trades on crypto markets
+(15, 30, and 60 minute timeframes).
 
 Target: 0x1979ae6b7e6534de9c4539d0c205e582ca637c9d
 
@@ -190,7 +191,7 @@ def get_latest_bets(wallet_address: str, limit: int = 20) -> list:
 
 
 def is_crypto_market(bet: dict) -> bool:
-    """Check if bet is on a crypto 15-min market"""
+    """Check if bet is on a crypto market (15, 30, or 60 min)"""
     slug = bet.get("slug", "").lower()
     title = bet.get("title", "").lower()
 
@@ -199,8 +200,13 @@ def is_crypto_market(bet: dict) -> bool:
         if pattern in slug or pattern in title:
             return True
 
-    # Also check for specific crypto keywords
-    crypto_keywords = ["bitcoin", "ethereum", "solana", "xrp", "15m", "15-min", "15 min"]
+    # Also check for specific crypto keywords and timeframes (15, 30, 60 min)
+    crypto_keywords = [
+        "bitcoin", "ethereum", "solana", "xrp",
+        "15m", "15-min", "15 min",
+        "30m", "30-min", "30 min",
+        "60m", "60-min", "60 min", "1h", "1-hour", "1 hour"
+    ]
     for kw in crypto_keywords:
         if kw in title:
             return True
