@@ -103,9 +103,12 @@ def get_market_resolution(condition_id: str = "", slug: str = "") -> Optional[di
         if condition_id:
             params["condition_ids"] = condition_id
         elif slug:
-            params["slug"] = slug
+            # Try slug_contains for partial match
+            params["slug_contains"] = slug
         else:
             return {"resolved": False}
+
+        print(f"[COPY] Querying gamma API with params: {params}")
 
         response = requests.get(
             f"{GAMMA_API}/markets",
@@ -115,8 +118,14 @@ def get_market_resolution(condition_id: str = "", slug: str = "") -> Optional[di
         response.raise_for_status()
         markets = response.json()
 
+        print(f"[COPY] Gamma API returned {len(markets) if markets else 0} markets")
+
         if markets and len(markets) > 0:
             market = markets[0]
+            print(f"[COPY] Market closed={market.get('closed')}, resolved={market.get('resolved')}")
+            print(f"[COPY] Outcomes: {market.get('outcomes')}")
+            print(f"[COPY] OutcomePrices: {market.get('outcomePrices')}")
+
             # Check if resolved
             if market.get("closed") or market.get("resolved"):
                 # Get winning outcome
@@ -141,7 +150,7 @@ def get_market_resolution(condition_id: str = "", slug: str = "") -> Optional[di
         return {"resolved": False}
 
     except Exception as e:
-        identifier = condition_id[:20] if condition_id else slug[:20]
+        identifier = condition_id[:20] if condition_id else slug[:20] if slug else "unknown"
         print(f"[COPY] Error checking resolution for {identifier}...: {e}")
         return {"resolved": False}
 
@@ -513,15 +522,22 @@ class CopyTrader:
 
         resolved_this_check = 0
 
+        print(f"[COPY] Checking {len(open_positions)} open positions for resolution...")
+
         for position in open_positions[:]:  # Copy list to allow modification
             condition_id = position.get("condition_id", "")
             slug = position.get("slug", "")
 
+            print(f"[COPY] Position: {position.get('market', '?')[:40]}")
+            print(f"       condition_id='{condition_id}', slug='{slug}'")
+
             # Need either condition_id or slug to check resolution
             if not condition_id and not slug:
+                print(f"       SKIP: no condition_id or slug")
                 continue
 
             result = get_market_resolution(condition_id=condition_id, slug=slug)
+            print(f"       Resolution result: {result}")
 
             if result.get("resolved"):
                 # Position resolved!
