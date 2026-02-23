@@ -1732,6 +1732,73 @@ def api_copy_reset_stats():
     })
 
 
+@app.route('/api/copy-trader/download')
+def api_copy_download():
+    """Download all resolved positions as CSV for manual verification"""
+    import csv
+    from io import StringIO
+
+    # Load positions from file if copy_trader not running
+    positions_data = None
+    if copy_trader:
+        positions_data = copy_trader.positions
+    else:
+        # Try to load from file directly
+        try:
+            positions_file = Path("copy_positions.json")
+            if positions_file.exists():
+                with open(positions_file) as f:
+                    positions_data = json.load(f)
+        except Exception as e:
+            return jsonify({"error": f"Failed to load positions: {e}"}), 500
+
+    if not positions_data:
+        return jsonify({"error": "No position data available"}), 404
+
+    resolved = positions_data.get("resolved", [])
+    if not resolved:
+        return jsonify({"error": "No resolved positions to download"}), 404
+
+    # Create CSV
+    output = StringIO()
+    fieldnames = [
+        "timestamp", "market", "slug", "outcome", "outcome_index",
+        "amount", "price", "won", "pnl", "winning_outcome", "winning_index",
+        "condition_id", "token_id"
+    ]
+    writer = csv.DictWriter(output, fieldnames=fieldnames, extrasaction='ignore')
+    writer.writeheader()
+
+    for pos in resolved:
+        row = {
+            "timestamp": pos.get("timestamp", ""),
+            "market": pos.get("market", ""),
+            "slug": pos.get("slug", ""),
+            "outcome": pos.get("outcome", ""),
+            "outcome_index": pos.get("outcome_index", ""),
+            "amount": pos.get("amount", 0),
+            "price": pos.get("price", 0),
+            "won": "YES" if pos.get("won") else "NO",
+            "pnl": pos.get("pnl", 0),
+            "winning_outcome": pos.get("winning_outcome", ""),
+            "winning_index": pos.get("winning_index", ""),
+            "condition_id": pos.get("condition_id", ""),
+            "token_id": pos.get("token_id", ""),
+        }
+        writer.writerow(row)
+
+    # Create response
+    csv_content = output.getvalue()
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"copy_trader_resolved_{timestamp}.csv"
+
+    return Response(
+        csv_content,
+        mimetype='text/csv',
+        headers={"Content-Disposition": f"attachment; filename={filename}"}
+    )
+
+
 @app.route('/api/trades/demo')
 def api_trades_demo():
     """Get demo trades"""
