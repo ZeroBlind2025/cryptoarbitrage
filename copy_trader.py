@@ -95,10 +95,26 @@ def save_positions(positions: dict):
 
 
 def check_token_resolution(token_id: str) -> Optional[dict]:
-    """Check if a specific token has resolved by checking its price on CLOB"""
+    """Check if a specific token has resolved by checking last trade price"""
     if not token_id:
         return None
     try:
+        # Try last-trade-price endpoint (works better for resolved markets)
+        response = requests.get(
+            f"{CLOB_API}/last-trade-price",
+            params={"token_id": token_id},
+            timeout=10
+        )
+        if response.status_code == 200:
+            data = response.json()
+            price = float(data.get("price", 0.5))
+            print(f"[COPY] Token {token_id[:20]}... last_trade_price = {price}")
+            if price >= 0.95:
+                return {"resolved": True, "won": True, "price": price}
+            elif price <= 0.05:
+                return {"resolved": True, "won": False, "price": price}
+
+        # Fallback: try regular price endpoint
         response = requests.get(
             f"{CLOB_API}/price",
             params={"token_id": token_id},
@@ -106,15 +122,47 @@ def check_token_resolution(token_id: str) -> Optional[dict]:
         )
         if response.status_code == 200:
             data = response.json()
-            price = float(data.get("price", 0))
-            # If price is $1 or very close, this token won
-            # If price is $0 or very close, this token lost
+            price = float(data.get("price", 0.5))
+            print(f"[COPY] Token {token_id[:20]}... price = {price}")
             if price >= 0.95:
                 return {"resolved": True, "won": True, "price": price}
             elif price <= 0.05:
                 return {"resolved": True, "won": False, "price": price}
+
         return None
-    except Exception:
+    except Exception as e:
+        print(f"[COPY] Token check error: {e}")
+        return None
+
+
+def check_target_position(token_id: str) -> Optional[dict]:
+    """Check target trader's position status for this token"""
+    if not token_id:
+        return None
+    try:
+        # Check target trader's position to see if it's redeemable
+        response = requests.get(
+            f"{DATA_API}/positions",
+            params={"user": TARGET_ADDRESS, "asset": token_id},
+            timeout=10
+        )
+        if response.status_code == 200:
+            positions = response.json()
+            for pos in positions:
+                # Check if this is the right token
+                if str(pos.get("asset")) == str(token_id):
+                    redeemable = pos.get("redeemable", False)
+                    cur_price = float(pos.get("curPrice", 0.5))
+                    print(f"[COPY] Target position: redeemable={redeemable}, curPrice={cur_price}")
+                    if redeemable:
+                        return {"resolved": True, "won": True}
+                    elif cur_price <= 0.05:
+                        return {"resolved": True, "won": False}
+                    elif cur_price >= 0.95:
+                        return {"resolved": True, "won": True}
+        return None
+    except Exception as e:
+        print(f"[COPY] Target position check error: {e}")
         return None
 
 
@@ -125,12 +173,21 @@ def get_market_resolution(condition_id: str = "", slug: str = "", token_id: str 
         if token_id:
             token_result = check_token_resolution(token_id)
             if token_result and token_result.get("resolved"):
-                # We know if OUR token won or lost directly
                 return {
                     "resolved": True,
                     "our_token_won": token_result.get("won"),
                     "winning_outcome": our_outcome if token_result.get("won") else None,
-                    "winning_index": None,  # Don't need index when we know directly
+                    "winning_index": None,
+                }
+
+            # Second try: Check target trader's position for this token
+            target_result = check_target_position(token_id)
+            if target_result and target_result.get("resolved"):
+                return {
+                    "resolved": True,
+                    "our_token_won": target_result.get("won"),
+                    "winning_outcome": our_outcome if target_result.get("won") else None,
+                    "winning_index": None,
                 }
 
         # Fallback: Try gamma API for market info
@@ -448,11 +505,8 @@ class CopyTrader:
                 self.trades_skipped += 1
                 continue
 
-            # Filter: only copy trades with entry price >= 45¢ (higher probability)
-            if price < 0.45:
-                print(f"[COPY] Skip (price too low): {title} @ {price*100:.1f}¢")
-                self.trades_skipped += 1
-                continue
+            # No price filter - copy all trades to match target trader's strategy
+            # Target trades at low prices (20-30¢) for 4-5x returns
 
             # Check if we already have this position
             # Try multiple field names for condition_id (API may use camelCase or snake_case)
