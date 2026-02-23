@@ -722,12 +722,22 @@
                                             </span>
                                         </div>
                                         <div className="flex justify-between">
-                                            <span className="text-slate-400">Trades Copied</span>
-                                            <span className="text-green-400 font-mono">{copyTrader.trades_copied || 0}</span>
+                                            <span className="text-slate-400">Open / Resolved</span>
+                                            <span className="text-white font-mono">
+                                                {copyTrader.open_positions || 0} / {copyTrader.resolved_positions || 0}
+                                            </span>
                                         </div>
                                         <div className="flex justify-between">
-                                            <span className="text-slate-400">Trades Skipped</span>
-                                            <span className="text-yellow-400 font-mono">{copyTrader.trades_skipped || 0}</span>
+                                            <span className="text-slate-400">Win Rate</span>
+                                            <span className="text-green-400 font-mono">
+                                                {copyTrader.wins || 0}W / {copyTrader.losses || 0}L ({(copyTrader.win_rate || 0).toFixed(1)}%)
+                                            </span>
+                                        </div>
+                                        <div className="flex justify-between">
+                                            <span className="text-slate-400">Total PnL</span>
+                                            <span className={`font-mono ${(copyTrader.total_pnl || 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                                                ${(copyTrader.total_pnl || 0) >= 0 ? '+' : ''}{(copyTrader.total_pnl || 0).toFixed(2)}
+                                            </span>
                                         </div>
                                         {!copyTrader.dry_run && (
                                             <div className="flex justify-between">

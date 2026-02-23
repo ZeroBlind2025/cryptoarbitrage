@@ -17,10 +17,12 @@ Usage:
 import os
 import sys
 import time
+import json
 import argparse
 import requests
 from datetime import datetime, timezone
 from typing import Optional
+from pathlib import Path
 
 try:
     from dotenv import load_dotenv
@@ -60,7 +62,77 @@ CRYPTO_SLUGS = ["btc-", "eth-", "sol-", "xrp-", "-updown-"]
 # API endpoints
 DATA_API = "https://data-api.polymarket.com"
 CLOB_API = "https://clob.polymarket.com"
+GAMMA_API = "https://gamma-api.polymarket.com"
 PROFILE_API = "https://gamma-api.polymarket.com"
+
+# Position tracking file
+POSITIONS_FILE = Path(__file__).parent / "copy_positions.json"
+
+
+# =============================================================================
+# POSITION TRACKING
+# =============================================================================
+
+def load_positions() -> dict:
+    """Load positions from file"""
+    if POSITIONS_FILE.exists():
+        try:
+            with open(POSITIONS_FILE, "r") as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"[COPY] Error loading positions: {e}")
+    return {"open": [], "resolved": [], "stats": {"wins": 0, "losses": 0, "total_pnl": 0.0}}
+
+
+def save_positions(positions: dict):
+    """Save positions to file"""
+    try:
+        with open(POSITIONS_FILE, "w") as f:
+            json.dump(positions, f, indent=2)
+    except Exception as e:
+        print(f"[COPY] Error saving positions: {e}")
+
+
+def get_market_resolution(condition_id: str) -> Optional[dict]:
+    """Check if a market has resolved and get the winning outcome"""
+    try:
+        # Try gamma API for market info
+        response = requests.get(
+            f"{GAMMA_API}/markets",
+            params={"condition_ids": condition_id},
+            timeout=10
+        )
+        response.raise_for_status()
+        markets = response.json()
+
+        if markets and len(markets) > 0:
+            market = markets[0]
+            # Check if resolved
+            if market.get("closed") or market.get("resolved"):
+                # Get winning outcome
+                outcomes = market.get("outcomes", [])
+                outcome_prices = market.get("outcomePrices", [])
+
+                # If resolved, one outcome will be $1.00 and others $0.00
+                for i, price in enumerate(outcome_prices):
+                    try:
+                        if float(price) >= 0.99:  # Winner
+                            return {
+                                "resolved": True,
+                                "winning_outcome": outcomes[i] if i < len(outcomes) else f"outcome_{i}",
+                                "winning_index": i,
+                            }
+                    except (ValueError, TypeError):
+                        continue
+
+                # Market closed but can't determine winner
+                return {"resolved": True, "winning_outcome": None, "winning_index": None}
+
+        return {"resolved": False}
+
+    except Exception as e:
+        print(f"[COPY] Error checking resolution for {condition_id[:20]}...: {e}")
+        return {"resolved": False}
 
 
 # =============================================================================
@@ -196,13 +268,14 @@ def place_bet(client: "ClobClient", token_id: str, amount: float) -> bool:
 class CopyTrader:
     """Copy trading engine"""
 
-    def __init__(self, dry_run: bool = True, crypto_only: bool = True, on_trade: Optional[callable] = None):
+    def __init__(self, dry_run: bool = True, crypto_only: bool = True, on_trade: Optional[callable] = None, on_resolution: Optional[callable] = None):
         self.dry_run = dry_run
         self.crypto_only = crypto_only
         self.client: Optional["ClobClient"] = None
         self.copied_trades: set = set()  # Track copied trade IDs
         self.target_name = get_profile_name(TARGET_ADDRESS)
         self.on_trade = on_trade  # Callback for dashboard integration
+        self.on_resolution = on_resolution  # Callback when position resolves
 
         # Stats
         self.trades_copied = 0
@@ -211,6 +284,11 @@ class CopyTrader:
 
         # Trade history (for dashboard)
         self.trade_history: list = []
+
+        # Position tracking (persisted to file)
+        self.positions = load_positions()
+        self.last_resolution_check = 0
+        self.resolution_check_interval = 60  # Check every 60 seconds
 
     def start(self):
         """Initialize the copy trader"""
@@ -228,6 +306,28 @@ class CopyTrader:
             if not self.client:
                 print("[COPY] Failed to initialize client. Running in dry-run mode.")
                 self.dry_run = True
+
+        # Snapshot existing trades so we don't copy historical trades
+        # Only copy NEW trades that happen AFTER we start monitoring
+        print("[COPY] Loading existing trades to avoid duplicates...")
+        existing_bets = get_latest_bets(TARGET_ADDRESS, limit=50)
+        for bet in existing_bets:
+            trade_id = bet.get("id") or f"{bet.get('conditionId')}_{bet.get('timestamp')}"
+            self.copied_trades.add(trade_id)
+        print(f"[COPY] Marked {len(self.copied_trades)} existing trades as seen. Waiting for NEW trades...")
+
+        # Show position tracking stats
+        stats = self.positions.get("stats", {})
+        open_count = len(self.positions.get("open", []))
+        resolved_count = len(self.positions.get("resolved", []))
+        wins = stats.get("wins", 0)
+        losses = stats.get("losses", 0)
+        total_pnl = stats.get("total_pnl", 0.0)
+        win_rate = (wins / (wins + losses) * 100) if (wins + losses) > 0 else 0
+
+        print(f"[COPY] Positions: {open_count} open, {resolved_count} resolved")
+        print(f"[COPY] Record: {wins}W / {losses}L ({win_rate:.1f}% win rate)")
+        print(f"[COPY] Total PnL: ${total_pnl:+.2f}")
 
     def check_and_copy(self) -> int:
         """Check for new trades and copy them. Returns number of trades copied."""
@@ -316,6 +416,25 @@ class CopyTrader:
             # Record trade
             self.trade_history.append(trade_record)
 
+            # Save position for tracking (if trade was successful or dry run)
+            if trade_record["status"] in ["filled", "dry_run"]:
+                position = {
+                    "id": trade_record["id"],
+                    "timestamp": trade_record["timestamp"],
+                    "condition_id": condition_id,
+                    "outcome_index": outcome_index,
+                    "outcome": outcome,
+                    "market": title,
+                    "slug": slug,
+                    "entry_price": price,
+                    "amount": BET_AMOUNT,
+                    "potential_payout": BET_AMOUNT / price if price > 0 else 0,
+                    "dry_run": self.dry_run,
+                }
+                self.positions["open"].append(position)
+                save_positions(self.positions)
+                print(f"       Position saved. Potential payout: ${position['potential_payout']:.2f}")
+
             # Call dashboard callback
             if self.on_trade:
                 try:
@@ -354,19 +473,126 @@ class CopyTrader:
                 if copied > 0:
                     print(f"[COPY] Copied {copied} trade(s) this cycle")
 
+                # Periodically check for resolved positions
+                self.check_resolutions()
+
                 time.sleep(POLL_INTERVAL)
 
         except KeyboardInterrupt:
             print("\n[COPY] Stopping...")
             self.print_stats()
 
+    def check_resolutions(self):
+        """Check if any open positions have resolved"""
+        now = time.time()
+        if now - self.last_resolution_check < self.resolution_check_interval:
+            return
+
+        self.last_resolution_check = now
+
+        open_positions = self.positions.get("open", [])
+        if not open_positions:
+            return
+
+        resolved_this_check = 0
+
+        for position in open_positions[:]:  # Copy list to allow modification
+            condition_id = position.get("condition_id", "")
+            if not condition_id:
+                continue
+
+            result = get_market_resolution(condition_id)
+
+            if result.get("resolved"):
+                # Position resolved!
+                winning_outcome = result.get("winning_outcome")
+                our_outcome = position.get("outcome")
+                entry_price = position.get("entry_price", 0)
+                amount = position.get("amount", 0)
+
+                # Calculate PnL
+                if winning_outcome and our_outcome:
+                    # Normalize for comparison (case insensitive)
+                    won = winning_outcome.lower() == our_outcome.lower()
+                else:
+                    # Can't determine winner
+                    won = None
+
+                if won is True:
+                    payout = amount / entry_price if entry_price > 0 else 0
+                    pnl = payout - amount
+                    position["result"] = "WIN"
+                    position["pnl"] = pnl
+                    self.positions["stats"]["wins"] = self.positions["stats"].get("wins", 0) + 1
+                    print(f"[COPY] WIN: {position['market'][:30]} | +${pnl:.2f}")
+                elif won is False:
+                    pnl = -amount
+                    position["result"] = "LOSS"
+                    position["pnl"] = pnl
+                    self.positions["stats"]["losses"] = self.positions["stats"].get("losses", 0) + 1
+                    print(f"[COPY] LOSS: {position['market'][:30]} | -${amount:.2f}")
+                else:
+                    # Unknown result
+                    pnl = 0
+                    position["result"] = "UNKNOWN"
+                    position["pnl"] = 0
+                    print(f"[COPY] RESOLVED (unknown): {position['market'][:30]}")
+
+                # Update totals
+                self.positions["stats"]["total_pnl"] = self.positions["stats"].get("total_pnl", 0) + pnl
+
+                # Move from open to resolved
+                position["resolved_at"] = datetime.now(timezone.utc).isoformat()
+                position["winning_outcome"] = winning_outcome
+                self.positions["open"].remove(position)
+                self.positions["resolved"].append(position)
+                resolved_this_check += 1
+
+                # Call resolution callback
+                if self.on_resolution:
+                    try:
+                        self.on_resolution(position)
+                    except Exception as e:
+                        print(f"[COPY] Resolution callback error: {e}")
+
+        if resolved_this_check > 0:
+            save_positions(self.positions)
+            stats = self.positions["stats"]
+            print(f"[COPY] {resolved_this_check} position(s) resolved. Record: {stats['wins']}W/{stats['losses']}L, PnL: ${stats['total_pnl']:+.2f}")
+
+    def get_stats(self) -> dict:
+        """Get current statistics for dashboard"""
+        stats = self.positions.get("stats", {})
+        wins = stats.get("wins", 0)
+        losses = stats.get("losses", 0)
+        total_pnl = stats.get("total_pnl", 0.0)
+        win_rate = (wins / (wins + losses) * 100) if (wins + losses) > 0 else 0
+
+        return {
+            "trades_copied": self.trades_copied,
+            "trades_skipped": self.trades_skipped,
+            "total_spent": self.total_spent,
+            "open_positions": len(self.positions.get("open", [])),
+            "resolved_positions": len(self.positions.get("resolved", [])),
+            "wins": wins,
+            "losses": losses,
+            "win_rate": win_rate,
+            "total_pnl": total_pnl,
+            "dry_run": self.dry_run,
+        }
+
     def print_stats(self):
         """Print trading statistics"""
+        stats = self.get_stats()
         print("\n" + "-" * 40)
-        print(f"  Trades copied: {self.trades_copied}")
-        print(f"  Trades skipped: {self.trades_skipped}")
+        print(f"  Trades copied: {stats['trades_copied']}")
+        print(f"  Trades skipped: {stats['trades_skipped']}")
+        print(f"  Open positions: {stats['open_positions']}")
+        print(f"  Resolved: {stats['resolved_positions']}")
+        print(f"  Record: {stats['wins']}W / {stats['losses']}L ({stats['win_rate']:.1f}%)")
+        print(f"  Total PnL: ${stats['total_pnl']:+.2f}")
         if not self.dry_run:
-            print(f"  Total spent: ${self.total_spent:.2f}")
+            print(f"  Total spent: ${stats['total_spent']:.2f}")
         print("-" * 40)
 
 
