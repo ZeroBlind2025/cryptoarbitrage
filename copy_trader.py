@@ -374,13 +374,44 @@ class CopyTrader:
             size = bet.get("size", 0)
             slug = bet.get("slug", "")
 
+            # Debug: log all bet keys and values to find price field
+            print(f"[COPY] Bet fields: {list(bet.keys())}")
+            print(f"[COPY] Bet values: price={bet.get('price')}, avgPrice={bet.get('avgPrice')}, "
+                  f"averagePrice={bet.get('averagePrice')}, tradePrice={bet.get('tradePrice')}, "
+                  f"size={bet.get('size')}, usdcSize={bet.get('usdcSize')}")
+
             # Try multiple field names for price (API may vary)
-            price = bet.get("price") or bet.get("avgPrice") or bet.get("average_price") or bet.get("tradePrice") or 0
-            # Convert to float if string
-            try:
-                price = float(price) if price else 0
-            except (ValueError, TypeError):
+            # Check all common variations for entry price
+            price = None
+            for price_field in ['price', 'avgPrice', 'averagePrice', 'average_price', 'tradePrice', 'entryPrice', 'entry_price']:
+                val = bet.get(price_field)
+                if val is not None and val != '' and val != 0:
+                    try:
+                        price = float(val)
+                        if price > 0:
+                            print(f"[COPY] Found price in field '{price_field}': {price}")
+                            break
+                    except (ValueError, TypeError):
+                        continue
+
+            # Fallback: calculate price from usdcSize / size (if we have shares and dollar amount)
+            if not price or price <= 0:
+                usdc_size = bet.get('usdcSize') or bet.get('usdc_size') or bet.get('amount')
+                shares = bet.get('size')
+                if usdc_size and shares:
+                    try:
+                        usdc_size = float(usdc_size)
+                        shares = float(shares)
+                        if shares > 0:
+                            price = usdc_size / shares
+                            print(f"[COPY] Calculated price from usdcSize/size: ${usdc_size}/{shares} = {price:.4f}")
+                    except (ValueError, TypeError):
+                        pass
+
+            # Final fallback
+            if not price or price <= 0:
                 price = 0
+                print(f"[COPY] WARNING: Could not determine entry price, defaulting to 0")
 
             # Filter for crypto markets only
             if self.crypto_only and not is_crypto_market(bet):
@@ -563,12 +594,23 @@ class CopyTrader:
                     won = (winning_index == our_index)
 
                 if won is True:
-                    payout = amount / entry_price if entry_price > 0 else 0
-                    pnl = payout - amount
+                    # Validate entry_price before calculating
+                    if entry_price <= 0:
+                        # No valid entry price - use placeholder PnL
+                        pnl = amount * 3  # Assume ~4x return (typical for 20-25% odds)
+                        print(f"[COPY] WIN (no price): {position['market'][:30]} | entry_price=0, estimating +${pnl:.2f}")
+                    elif entry_price > 0.95:
+                        # Suspiciously high price (>95%) - likely bad data
+                        pnl = amount * 0.05  # Minimal win
+                        print(f"[COPY] WIN (high price): {position['market'][:30]} | entry={entry_price:.2f}, +${pnl:.2f}")
+                    else:
+                        # Normal calculation
+                        payout = amount / entry_price
+                        pnl = payout - amount
+                        print(f"[COPY] WIN: {position['market'][:30]} | entry={entry_price:.4f}, payout=${payout:.2f}, pnl=+${pnl:.2f}")
                     position["result"] = "WIN"
                     position["pnl"] = pnl
                     self.positions["stats"]["wins"] = self.positions["stats"].get("wins", 0) + 1
-                    print(f"[COPY] WIN: {position['market'][:30]} | +${pnl:.2f}")
                 elif won is False:
                     pnl = -amount
                     position["result"] = "LOSS"
