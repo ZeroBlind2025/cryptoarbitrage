@@ -1688,6 +1688,50 @@ def api_copy_trades():
     return jsonify(trades)
 
 
+@app.route('/api/copy-trader/positions')
+def api_copy_positions():
+    """Get raw position data for debugging"""
+    if not copy_trader:
+        return jsonify({"error": "Copy trader not running"})
+
+    positions = copy_trader.positions
+    return jsonify({
+        "open_count": len(positions.get("open", [])),
+        "resolved_count": len(positions.get("resolved", [])),
+        "stats": positions.get("stats", {}),
+        "open": positions.get("open", [])[-20:],  # Last 20 open
+        "resolved": positions.get("resolved", [])[-20:],  # Last 20 resolved
+    })
+
+
+@app.route('/api/copy-trader/reset-stats', methods=['POST'])
+def api_copy_reset_stats():
+    """Reset position tracking stats (keeps positions but resets W/L/PnL)"""
+    if not copy_trader:
+        return jsonify({"error": "Copy trader not running"})
+
+    # Reset stats
+    copy_trader.positions["stats"] = {"wins": 0, "losses": 0, "total_pnl": 0.0}
+
+    # Also clear resolved to start fresh
+    data = request.get_json() or {}
+    if data.get("clear_all"):
+        copy_trader.positions["open"] = []
+        copy_trader.positions["resolved"] = []
+
+    from copy_trader import save_positions
+    save_positions(copy_trader.positions)
+
+    return jsonify({
+        "success": True,
+        "message": "Stats reset",
+        "positions": {
+            "open": len(copy_trader.positions.get("open", [])),
+            "resolved": len(copy_trader.positions.get("resolved", [])),
+        }
+    })
+
+
 @app.route('/api/trades/demo')
 def api_trades_demo():
     """Get demo trades"""

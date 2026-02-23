@@ -506,12 +506,21 @@ class CopyTrader:
             if result.get("resolved"):
                 # Position resolved!
                 winning_outcome = result.get("winning_outcome")
+                winning_index = result.get("winning_index")
                 our_outcome = position.get("outcome")
+                our_index = position.get("outcome_index")
                 entry_price = position.get("entry_price", 0)
                 amount = position.get("amount", 0)
 
-                # Calculate PnL
-                if winning_outcome and our_outcome:
+                # Debug logging
+                print(f"[COPY] Checking resolution for: {position.get('market', '?')[:30]}")
+                print(f"       Our outcome: '{our_outcome}' (index {our_index})")
+                print(f"       Winning outcome: '{winning_outcome}' (index {winning_index})")
+
+                # Compare by index first (more reliable), then by name
+                if winning_index is not None and our_index is not None:
+                    won = (winning_index == our_index)
+                elif winning_outcome and our_outcome:
                     # Normalize for comparison (case insensitive)
                     won = winning_outcome.lower() == our_outcome.lower()
                 else:
