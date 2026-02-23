@@ -169,6 +169,8 @@ def check_target_position(token_id: str) -> Optional[dict]:
 def get_market_resolution(condition_id: str = "", slug: str = "", token_id: str = "", our_outcome: str = "") -> Optional[dict]:
     """Check if a market has resolved and get the winning outcome"""
     try:
+        print(f"[COPY] Checking resolution: token={token_id[:20] if token_id else 'none'}... cid={condition_id[:20] if condition_id else 'none'}...")
+
         # First try: Check token price directly (most reliable for resolved markets)
         if token_id:
             token_result = check_token_resolution(token_id)
@@ -197,6 +199,7 @@ def get_market_resolution(condition_id: str = "", slug: str = "", token_id: str 
         elif slug:
             params["slug_contains"] = slug
         else:
+            print(f"[COPY] No condition_id or slug, can't query gamma API")
             return {"resolved": False}
 
         response = requests.get(
@@ -206,14 +209,19 @@ def get_market_resolution(condition_id: str = "", slug: str = "", token_id: str 
         )
         response.raise_for_status()
         markets = response.json()
+        print(f"[COPY] Gamma API returned {len(markets)} markets")
 
         if markets and len(markets) > 0:
             market = markets[0]
+            closed = market.get("closed")
+            resolved = market.get("resolved")
+            print(f"[COPY] Market closed={closed}, resolved={resolved}")
 
             # Check if resolved
-            if market.get("closed") or market.get("resolved"):
+            if closed or resolved:
                 outcomes = market.get("outcomes", [])
                 outcome_prices = market.get("outcomePrices", [])
+                print(f"[COPY] outcomes={outcomes}, prices={outcome_prices}")
 
                 # Only use gamma data if it looks valid (2 outcomes for binary market)
                 if len(outcomes) == 2 and len(outcome_prices) == 2:
