@@ -1762,26 +1762,50 @@ def api_copy_download():
     # Create CSV
     output = StringIO()
     fieldnames = [
-        "timestamp", "market", "slug", "outcome", "outcome_index",
-        "amount", "price", "won", "pnl", "winning_outcome", "winning_index",
-        "condition_id", "token_id"
+        "timestamp", "resolved_at", "market", "direction", "outcome",
+        "amount", "entry_price", "result", "won", "pnl",
+        "winning_outcome", "condition_id", "token_id"
     ]
     writer = csv.DictWriter(output, fieldnames=fieldnames, extrasaction='ignore')
     writer.writeheader()
 
     for pos in resolved:
+        # Extract direction: "Up" or "Down" from outcome field
+        outcome = pos.get("outcome", "")
+        direction = ""
+        outcome_lower = outcome.lower() if outcome else ""
+        if "up" in outcome_lower:
+            direction = "UP"
+        elif "down" in outcome_lower:
+            direction = "DOWN"
+        elif "yes" in outcome_lower:
+            direction = "YES"
+        elif "no" in outcome_lower:
+            direction = "NO"
+        else:
+            direction = outcome
+
+        # Properly handle won=None (unknown) vs won=True/False
+        won_val = pos.get("won")
+        if won_val is True:
+            won_str = "YES"
+        elif won_val is False:
+            won_str = "NO"
+        else:
+            won_str = "UNKNOWN"
+
         row = {
             "timestamp": pos.get("timestamp", ""),
+            "resolved_at": pos.get("resolved_at", ""),
             "market": pos.get("market", ""),
-            "slug": pos.get("slug", ""),
-            "outcome": pos.get("outcome", ""),
-            "outcome_index": pos.get("outcome_index", ""),
+            "direction": direction,
+            "outcome": outcome,
             "amount": pos.get("amount", 0),
-            "price": pos.get("entry_price") or pos.get("price", 0),
-            "won": "YES" if pos.get("won") else "NO",
+            "entry_price": pos.get("entry_price") or pos.get("price", 0),
+            "result": pos.get("result", "UNKNOWN"),
+            "won": won_str,
             "pnl": pos.get("pnl", 0),
             "winning_outcome": pos.get("winning_outcome", ""),
-            "winning_index": pos.get("winning_index", ""),
             "condition_id": pos.get("condition_id", ""),
             "token_id": pos.get("token_id", ""),
         }
@@ -1790,7 +1814,7 @@ def api_copy_download():
     # Create response
     csv_content = output.getvalue()
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"copy_trader_resolved_{timestamp}.csv"
+    filename = f"poly_algo_resolved_{timestamp}.csv"
 
     return Response(
         csv_content,
