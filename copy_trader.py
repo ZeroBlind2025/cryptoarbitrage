@@ -140,11 +140,11 @@ def check_target_position(token_id: str) -> Optional[dict]:
                     # Determine win/loss from redeemable flag AND token price
                     if redeemable and size > 0:
                         return {"resolved": True, "won": True}
-                    elif cur_price >= 0.99 and size > 0:
+                    elif cur_price >= 0.99:
                         # Token price at ~$1 = this outcome WON
-                        # redeemable flag may lag behind price on-chain
+                        # redeemable flag or size may lag (target may have redeemed already)
                         return {"resolved": True, "won": True}
-                    elif cur_price <= 0.01 and not redeemable:
+                    elif cur_price <= 0.01:
                         # Token worthless = this outcome LOST
                         return {"resolved": True, "won": False}
         return None
