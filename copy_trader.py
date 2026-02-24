@@ -137,13 +137,15 @@ def check_target_position(token_id: str) -> Optional[dict]:
                     size = float(pos.get("size", 0))
                     print(f"[ALGO] Target position: redeemable={redeemable}, curPrice={cur_price}, size={size}")
 
-                    # redeemable=True means market resolved (both tokens), curPrice tells who won
-                    if redeemable and size > 0 and cur_price >= 0.90:
-                        return {"resolved": True, "won": True}
-                    elif redeemable and cur_price <= 0.10:
-                        return {"resolved": True, "won": False}
-                    elif not redeemable and cur_price <= 0.01:
-                        return {"resolved": True, "won": False}
+                    if redeemable:
+                        # Market resolved — curPrice indicates winning side
+                        if cur_price >= 0.50:
+                            return {"resolved": True, "won": True}
+                        else:
+                            return {"resolved": True, "won": False}
+                    elif cur_price <= 0.01 or cur_price >= 0.99:
+                        # Not redeemable yet but price extreme = effectively resolved
+                        return {"resolved": True, "won": cur_price >= 0.99}
         return None
     except Exception as e:
         print(f"[ALGO] Target position check error: {e}")
@@ -202,16 +204,20 @@ def get_market_resolution(condition_id: str = "", slug: str = "", token_id: str 
 
                 # Only use gamma data if it looks valid (2 outcomes for binary market)
                 if len(outcomes) == 2 and len(outcome_prices) == 2:
-                    for i, price in enumerate(outcome_prices):
-                        try:
-                            if float(price) >= 0.99 and i < len(outcomes):
-                                return {
-                                    "resolved": True,
-                                    "winning_outcome": outcomes[i],
-                                    "winning_index": i,
-                                }
-                        except (ValueError, TypeError):
-                            continue
+                    try:
+                        prices = [float(p) for p in outcome_prices]
+                    except (ValueError, TypeError):
+                        prices = []
+
+                    if len(prices) == 2:
+                        # Pick the outcome with the higher price if it's clearly dominant
+                        high_idx = 0 if prices[0] >= prices[1] else 1
+                        if prices[high_idx] >= 0.90:
+                            return {
+                                "resolved": True,
+                                "winning_outcome": outcomes[high_idx],
+                                "winning_index": high_idx,
+                            }
 
                 # Market closed but can't determine winner reliably
                 return {"resolved": True, "winning_outcome": None, "winning_index": None}
@@ -303,10 +309,12 @@ def is_crypto_market(bet: dict) -> bool:
 
 
 def already_has_position(my_positions: list, condition_id: str, outcome_index: int) -> bool:
-    """Check if we already have this position"""
-    target_key = f"{condition_id}_{outcome_index}"
-    my_keys = {f"{p['conditionId']}_{p['outcomeIndex']}" for p in my_positions}
-    return target_key in my_keys
+    """Check if we already have ANY position on this market (not just this outcome).
+    Prevents buying both UP and DOWN on the same market."""
+    if not condition_id:
+        return False
+    my_condition_ids = {p.get('conditionId', '') for p in my_positions}
+    return condition_id in my_condition_ids
 
 
 def get_clob_client() -> Optional["ClobClient"]:
@@ -501,7 +509,14 @@ class CopyTrader:
             outcome_index = bet.get("outcomeIndex") or bet.get("outcome_index") or 0
 
             if already_has_position(my_positions, condition_id, outcome_index):
-                print(f"[ALGO] Skip (already own): {title}")
+                print(f"[ALGO] Skip (already own on-chain): {title}")
+                self.trades_skipped += 1
+                continue
+
+            # Also check our local open positions (covers indexing delay)
+            open_condition_ids = {p.get("condition_id", "") for p in self.positions.get("open", [])}
+            if condition_id and condition_id in open_condition_ids:
+                print(f"[ALGO] Skip (already tracking): {title}")
                 self.trades_skipped += 1
                 continue
 
