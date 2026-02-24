@@ -115,13 +115,15 @@ def save_positions(positions: dict):
 
 
 def check_target_position(token_id: str) -> Optional[dict]:
-    """Check target trader's position status for this token - ONLY trust redeemable field"""
+    """Check target trader's position status for this token.
+
+    redeemable=True is a definitive WIN signal.
+    redeemable=False is INCONCLUSIVE - could be active or lost.
+    We return the raw data so the caller can combine with market status.
+    """
     if not token_id:
         return None
     try:
-        # Check target trader's position to see if it's redeemable
-        # Redeemable = WON (can redeem for $1)
-        # NOT redeemable + market closed = LOST
         response = requests.get(
             f"{DATA_API}/positions",
             params={"user": TARGET_ADDRESS, "asset": token_id},
@@ -130,18 +132,19 @@ def check_target_position(token_id: str) -> Optional[dict]:
         if response.status_code == 200:
             positions = response.json()
             for pos in positions:
-                # Check if this is the right token
                 if str(pos.get("asset")) == str(token_id):
                     redeemable = pos.get("redeemable", False)
                     cur_price = float(pos.get("curPrice", 0.5))
                     size = float(pos.get("size", 0))
                     print(f"[ALGO] Target position: redeemable={redeemable}, curPrice={cur_price}, size={size}")
 
-                    # Trust redeemable flag - curPrice is stale/unreliable for expired short-term markets
                     if redeemable and size > 0:
+                        # Definitive WIN - can redeem for $1
                         return {"resolved": True, "won": True}
-                    elif not redeemable:
-                        return {"resolved": True, "won": False}
+                    else:
+                        # NOT redeemable - could be active market OR lost
+                        # Return data so caller can combine with market end time
+                        return {"resolved": False, "redeemable": False, "cur_price": cur_price, "size": size}
         return None
     except Exception as e:
         print(f"[ALGO] Target position check error: {e}")
@@ -149,25 +152,31 @@ def check_target_position(token_id: str) -> Optional[dict]:
 
 
 def get_market_resolution(condition_id: str = "", slug: str = "", token_id: str = "", our_outcome: str = "") -> Optional[dict]:
-    """Check if a market has resolved and get the winning outcome"""
+    """Check if a market has resolved and get the winning outcome.
+
+    Strategy:
+    1. Check target position - redeemable=True is a definitive WIN
+    2. Check gamma API for market closed/resolved/expired status
+    3. Only mark as LOSS when market is CONFIRMED ended AND position not redeemable
+    """
     try:
         print(f"[ALGO] Checking resolution: token={token_id[:20] if token_id else 'none'}... cid={condition_id[:20] if condition_id else 'none'}...")
 
-        # ONLY method that works: Check target trader's position redeemable status
-        # Token prices are unreliable (winners can show 0 due to no liquidity)
+        # Step 1: Check target trader's position
+        target_result = None
         if token_id:
             target_result = check_target_position(token_id)
             if target_result and target_result.get("resolved"):
-                won = target_result.get("won")
-                print(f"[ALGO] Target position resolved: won={won}")
+                # Definitive WIN from redeemable=True
+                print(f"[ALGO] Target position: WIN (redeemable)")
                 return {
                     "resolved": True,
-                    "our_token_won": won,
-                    "winning_outcome": our_outcome if won else None,
+                    "our_token_won": True,
+                    "winning_outcome": our_outcome,
                     "winning_index": None,
                 }
 
-        # Fallback: Try gamma API for market info
+        # Step 2: Check gamma API to see if market has ended
         params = {}
         if condition_id:
             params["condition_ids"] = condition_id
@@ -189,16 +198,45 @@ def get_market_resolution(condition_id: str = "", slug: str = "", token_id: str 
         if markets and len(markets) > 0:
             market = markets[0]
             closed = market.get("closed")
-            resolved = market.get("resolved")
-            print(f"[ALGO] Market closed={closed}, resolved={resolved}")
+            resolved_flag = market.get("resolved")
+            end_date = market.get("endDateIso") or market.get("end_date_iso")
+            print(f"[ALGO] Market closed={closed}, resolved={resolved_flag}, endDate={end_date}")
 
-            # Check if resolved
-            if closed or resolved:
+            # Determine if market has definitively ended
+            market_ended = bool(closed or resolved_flag)
+
+            # Also check end date - critical for short-term crypto markets
+            # where gamma API may not update closed/resolved promptly
+            if not market_ended and end_date:
+                try:
+                    from dateutil.parser import parse as parse_date
+                    end_dt = parse_date(end_date)
+                    if end_dt.tzinfo is None:
+                        end_dt = end_dt.replace(tzinfo=timezone.utc)
+                    if datetime.now(timezone.utc) > end_dt:
+                        market_ended = True
+                        print(f"[ALGO] Market end date passed: {end_date}")
+                except Exception as e:
+                    print(f"[ALGO] Could not parse end date: {e}")
+
+            if market_ended:
+                # Market has ended - now we can determine win/loss
+
+                # If we have target position data showing not redeemable, it's a LOSS
+                if target_result and not target_result.get("redeemable", True):
+                    print(f"[ALGO] Market ended + not redeemable = LOSS")
+                    return {
+                        "resolved": True,
+                        "our_token_won": False,
+                        "winning_outcome": None,
+                        "winning_index": None,
+                    }
+
+                # Try gamma outcome prices to determine winner
                 outcomes = market.get("outcomes", [])
                 outcome_prices = market.get("outcomePrices", [])
                 print(f"[ALGO] outcomes={outcomes}, prices={outcome_prices}")
 
-                # Only use gamma data if it looks valid (2 outcomes for binary market)
                 if len(outcomes) == 2 and len(outcome_prices) == 2:
                     for i, price in enumerate(outcome_prices):
                         try:
@@ -211,8 +249,10 @@ def get_market_resolution(condition_id: str = "", slug: str = "", token_id: str 
                         except (ValueError, TypeError):
                             continue
 
-                # Market closed but can't determine winner reliably
+                # Market ended but can't determine winner - resolve as unknown
                 return {"resolved": True, "winning_outcome": None, "winning_index": None}
+            else:
+                print(f"[ALGO] Market still active")
 
         return {"resolved": False}
 
@@ -499,7 +539,19 @@ class CopyTrader:
             outcome_index = bet.get("outcomeIndex") or bet.get("outcome_index") or 0
 
             if already_has_position(my_positions, condition_id, outcome_index):
-                print(f"[ALGO] Skip (already own): {title}")
+                print(f"[ALGO] Skip (already own on-chain): {title}")
+                self.trades_skipped += 1
+                continue
+
+            # Also check our LOCAL open positions to prevent duplicates
+            # (critical for dry-run mode and when on-chain data is delayed)
+            already_tracking = False
+            for open_pos in self.positions.get("open", []):
+                if open_pos.get("condition_id") == condition_id:
+                    already_tracking = True
+                    break
+            if already_tracking:
+                print(f"[ALGO] Skip (already tracking): {title}")
                 self.trades_skipped += 1
                 continue
 
