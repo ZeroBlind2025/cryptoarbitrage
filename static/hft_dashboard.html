@@ -155,7 +155,7 @@
             );
         };
 
-        // Copy Trade Row (for copy trader trades)
+        // Algo Trade Row (for poly algo trades)
         const CopyTradeRow = ({ trade, isNew }) => {
             const time = new Date(trade.timestamp).toLocaleTimeString();
 
@@ -164,7 +164,7 @@
                     <div className="flex items-center justify-between mb-2">
                         <div className="flex items-center gap-2">
                             <span className="px-2 py-0.5 text-xs rounded border font-medium bg-cyan-500/20 text-cyan-400 border-cyan-500/30">
-                                COPY
+                                ALGO
                             </span>
                             <span className={`px-2 py-0.5 text-xs rounded border ${
                                 trade.status === 'filled' ? 'bg-green-500/20 text-green-400 border-green-500/30' :
@@ -198,6 +198,133 @@
                                 {trade.target_trader?.slice(0, 10)}...
                             </p>
                         </div>
+                    </div>
+                </div>
+            );
+        };
+
+        // Balance Chart - interactive line chart with timeframe toggles
+        const BalanceChart = ({ history }) => {
+            const [timeframe, setTimeframe] = useState('1d');
+
+            const timeframes = {
+                '1h': { label: '1H', ms: 60 * 60 * 1000 },
+                '6h': { label: '6H', ms: 6 * 60 * 60 * 1000 },
+                '1d': { label: '1D', ms: 24 * 60 * 60 * 1000 },
+                '1w': { label: '1W', ms: 7 * 24 * 60 * 60 * 1000 },
+                '1m': { label: '1M', ms: 30 * 24 * 60 * 60 * 1000 },
+            };
+
+            const filteredData = React.useMemo(() => {
+                if (!history || history.length === 0) return [];
+                const now = Date.now();
+                const cutoff = now - timeframes[timeframe].ms;
+                const filtered = history
+                    .filter(h => new Date(h.timestamp).getTime() >= cutoff)
+                    .map(h => ({
+                        time: new Date(h.timestamp).getTime(),
+                        balance: h.balance,
+                        label: new Date(h.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+                        event: h.event,
+                        detail: h.detail || '',
+                    }));
+                // If no data in range, show all data
+                if (filtered.length === 0) {
+                    return history.map(h => ({
+                        time: new Date(h.timestamp).getTime(),
+                        balance: h.balance,
+                        label: new Date(h.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+                        event: h.event,
+                        detail: h.detail || '',
+                    }));
+                }
+                return filtered;
+            }, [history, timeframe]);
+
+            const startBalance = 500;
+            const currentBalance = filteredData.length > 0 ? filteredData[filteredData.length - 1].balance : startBalance;
+            const isUp = currentBalance >= startBalance;
+
+            const CustomTooltip = ({ active, payload }) => {
+                if (active && payload && payload.length) {
+                    const d = payload[0].payload;
+                    return (
+                        <div className="bg-slate-800 border border-slate-600 rounded-lg px-3 py-2 text-xs">
+                            <p className="text-white font-mono font-bold">${d.balance.toFixed(2)}</p>
+                            <p className="text-slate-400">{new Date(d.time).toLocaleString()}</p>
+                            {d.event !== 'init' && (
+                                <p className={`${d.event === 'win' ? 'text-green-400' : d.event === 'loss' ? 'text-red-400' : 'text-cyan-400'}`}>
+                                    {d.event.toUpperCase()}{d.detail ? `: ${d.detail}` : ''}
+                                </p>
+                            )}
+                        </div>
+                    );
+                }
+                return null;
+            };
+
+            if (!history || history.length === 0) {
+                return (
+                    <div className="text-slate-500 text-center py-4 text-sm">
+                        No balance history yet
+                    </div>
+                );
+            }
+
+            return (
+                <div>
+                    {/* Timeframe toggles */}
+                    <div className="flex gap-1 mb-3">
+                        {Object.entries(timeframes).map(([key, { label }]) => (
+                            <button
+                                key={key}
+                                onClick={() => setTimeframe(key)}
+                                className={`px-3 py-1 text-xs rounded-md font-medium transition-all ${
+                                    timeframe === key
+                                        ? 'bg-cyan-500/20 text-cyan-400 border border-cyan-500/40'
+                                        : 'text-slate-400 hover:text-slate-300 hover:bg-slate-700/50 border border-transparent'
+                                }`}
+                            >
+                                {label}
+                            </button>
+                        ))}
+                    </div>
+
+                    {/* Chart */}
+                    <div style={{ width: '100%', height: 200 }}>
+                        <ResponsiveContainer>
+                            <AreaChart data={filteredData} margin={{ top: 5, right: 5, left: 5, bottom: 5 }}>
+                                <defs>
+                                    <linearGradient id="balanceGradient" x1="0" y1="0" x2="0" y2="1">
+                                        <stop offset="5%" stopColor={isUp ? '#22c55e' : '#ef4444'} stopOpacity={0.3} />
+                                        <stop offset="95%" stopColor={isUp ? '#22c55e' : '#ef4444'} stopOpacity={0} />
+                                    </linearGradient>
+                                </defs>
+                                <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
+                                <XAxis
+                                    dataKey="label"
+                                    stroke="#64748b"
+                                    tick={{ fontSize: 10 }}
+                                    interval="preserveStartEnd"
+                                />
+                                <YAxis
+                                    stroke="#64748b"
+                                    tick={{ fontSize: 10 }}
+                                    domain={['auto', 'auto']}
+                                    tickFormatter={(v) => `$${v}`}
+                                />
+                                <Tooltip content={<CustomTooltip />} />
+                                <Area
+                                    type="monotone"
+                                    dataKey="balance"
+                                    stroke={isUp ? '#22c55e' : '#ef4444'}
+                                    strokeWidth={2}
+                                    fill="url(#balanceGradient)"
+                                    dot={false}
+                                    activeDot={{ r: 4, strokeWidth: 2, stroke: isUp ? '#22c55e' : '#ef4444', fill: '#0f172a' }}
+                                />
+                            </AreaChart>
+                        </ResponsiveContainer>
                     </div>
                 </div>
             );
@@ -631,7 +758,7 @@
                                     </h2>
                                     <div className="flex gap-2">
                                         <span className="text-xs text-slate-400">
-                                            {trades.demo?.length || 0} demo / {trades.live?.length || 0} live / {trades.copy?.length || 0} copy
+                                            {trades.demo?.length || 0} demo / {trades.live?.length || 0} live / {trades.copy?.length || 0} algo
                                         </span>
                                     </div>
                                 </div>
@@ -661,12 +788,12 @@
                                 </div>
                             </div>
 
-                            {/* Copy Trader Status */}
+                            {/* Poly Algo Status */}
                             <div className="bg-slate-800/50 backdrop-blur rounded-xl border border-slate-700/50 p-4">
                                 <div className="flex items-center justify-between mb-4">
                                     <h2 className="text-lg font-semibold flex items-center gap-2">
-                                        <span className="text-cyan-400">👤</span>
-                                        Copy Trader
+                                        <span className="text-cyan-400"><Zap /></span>
+                                        Poly Algo
                                     </h2>
                                     <div className="flex items-center gap-2">
                                         <span className={`px-2 py-0.5 text-xs rounded border ${
@@ -707,8 +834,23 @@
                                         )}
                                     </div>
                                 </div>
+
+                                {/* Balance Hero */}
+                                <div className="mb-4 p-4 rounded-xl bg-gradient-to-r from-cyan-900/30 to-blue-900/30 border border-cyan-500/20">
+                                    <p className="text-xs text-slate-400 mb-1">Balance</p>
+                                    <p className={`text-3xl font-bold font-mono ${(copyTrader.balance || 500) >= 500 ? 'text-green-400' : 'text-red-400'}`}>
+                                        ${(copyTrader.balance || 500).toFixed(2)}
+                                    </p>
+                                    <p className={`text-sm font-mono mt-1 ${(copyTrader.total_pnl || 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                                        {(copyTrader.total_pnl || 0) >= 0 ? '+' : ''}{(copyTrader.total_pnl || 0).toFixed(2)} all time
+                                    </p>
+                                </div>
+
+                                {/* Balance Chart */}
+                                <BalanceChart history={copyTrader.balance_history || []} />
+
                                 {copyTrader.running ? (
-                                    <div className="space-y-2 text-sm">
+                                    <div className="space-y-2 text-sm mt-4">
                                         <div className="flex justify-between">
                                             <span className="text-slate-400">Following</span>
                                             <span className="text-cyan-400 font-mono truncate max-w-[150px]" title={copyTrader.target_name}>
@@ -756,8 +898,8 @@
                                         )}
                                     </div>
                                 ) : (
-                                    <p className="text-slate-500 text-sm">
-                                        Click Start to begin following crypto trader trades.
+                                    <p className="text-slate-500 text-sm mt-4">
+                                        Click Start to begin algo trading on crypto markets.
                                     </p>
                                 )}
                             </div>

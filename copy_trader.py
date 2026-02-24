@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-COPY TRADER - Follow a specific trader's crypto bets
-=====================================================
+POLY ALGO - Algorithmic trader following a specific trader's crypto bets
+========================================================================
 
 Monitors a target trader's activity and copies their trades on crypto markets
 (15, 30, and 60 minute timeframes).
@@ -38,7 +38,7 @@ try:
     HAS_CLOB_CLIENT = True
 except ImportError:
     HAS_CLOB_CLIENT = False
-    print("[COPY] Warning: py_clob_client not installed. Install with: pip install py-clob-client")
+    print("[ALGO] Warning: py_clob_client not installed. Install with: pip install py-clob-client")
 
 
 # =============================================================================
@@ -56,6 +56,7 @@ SIGNATURE_TYPE = int(os.getenv("POLYMARKET_SIGNATURE_TYPE", "0"))  # 0=EOA, 1=Em
 # Trading settings
 BET_AMOUNT = float(os.getenv("COPY_BET_AMOUNT", "2.0"))  # $ per copied bet
 POLL_INTERVAL = int(os.getenv("COPY_POLL_INTERVAL", "10"))  # seconds between checks
+ALGO_STARTING_BALANCE = 500.0  # Starting balance for Poly Algo
 
 # Crypto market filter - only copy trades on these markets
 CRYPTO_SLUGS = ["btc-", "eth-", "sol-", "xrp-", "-updown-"]
@@ -79,10 +80,29 @@ def load_positions() -> dict:
     if POSITIONS_FILE.exists():
         try:
             with open(POSITIONS_FILE, "r") as f:
-                return json.load(f)
+                data = json.load(f)
+            # Migrate: add balance fields if missing
+            stats = data.get("stats", {})
+            if "balance" not in stats:
+                stats["balance"] = ALGO_STARTING_BALANCE
+            if "balance_history" not in stats:
+                stats["balance_history"] = [
+                    {"timestamp": datetime.now(timezone.utc).isoformat(), "balance": stats["balance"], "event": "init"}
+                ]
+            data["stats"] = stats
+            return data
         except Exception as e:
-            print(f"[COPY] Error loading positions: {e}")
-    return {"open": [], "resolved": [], "stats": {"wins": 0, "losses": 0, "total_pnl": 0.0}}
+            print(f"[ALGO] Error loading positions: {e}")
+    return {
+        "open": [], "resolved": [],
+        "stats": {
+            "wins": 0, "losses": 0, "total_pnl": 0.0,
+            "balance": ALGO_STARTING_BALANCE,
+            "balance_history": [
+                {"timestamp": datetime.now(timezone.utc).isoformat(), "balance": ALGO_STARTING_BALANCE, "event": "init"}
+            ],
+        }
+    }
 
 
 def save_positions(positions: dict):
@@ -91,7 +111,7 @@ def save_positions(positions: dict):
         with open(POSITIONS_FILE, "w") as f:
             json.dump(positions, f, indent=2)
     except Exception as e:
-        print(f"[COPY] Error saving positions: {e}")
+        print(f"[ALGO] Error saving positions: {e}")
 
 
 def check_target_position(token_id: str) -> Optional[dict]:
@@ -115,7 +135,7 @@ def check_target_position(token_id: str) -> Optional[dict]:
                     redeemable = pos.get("redeemable", False)
                     cur_price = float(pos.get("curPrice", 0.5))
                     size = float(pos.get("size", 0))
-                    print(f"[COPY] Target position: redeemable={redeemable}, curPrice={cur_price}, size={size}")
+                    print(f"[ALGO] Target position: redeemable={redeemable}, curPrice={cur_price}, size={size}")
 
                     # ONLY trust redeemable flag - price can be misleading
                     if redeemable and size > 0:
@@ -125,14 +145,14 @@ def check_target_position(token_id: str) -> Optional[dict]:
                         return {"resolved": True, "won": False}
         return None
     except Exception as e:
-        print(f"[COPY] Target position check error: {e}")
+        print(f"[ALGO] Target position check error: {e}")
         return None
 
 
 def get_market_resolution(condition_id: str = "", slug: str = "", token_id: str = "", our_outcome: str = "") -> Optional[dict]:
     """Check if a market has resolved and get the winning outcome"""
     try:
-        print(f"[COPY] Checking resolution: token={token_id[:20] if token_id else 'none'}... cid={condition_id[:20] if condition_id else 'none'}...")
+        print(f"[ALGO] Checking resolution: token={token_id[:20] if token_id else 'none'}... cid={condition_id[:20] if condition_id else 'none'}...")
 
         # ONLY method that works: Check target trader's position redeemable status
         # Token prices are unreliable (winners can show 0 due to no liquidity)
@@ -140,7 +160,7 @@ def get_market_resolution(condition_id: str = "", slug: str = "", token_id: str 
             target_result = check_target_position(token_id)
             if target_result and target_result.get("resolved"):
                 won = target_result.get("won")
-                print(f"[COPY] Target position resolved: won={won}")
+                print(f"[ALGO] Target position resolved: won={won}")
                 return {
                     "resolved": True,
                     "our_token_won": won,
@@ -155,7 +175,7 @@ def get_market_resolution(condition_id: str = "", slug: str = "", token_id: str 
         elif slug:
             params["slug_contains"] = slug
         else:
-            print(f"[COPY] No condition_id or slug, can't query gamma API")
+            print(f"[ALGO] No condition_id or slug, can't query gamma API")
             return {"resolved": False}
 
         response = requests.get(
@@ -165,19 +185,19 @@ def get_market_resolution(condition_id: str = "", slug: str = "", token_id: str 
         )
         response.raise_for_status()
         markets = response.json()
-        print(f"[COPY] Gamma API returned {len(markets)} markets")
+        print(f"[ALGO] Gamma API returned {len(markets)} markets")
 
         if markets and len(markets) > 0:
             market = markets[0]
             closed = market.get("closed")
             resolved = market.get("resolved")
-            print(f"[COPY] Market closed={closed}, resolved={resolved}")
+            print(f"[ALGO] Market closed={closed}, resolved={resolved}")
 
             # Check if resolved
             if closed or resolved:
                 outcomes = market.get("outcomes", [])
                 outcome_prices = market.get("outcomePrices", [])
-                print(f"[COPY] outcomes={outcomes}, prices={outcome_prices}")
+                print(f"[ALGO] outcomes={outcomes}, prices={outcome_prices}")
 
                 # Only use gamma data if it looks valid (2 outcomes for binary market)
                 if len(outcomes) == 2 and len(outcome_prices) == 2:
@@ -199,7 +219,7 @@ def get_market_resolution(condition_id: str = "", slug: str = "", token_id: str 
 
     except Exception as e:
         identifier = condition_id[:20] if condition_id else slug[:20] if slug else "unknown"
-        print(f"[COPY] Error checking resolution for {identifier}...: {e}")
+        print(f"[ALGO] Error checking resolution for {identifier}...: {e}")
         return {"resolved": False}
 
 
@@ -233,7 +253,7 @@ def get_positions(wallet_address: str) -> list:
         response.raise_for_status()
         return response.json()
     except Exception as e:
-        print(f"[COPY] Error fetching positions: {e}")
+        print(f"[ALGO] Error fetching positions: {e}")
         return []
 
 
@@ -253,7 +273,7 @@ def get_latest_bets(wallet_address: str, limit: int = 20) -> list:
                 bets.append(activity)
         return bets
     except Exception as e:
-        print(f"[COPY] Error fetching activity: {e}")
+        print(f"[ALGO] Error fetching activity: {e}")
         return []
 
 
@@ -294,11 +314,11 @@ def get_clob_client() -> Optional["ClobClient"]:
         return None
 
     if not PRIVATE_KEY:
-        print("[COPY] Error: POLYGON_PRIVATE_KEY not set in environment")
+        print("[ALGO] Error: POLYGON_PRIVATE_KEY not set in environment")
         return None
 
     if not FUNDER_ADDRESS:
-        print("[COPY] Error: POLYMARKET_FUNDER_ADDRESS not set in environment")
+        print("[ALGO] Error: POLYMARKET_FUNDER_ADDRESS not set in environment")
         return None
 
     try:
@@ -313,7 +333,7 @@ def get_clob_client() -> Optional["ClobClient"]:
         client.set_api_creds(creds)
         return client
     except Exception as e:
-        print(f"[COPY] Error initializing CLOB client: {e}")
+        print(f"[ALGO] Error initializing CLOB client: {e}")
         return None
 
 
@@ -330,7 +350,7 @@ def place_bet(client: "ClobClient", token_id: str, amount: float) -> bool:
         result = client.post_order(signed_order, OrderType.FOK)
         return True
     except Exception as e:
-        print(f"[COPY] Order error: {e}")
+        print(f"[ALGO] Order error: {e}")
         return False
 
 
@@ -364,12 +384,14 @@ class CopyTrader:
         self.resolution_check_interval = 60  # Check every 60 seconds
 
     def start(self):
-        """Initialize the copy trader"""
+        """Initialize the algo trader"""
+        balance = self.positions.get("stats", {}).get("balance", ALGO_STARTING_BALANCE)
         print("\n" + "=" * 60)
-        print(f"  COPY TRADER")
+        print(f"  POLY ALGO")
         print(f"  Following: {self.target_name}")
         print(f"  Target: {TARGET_ADDRESS[:20]}...")
         print(f"  Bet amount: ${BET_AMOUNT}")
+        print(f"  Balance: ${balance:.2f}")
         print(f"  Mode: {'DRY RUN' if self.dry_run else 'LIVE'}")
         print(f"  Filter: {'Crypto only' if self.crypto_only else 'All markets'}")
         print("=" * 60 + "\n")
@@ -377,17 +399,17 @@ class CopyTrader:
         if not self.dry_run:
             self.client = get_clob_client()
             if not self.client:
-                print("[COPY] Failed to initialize client. Running in dry-run mode.")
+                print("[ALGO] Failed to initialize client. Running in dry-run mode.")
                 self.dry_run = True
 
         # Snapshot existing trades so we don't copy historical trades
         # Only copy NEW trades that happen AFTER we start monitoring
-        print("[COPY] Loading existing trades to avoid duplicates...")
+        print("[ALGO] Loading existing trades to avoid duplicates...")
         existing_bets = get_latest_bets(TARGET_ADDRESS, limit=50)
         for bet in existing_bets:
             trade_id = bet.get("id") or f"{bet.get('conditionId')}_{bet.get('timestamp')}"
             self.copied_trades.add(trade_id)
-        print(f"[COPY] Marked {len(self.copied_trades)} existing trades as seen. Waiting for NEW trades...")
+        print(f"[ALGO] Marked {len(self.copied_trades)} existing trades as seen. Waiting for NEW trades...")
 
         # Show position tracking stats
         stats = self.positions.get("stats", {})
@@ -398,9 +420,9 @@ class CopyTrader:
         total_pnl = stats.get("total_pnl", 0.0)
         win_rate = (wins / (wins + losses) * 100) if (wins + losses) > 0 else 0
 
-        print(f"[COPY] Positions: {open_count} open, {resolved_count} resolved")
-        print(f"[COPY] Record: {wins}W / {losses}L ({win_rate:.1f}% win rate)")
-        print(f"[COPY] Total PnL: ${total_pnl:+.2f}")
+        print(f"[ALGO] Positions: {open_count} open, {resolved_count} resolved")
+        print(f"[ALGO] Record: {wins}W / {losses}L ({win_rate:.1f}% win rate)")
+        print(f"[ALGO] Total PnL: ${total_pnl:+.2f}")
 
     def check_and_copy(self) -> int:
         """Check for new trades and copy them. Returns number of trades copied."""
@@ -435,8 +457,8 @@ class CopyTrader:
             usdc_size = bet.get('usdcSize') or bet.get('usdc_size') or bet.get('amount')
             shares = bet.get('size')
 
-            print(f"[COPY] Bet fields: {list(bet.keys())}")
-            print(f"[COPY] Bet values: usdcSize={usdc_size}, size={shares}, price_field={bet.get('price')}")
+            print(f"[ALGO] Bet fields: {list(bet.keys())}")
+            print(f"[ALGO] Bet values: usdcSize={usdc_size}, size={shares}, price_field={bet.get('price')}")
 
             if usdc_size and shares:
                 try:
@@ -444,7 +466,7 @@ class CopyTrader:
                     shares = float(shares)
                     if shares > 0:
                         price = usdc_size / shares
-                        print(f"[COPY] Entry price calculated: ${usdc_size} / {shares} shares = {price:.4f} ({price*100:.1f}¢)")
+                        print(f"[ALGO] Entry price calculated: ${usdc_size} / {shares} shares = {price:.4f} ({price*100:.1f}¢)")
                 except (ValueError, TypeError):
                     pass
 
@@ -454,18 +476,18 @@ class CopyTrader:
                 if raw_price:
                     try:
                         price = float(raw_price)
-                        print(f"[COPY] WARNING: Using price field as fallback: {price}")
+                        print(f"[ALGO] WARNING: Using price field as fallback: {price}")
                     except (ValueError, TypeError):
                         pass
 
             # Final fallback
             if not price or price <= 0:
                 price = 0
-                print(f"[COPY] WARNING: Could not determine entry price, defaulting to 0")
+                print(f"[ALGO] WARNING: Could not determine entry price, defaulting to 0")
 
             # Filter for crypto markets only
             if self.crypto_only and not is_crypto_market(bet):
-                print(f"[COPY] Skip (not crypto): {title}")
+                print(f"[ALGO] Skip (not crypto): {title}")
                 self.trades_skipped += 1
                 continue
 
@@ -478,12 +500,12 @@ class CopyTrader:
             outcome_index = bet.get("outcomeIndex") or bet.get("outcome_index") or 0
 
             if already_has_position(my_positions, condition_id, outcome_index):
-                print(f"[COPY] Skip (already own): {title}")
+                print(f"[ALGO] Skip (already own): {title}")
                 self.trades_skipped += 1
                 continue
 
             # Copy the trade!
-            print(f"\n[COPY] NEW TRADE DETECTED!")
+            print(f"\n[ALGO] NEW TRADE DETECTED!")
             print(f"       Market: {title}")
             print(f"       Target bought: {size:.1f} {outcome} @ {price*100:.1f}¢")
             print(f"       Copying: ${BET_AMOUNT:.2f} of {outcome}")
@@ -544,15 +566,27 @@ class CopyTrader:
                     "dry_run": self.dry_run,
                 }
                 self.positions["open"].append(position)
+
+                # Deduct balance
+                stats = self.positions["stats"]
+                stats["balance"] = stats.get("balance", ALGO_STARTING_BALANCE) - BET_AMOUNT
+                now_ts = datetime.now(timezone.utc).isoformat()
+                stats.setdefault("balance_history", []).append({
+                    "timestamp": now_ts,
+                    "balance": stats["balance"],
+                    "event": "trade",
+                    "detail": f"{outcome} {title[:30]}"
+                })
+
                 save_positions(self.positions)
-                print(f"       Position saved. Potential payout: ${position['potential_payout']:.2f}")
+                print(f"       Position saved. Potential payout: ${position['potential_payout']:.2f} | Balance: ${stats['balance']:.2f}")
 
             # Call dashboard callback
             if self.on_trade:
                 try:
                     self.on_trade(trade_record)
                 except Exception as e:
-                    print(f"[COPY] Callback error: {e}")
+                    print(f"[ALGO] Callback error: {e}")
 
             self.trades_copied += copied
 
@@ -562,13 +596,13 @@ class CopyTrader:
         """Single check iteration"""
         self.start()
 
-        print("[COPY] Checking for trades to copy...")
+        print("[ALGO] Checking for trades to copy...")
         copied = self.check_and_copy()
 
         if copied > 0:
-            print(f"\n[COPY] Copied {copied} trade(s)")
+            print(f"\n[ALGO] Copied {copied} trade(s)")
         else:
-            print("[COPY] No new trades to copy")
+            print("[ALGO] No new trades to copy")
 
         self.print_stats()
 
@@ -576,14 +610,14 @@ class CopyTrader:
         """Continuous monitoring loop"""
         self.start()
 
-        print(f"[COPY] Starting continuous monitoring (every {POLL_INTERVAL}s)...")
-        print("[COPY] Press Ctrl+C to stop\n")
+        print(f"[ALGO] Starting continuous monitoring (every {POLL_INTERVAL}s)...")
+        print("[ALGO] Press Ctrl+C to stop\n")
 
         try:
             while True:
                 copied = self.check_and_copy()
                 if copied > 0:
-                    print(f"[COPY] Copied {copied} trade(s) this cycle")
+                    print(f"[ALGO] Copied {copied} trade(s) this cycle")
 
                 # Periodically check for resolved positions
                 self.check_resolutions()
@@ -591,7 +625,7 @@ class CopyTrader:
                 time.sleep(POLL_INTERVAL)
 
         except KeyboardInterrupt:
-            print("\n[COPY] Stopping...")
+            print("\n[ALGO] Stopping...")
             self.print_stats()
 
     def check_resolutions(self):
@@ -640,7 +674,7 @@ class CopyTrader:
                 if "our_token_won" in result:
                     # Direct result from token price - most reliable
                     won = result.get("our_token_won")
-                    print(f"[COPY] Token resolution: {position['market'][:30]} | won={won}")
+                    print(f"[ALGO] Token resolution: {position['market'][:30]} | won={won}")
                 else:
                     # Fallback to outcome name comparison
                     winning_outcome = result.get("winning_outcome")
@@ -664,16 +698,16 @@ class CopyTrader:
                     if entry_price <= 0:
                         # No valid entry price - use placeholder PnL
                         pnl = amount * 3  # Assume ~4x return (typical for 20-25% odds)
-                        print(f"[COPY] WIN (no price): {position['market'][:30]} | entry_price=0, estimating +${pnl:.2f}")
+                        print(f"[ALGO] WIN (no price): {position['market'][:30]} | entry_price=0, estimating +${pnl:.2f}")
                     elif entry_price > 0.95:
                         # Suspiciously high price (>95%) - likely bad data
                         pnl = amount * 0.05  # Minimal win
-                        print(f"[COPY] WIN (high price): {position['market'][:30]} | entry={entry_price:.2f}, +${pnl:.2f}")
+                        print(f"[ALGO] WIN (high price): {position['market'][:30]} | entry={entry_price:.2f}, +${pnl:.2f}")
                     else:
                         # Normal calculation
                         payout = amount / entry_price
                         pnl = payout - amount
-                        print(f"[COPY] WIN: {position['market'][:30]} | entry={entry_price:.4f}, payout=${payout:.2f}, pnl=+${pnl:.2f}")
+                        print(f"[ALGO] WIN: {position['market'][:30]} | entry={entry_price:.4f}, payout=${payout:.2f}, pnl=+${pnl:.2f}")
                     position["result"] = "WIN"
                     position["pnl"] = pnl
                     self.positions["stats"]["wins"] = self.positions["stats"].get("wins", 0) + 1
@@ -682,16 +716,30 @@ class CopyTrader:
                     position["result"] = "LOSS"
                     position["pnl"] = pnl
                     self.positions["stats"]["losses"] = self.positions["stats"].get("losses", 0) + 1
-                    print(f"[COPY] LOSS: {position['market'][:30]} | -${amount:.2f}")
+                    print(f"[ALGO] LOSS: {position['market'][:30]} | -${amount:.2f}")
                 else:
                     # Unknown result
                     pnl = 0
                     position["result"] = "UNKNOWN"
                     position["pnl"] = 0
-                    print(f"[COPY] RESOLVED (unknown): {position['market'][:30]}")
+                    print(f"[ALGO] RESOLVED (unknown): {position['market'][:30]}")
 
                 # Update totals
                 self.positions["stats"]["total_pnl"] = self.positions["stats"].get("total_pnl", 0) + pnl
+
+                # Update balance: on WIN, add payout (amount/entry_price); on LOSS, already deducted at trade time
+                stats = self.positions["stats"]
+                if won is True:
+                    payout = amount / entry_price if entry_price > 0 else amount
+                    stats["balance"] = stats.get("balance", ALGO_STARTING_BALANCE) + payout
+                now_ts = datetime.now(timezone.utc).isoformat()
+                event_type = "win" if won is True else "loss" if won is False else "resolved"
+                stats.setdefault("balance_history", []).append({
+                    "timestamp": now_ts,
+                    "balance": stats["balance"],
+                    "event": event_type,
+                    "detail": f"{position.get('outcome', '?')} {position.get('market', '?')[:30]}"
+                })
 
                 # Move from open to resolved
                 position["resolved_at"] = datetime.now(timezone.utc).isoformat()
@@ -707,12 +755,12 @@ class CopyTrader:
                     try:
                         self.on_resolution(position)
                     except Exception as e:
-                        print(f"[COPY] Resolution callback error: {e}")
+                        print(f"[ALGO] Resolution callback error: {e}")
 
         if resolved_this_check > 0:
             save_positions(self.positions)
             stats = self.positions["stats"]
-            print(f"[COPY] {resolved_this_check} position(s) resolved. Record: {stats['wins']}W/{stats['losses']}L, PnL: ${stats['total_pnl']:+.2f}")
+            print(f"[ALGO] {resolved_this_check} position(s) resolved. Record: {stats['wins']}W/{stats['losses']}L, PnL: ${stats['total_pnl']:+.2f}")
 
     def get_stats(self) -> dict:
         """Get current statistics for dashboard"""
@@ -721,6 +769,8 @@ class CopyTrader:
         losses = stats.get("losses", 0)
         total_pnl = stats.get("total_pnl", 0.0)
         win_rate = (wins / (wins + losses) * 100) if (wins + losses) > 0 else 0
+        balance = stats.get("balance", ALGO_STARTING_BALANCE)
+        balance_history = stats.get("balance_history", [])
 
         return {
             "trades_copied": self.trades_copied,
@@ -733,12 +783,15 @@ class CopyTrader:
             "win_rate": win_rate,
             "total_pnl": total_pnl,
             "dry_run": self.dry_run,
+            "balance": balance,
+            "balance_history": balance_history,
         }
 
     def print_stats(self):
         """Print trading statistics"""
         stats = self.get_stats()
         print("\n" + "-" * 40)
+        print(f"  Balance: ${stats['balance']:.2f}")
         print(f"  Trades copied: {stats['trades_copied']}")
         print(f"  Trades skipped: {stats['trades_skipped']}")
         print(f"  Open positions: {stats['open_positions']}")
@@ -757,7 +810,7 @@ class CopyTrader:
 def main():
     global BET_AMOUNT
 
-    parser = argparse.ArgumentParser(description="Copy trader for Polymarket crypto markets")
+    parser = argparse.ArgumentParser(description="Poly Algo - algorithmic trader for Polymarket crypto markets")
     parser.add_argument("--live", action="store_true", help="Enable live trading (default: dry run)")
     parser.add_argument("--loop", action="store_true", help="Continuous monitoring mode")
     parser.add_argument("--all-markets", action="store_true", help="Copy all markets (not just crypto)")
@@ -784,7 +837,7 @@ if __name__ == "__main__":
     try:
         main()
     except requests.HTTPError as e:
-        print(f"\n[COPY] Polymarket API Error: {e.response.status_code} - {e.response.text}")
+        print(f"\n[ALGO] Polymarket API Error: {e.response.status_code} - {e.response.text}")
     except Exception as e:
-        print(f"\n[COPY] Error: {e}")
+        print(f"\n[ALGO] Error: {e}")
         raise
