@@ -137,11 +137,12 @@ def check_target_position(token_id: str) -> Optional[dict]:
                     size = float(pos.get("size", 0))
                     print(f"[ALGO] Target position: redeemable={redeemable}, curPrice={cur_price}, size={size}")
 
-                    # ONLY trust redeemable flag - price can be misleading
-                    if redeemable and size > 0:
+                    # redeemable=True means market resolved (both tokens), curPrice tells who won
+                    if redeemable and size > 0 and cur_price >= 0.90:
                         return {"resolved": True, "won": True}
-                    elif not redeemable and (cur_price >= 0.99 or cur_price <= 0.01):
-                        # Market resolved (extreme price) but not redeemable = lost
+                    elif redeemable and cur_price <= 0.10:
+                        return {"resolved": True, "won": False}
+                    elif not redeemable and cur_price <= 0.01:
                         return {"resolved": True, "won": False}
         return None
     except Exception as e:
