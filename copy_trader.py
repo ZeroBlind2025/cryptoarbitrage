@@ -308,13 +308,15 @@ def is_crypto_market(bet: dict) -> bool:
     return False
 
 
-def already_has_position(my_positions: list, condition_id: str, outcome_index: int) -> bool:
-    """Check if we already have ANY position on this market (not just this outcome).
-    Prevents buying both UP and DOWN on the same market."""
+def has_opposite_position(my_positions: list, condition_id: str, outcome_index: int) -> bool:
+    """Check if we already have the OPPOSITE side of this market.
+    Allows stacking into the same side (UP, UP, UP) but blocks buying DOWN when we hold UP."""
     if not condition_id:
         return False
-    my_condition_ids = {p.get('conditionId', '') for p in my_positions}
-    return condition_id in my_condition_ids
+    for p in my_positions:
+        if p.get('conditionId', '') == condition_id and p.get('outcomeIndex') != outcome_index:
+            return True
+    return False
 
 
 def get_clob_client() -> Optional["ClobClient"]:
@@ -508,15 +510,17 @@ class CopyTrader:
             condition_id = bet.get("conditionId") or bet.get("condition_id") or bet.get("market_condition_id") or ""
             outcome_index = bet.get("outcomeIndex") or bet.get("outcome_index") or 0
 
-            if already_has_position(my_positions, condition_id, outcome_index):
-                print(f"[ALGO] Skip (already own on-chain): {title}")
+            if has_opposite_position(my_positions, condition_id, outcome_index):
+                print(f"[ALGO] Skip (opposite side on-chain): {title}")
                 self.trades_skipped += 1
                 continue
 
             # Also check our local open positions (covers indexing delay)
-            open_condition_ids = {p.get("condition_id", "") for p in self.positions.get("open", [])}
-            if condition_id and condition_id in open_condition_ids:
-                print(f"[ALGO] Skip (already tracking): {title}")
+            if condition_id and any(
+                op.get("condition_id") == condition_id and op.get("outcome_index") != outcome_index
+                for op in self.positions.get("open", [])
+            ):
+                print(f"[ALGO] Skip (opposite side tracked): {title}")
                 self.trades_skipped += 1
                 continue
 
