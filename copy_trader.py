@@ -727,19 +727,24 @@ class CopyTrader:
                 # Update totals
                 self.positions["stats"]["total_pnl"] = self.positions["stats"].get("total_pnl", 0) + pnl
 
-                # Update balance: on WIN, add payout (amount/entry_price); on LOSS, already deducted at trade time
-                stats = self.positions["stats"]
-                if won is True:
-                    payout = amount / entry_price if entry_price > 0 else amount
-                    stats["balance"] = stats.get("balance", ALGO_STARTING_BALANCE) + payout
-                now_ts = datetime.now(timezone.utc).isoformat()
-                event_type = "win" if won is True else "loss" if won is False else "resolved"
-                stats.setdefault("balance_history", []).append({
-                    "timestamp": now_ts,
-                    "balance": stats["balance"],
-                    "event": event_type,
-                    "detail": f"{position.get('outcome', '?')} {position.get('market', '?')[:30]}"
-                })
+                # Update balance (non-fatal — must never break resolution)
+                try:
+                    stats = self.positions["stats"]
+                    bal = stats.get("balance", ALGO_STARTING_BALANCE)
+                    if won is True:
+                        payout = amount / entry_price if entry_price > 0 else amount
+                        bal += payout
+                    stats["balance"] = bal
+                    now_ts = datetime.now(timezone.utc).isoformat()
+                    event_type = "win" if won is True else "loss" if won is False else "resolved"
+                    stats.setdefault("balance_history", []).append({
+                        "timestamp": now_ts,
+                        "balance": bal,
+                        "event": event_type,
+                        "detail": f"{position.get('outcome', '?')} {position.get('market', '?')[:30]}"
+                    })
+                except Exception as e:
+                    print(f"[ALGO] Balance update error (non-fatal): {e}", flush=True)
 
                 # Move from open to resolved
                 position["resolved_at"] = datetime.now(timezone.utc).isoformat()
