@@ -372,7 +372,7 @@ def place_bet(client: "ClobClient", token_id: str, amount: float) -> bool:
 class CopyTrader:
     """Copy trading engine"""
 
-    def __init__(self, dry_run: bool = True, crypto_only: bool = True, on_trade: Optional[callable] = None, on_resolution: Optional[callable] = None):
+    def __init__(self, dry_run: bool = True, crypto_only: bool = True, on_trade: Optional[callable] = None, on_resolution: Optional[callable] = None, bet_amount: Optional[float] = None, starting_balance: Optional[float] = None):
         self.dry_run = dry_run
         self.crypto_only = crypto_only
         self.client: Optional["ClobClient"] = None
@@ -380,6 +380,9 @@ class CopyTrader:
         self.target_name = get_profile_name(TARGET_ADDRESS)
         self.on_trade = on_trade  # Callback for dashboard integration
         self.on_resolution = on_resolution  # Callback when position resolves
+
+        # Configurable trade amount (can be changed at runtime via dashboard)
+        self.bet_amount = bet_amount if bet_amount is not None else BET_AMOUNT
 
         # Stats
         self.trades_copied = 0
@@ -391,6 +394,15 @@ class CopyTrader:
 
         # Position tracking (persisted to file)
         self.positions = load_positions()
+
+        # Override starting balance if provided
+        if starting_balance is not None:
+            self.positions["stats"]["balance"] = starting_balance
+            self.positions["stats"]["balance_history"] = [
+                {"timestamp": datetime.now(timezone.utc).isoformat(), "balance": starting_balance, "event": "init"}
+            ]
+            save_positions(self.positions)
+
         self.last_resolution_check = 0
         self.resolution_check_interval = 60  # Check every 60 seconds
 
@@ -401,7 +413,7 @@ class CopyTrader:
         print(f"  POLY ALGO")
         print(f"  Following: {self.target_name}")
         print(f"  Target: {TARGET_ADDRESS[:20]}...")
-        print(f"  Bet amount: ${BET_AMOUNT}")
+        print(f"  Bet amount: ${self.bet_amount}")
         print(f"  Balance: ${balance:.2f}")
         print(f"  Mode: {'DRY RUN' if self.dry_run else 'LIVE'}")
         print(f"  Filter: {'Crypto only' if self.crypto_only else 'All markets'}")
@@ -528,7 +540,7 @@ class CopyTrader:
             print(f"\n[ALGO] NEW TRADE DETECTED!")
             print(f"       Market: {title}")
             print(f"       Target bought: {size:.1f} {outcome} @ {price*100:.1f}¢")
-            print(f"       Copying: ${BET_AMOUNT:.2f} of {outcome}")
+            print(f"       Copying: ${self.bet_amount:.2f} of {outcome}")
 
             # Build trade record for dashboard
             trade_record = {
@@ -538,7 +550,7 @@ class CopyTrader:
                 "slug": slug,
                 "outcome": outcome,
                 "side": "BUY",
-                "amount": BET_AMOUNT,
+                "amount": self.bet_amount,
                 "price": price,
                 "target_trader": self.target_name,
                 "target_size": size,
@@ -552,12 +564,12 @@ class CopyTrader:
             else:
                 token_id = bet.get("asset", "")
                 if token_id and self.client:
-                    success = place_bet(self.client, token_id, BET_AMOUNT)
+                    success = place_bet(self.client, token_id, self.bet_amount)
                     if success:
                         print(f"       EXECUTED!")
                         trade_record["status"] = "filled"
                         copied += 1
-                        self.total_spent += BET_AMOUNT
+                        self.total_spent += self.bet_amount
                     else:
                         print(f"       FAILED!")
                         trade_record["status"] = "failed"
@@ -581,8 +593,8 @@ class CopyTrader:
                     "market": title,
                     "slug": slug,
                     "entry_price": price,
-                    "amount": BET_AMOUNT,
-                    "potential_payout": BET_AMOUNT / price if price > 0 else 0,
+                    "amount": self.bet_amount,
+                    "potential_payout": self.bet_amount / price if price > 0 else 0,
                     "dry_run": self.dry_run,
                 }
                 self.positions["open"].append(position)
@@ -590,7 +602,7 @@ class CopyTrader:
                 # Deduct balance (non-fatal — must never break trading)
                 try:
                     stats = self.positions["stats"]
-                    stats["balance"] = stats.get("balance", ALGO_STARTING_BALANCE) - BET_AMOUNT
+                    stats["balance"] = stats.get("balance", ALGO_STARTING_BALANCE) - self.bet_amount
                     stats.setdefault("balance_history", []).append({
                         "timestamp": trade_record["timestamp"],
                         "balance": stats["balance"],
@@ -811,6 +823,7 @@ class CopyTrader:
             "dry_run": self.dry_run,
             "balance": balance,
             "balance_history": balance_history,
+            "bet_amount": self.bet_amount,
         }
 
     def print_stats(self):

@@ -492,6 +492,155 @@
             );
         };
 
+        // Algo Settings Component - Trade Amount & Opening Balance controls
+        const AlgoSettings = ({ copyTrader, fetchData, setError }) => {
+            const [isOpen, setIsOpen] = useState(false);
+            const [betAmount, setBetAmount] = useState('');
+            const [startingBalance, setStartingBalance] = useState('');
+            const [saving, setSaving] = useState(false);
+            const [saveMsg, setSaveMsg] = useState('');
+
+            // Sync inputs with live data when panel opens
+            useEffect(() => {
+                if (isOpen) {
+                    setBetAmount(String(copyTrader.bet_amount || 2));
+                    setStartingBalance('');
+                    setSaveMsg('');
+                }
+            }, [isOpen]);
+
+            const handleSave = async () => {
+                setSaving(true);
+                setSaveMsg('');
+                try {
+                    const body = {};
+                    const amt = parseFloat(betAmount);
+                    if (!isNaN(amt) && amt > 0 && amt !== copyTrader.bet_amount) {
+                        body.bet_amount = amt;
+                    }
+                    const bal = parseFloat(startingBalance);
+                    if (!isNaN(bal) && bal > 0) {
+                        body.starting_balance = bal;
+                    }
+
+                    if (Object.keys(body).length === 0) {
+                        setSaveMsg('No changes to save.');
+                        setSaving(false);
+                        return;
+                    }
+
+                    const resp = await fetch('/api/copy-trader/settings', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(body),
+                    });
+                    const result = await resp.json();
+                    if (result.success) {
+                        setSaveMsg('Saved! ' + result.changes.join(', '));
+                        setStartingBalance('');
+                        fetchData();
+                    } else {
+                        setSaveMsg(result.error || 'Save failed');
+                    }
+                } catch (e) {
+                    setSaveMsg('Error: ' + e.message);
+                }
+                setSaving(false);
+            };
+
+            return (
+                <div className="mt-4 border-t border-slate-700 pt-4">
+                    <button
+                        onClick={() => setIsOpen(!isOpen)}
+                        className="flex items-center justify-between w-full text-sm text-slate-400 hover:text-slate-300"
+                    >
+                        <span className="font-medium">Settings</span>
+                        <span className="text-xs">{isOpen ? '\u25B2' : '\u25BC'}</span>
+                    </button>
+
+                    {isOpen && (
+                        <div className="mt-3 space-y-3">
+                            {/* Trade Amount */}
+                            <div>
+                                <label className="text-xs text-slate-400 block mb-1">
+                                    Trade Amount ($)
+                                    <span className="text-slate-500 ml-1">- applies to new trades only</span>
+                                </label>
+                                <input
+                                    type="number"
+                                    min="0.5"
+                                    step="0.5"
+                                    value={betAmount}
+                                    onChange={(e) => setBetAmount(e.target.value)}
+                                    className="w-full bg-slate-700/50 border border-slate-600 rounded-lg px-3 py-2 text-sm text-white font-mono focus:outline-none focus:border-cyan-500"
+                                    placeholder="2.00"
+                                />
+                            </div>
+
+                            {/* Opening Balance */}
+                            <div>
+                                <label className="text-xs text-slate-400 block mb-1">
+                                    Set Balance ($)
+                                    <span className="text-slate-500 ml-1">- resets balance history</span>
+                                </label>
+                                <input
+                                    type="number"
+                                    min="1"
+                                    step="1"
+                                    value={startingBalance}
+                                    onChange={(e) => setStartingBalance(e.target.value)}
+                                    className="w-full bg-slate-700/50 border border-slate-600 rounded-lg px-3 py-2 text-sm text-white font-mono focus:outline-none focus:border-cyan-500"
+                                    placeholder={`Current: $${(copyTrader.balance || 500).toFixed(2)}`}
+                                />
+                            </div>
+
+                            {/* Save button */}
+                            <button
+                                onClick={handleSave}
+                                disabled={saving || !copyTrader.running}
+                                className={`w-full py-2 rounded-lg text-sm font-medium transition-all ${
+                                    !copyTrader.running
+                                        ? 'bg-slate-700 text-slate-500 cursor-not-allowed'
+                                        : saving
+                                            ? 'bg-cyan-500/20 text-cyan-300 cursor-wait'
+                                            : 'bg-cyan-500/20 text-cyan-400 border border-cyan-500/30 hover:bg-cyan-500/30'
+                                }`}
+                            >
+                                {!copyTrader.running ? 'Start Algo to change settings' : saving ? 'Saving...' : 'Save Settings'}
+                            </button>
+
+                            {/* Feedback message */}
+                            {saveMsg && (
+                                <p className={`text-xs ${saveMsg.startsWith('Saved') ? 'text-green-400' : 'text-yellow-400'}`}>
+                                    {saveMsg}
+                                </p>
+                            )}
+
+                            {/* Quick presets */}
+                            {copyTrader.running && (
+                                <div className="flex gap-2">
+                                    <span className="text-xs text-slate-500 self-center">Quick:</span>
+                                    {[2, 5, 10, 25].map(amt => (
+                                        <button
+                                            key={amt}
+                                            onClick={() => setBetAmount(String(amt))}
+                                            className={`px-2 py-1 text-xs rounded border transition-all ${
+                                                parseFloat(betAmount) === amt
+                                                    ? 'bg-cyan-500/20 text-cyan-400 border-cyan-500/30'
+                                                    : 'bg-slate-700/50 text-slate-400 border-slate-600 hover:border-slate-500'
+                                            }`}
+                                        >
+                                            ${amt}
+                                        </button>
+                                    ))}
+                                </div>
+                            )}
+                        </div>
+                    )}
+                </div>
+            );
+        };
+
         // Main Dashboard
         function HFTDashboard() {
             const [data, setData] = useState(null);
@@ -797,24 +946,51 @@
                                     </h2>
                                     <div className="flex items-center gap-2">
                                         <span className={`px-2 py-0.5 text-xs rounded border ${
-                                            copyTrader.running
-                                                ? 'bg-green-500/20 text-green-400 border-green-500/30'
-                                                : 'bg-slate-500/20 text-slate-400 border-slate-500/30'
+                                            copyTrader.paused
+                                                ? 'bg-yellow-500/20 text-yellow-400 border-yellow-500/30'
+                                                : copyTrader.running
+                                                    ? 'bg-green-500/20 text-green-400 border-green-500/30'
+                                                    : 'bg-slate-500/20 text-slate-400 border-slate-500/30'
                                         }`}>
-                                            {copyTrader.running ? 'RUNNING' : 'STOPPED'}
+                                            {copyTrader.paused ? 'PAUSED' : copyTrader.running ? 'RUNNING' : 'STOPPED'}
                                         </span>
                                         {copyTrader.running ? (
-                                            <button
-                                                onClick={async () => {
-                                                    try {
-                                                        await fetch('/api/copy-trader/stop', { method: 'POST' });
-                                                        fetchData();
-                                                    } catch (e) { console.error(e); }
-                                                }}
-                                                className="px-3 py-1 text-xs rounded bg-red-500/20 text-red-400 border border-red-500/30 hover:bg-red-500/30"
-                                            >
-                                                Stop
-                                            </button>
+                                            <React.Fragment>
+                                                {/* Pause / Resume button */}
+                                                <button
+                                                    onClick={async () => {
+                                                        try {
+                                                            const endpoint = copyTrader.paused
+                                                                ? '/api/copy-trader/resume'
+                                                                : '/api/copy-trader/pause';
+                                                            await fetch(endpoint, { method: 'POST' });
+                                                            fetchData();
+                                                        } catch (e) { console.error(e); }
+                                                    }}
+                                                    className={`px-3 py-1 text-xs rounded border ${
+                                                        copyTrader.paused
+                                                            ? 'bg-green-500/20 text-green-400 border-green-500/30 hover:bg-green-500/30'
+                                                            : 'bg-yellow-500/20 text-yellow-400 border-yellow-500/30 hover:bg-yellow-500/30'
+                                                    }`}
+                                                    title={copyTrader.paused
+                                                        ? 'Resume looking for new trades'
+                                                        : 'Stop new trades but keep resolving open positions'}
+                                                >
+                                                    {copyTrader.paused ? 'Resume' : 'Pause'}
+                                                </button>
+                                                {/* Stop button */}
+                                                <button
+                                                    onClick={async () => {
+                                                        try {
+                                                            await fetch('/api/copy-trader/stop', { method: 'POST' });
+                                                            fetchData();
+                                                        } catch (e) { console.error(e); }
+                                                    }}
+                                                    className="px-3 py-1 text-xs rounded bg-red-500/20 text-red-400 border border-red-500/30 hover:bg-red-500/30"
+                                                >
+                                                    Stop
+                                                </button>
+                                            </React.Fragment>
                                         ) : (
                                             <button
                                                 onClick={async () => {
@@ -835,15 +1011,32 @@
                                     </div>
                                 </div>
 
+                                {/* Paused banner */}
+                                {copyTrader.paused && (
+                                    <div className="mb-4 p-3 rounded-lg bg-yellow-500/10 border border-yellow-500/30 text-yellow-400 text-xs">
+                                        Paused - No new trades. Resolution engine still running for {copyTrader.open_positions || 0} open position(s).
+                                    </div>
+                                )}
+
                                 {/* Balance Hero */}
                                 <div className="mb-4 p-4 rounded-xl bg-gradient-to-r from-cyan-900/30 to-blue-900/30 border border-cyan-500/20">
-                                    <p className="text-xs text-slate-400 mb-1">Balance</p>
-                                    <p className={`text-3xl font-bold font-mono ${(copyTrader.balance || 500) >= 500 ? 'text-green-400' : 'text-red-400'}`}>
-                                        ${(copyTrader.balance || 500).toFixed(2)}
-                                    </p>
-                                    <p className={`text-sm font-mono mt-1 ${(copyTrader.total_pnl || 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-                                        {(copyTrader.total_pnl || 0) >= 0 ? '+' : ''}{(copyTrader.total_pnl || 0).toFixed(2)} all time
-                                    </p>
+                                    <div className="flex items-center justify-between">
+                                        <div>
+                                            <p className="text-xs text-slate-400 mb-1">Balance</p>
+                                            <p className={`text-3xl font-bold font-mono ${(copyTrader.balance || 500) >= 500 ? 'text-green-400' : 'text-red-400'}`}>
+                                                ${(copyTrader.balance || 500).toFixed(2)}
+                                            </p>
+                                            <p className={`text-sm font-mono mt-1 ${(copyTrader.total_pnl || 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                                                {(copyTrader.total_pnl || 0) >= 0 ? '+' : ''}{(copyTrader.total_pnl || 0).toFixed(2)} all time
+                                            </p>
+                                        </div>
+                                        <div className="text-right">
+                                            <p className="text-xs text-slate-400 mb-1">Trade Size</p>
+                                            <p className="text-xl font-bold font-mono text-cyan-400">
+                                                ${(copyTrader.bet_amount || 2).toFixed(2)}
+                                            </p>
+                                        </div>
+                                    </div>
                                 </div>
 
                                 {/* Balance Chart */}
@@ -902,6 +1095,13 @@
                                         Click Start to begin algo trading on crypto markets.
                                     </p>
                                 )}
+
+                                {/* Settings Panel */}
+                                <AlgoSettings
+                                    copyTrader={copyTrader}
+                                    fetchData={fetchData}
+                                    setError={setError}
+                                />
                             </div>
 
                             {/* Latency Metrics */}

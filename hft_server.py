@@ -114,6 +114,7 @@ except ImportError:
 copy_trader: Optional["CopyTrader"] = None
 copy_trader_thread: Optional[threading.Thread] = None
 stop_copy_trader = threading.Event()
+copy_trader_paused = threading.Event()  # When set, skip new trades but keep resolution running
 copy_trades: deque = deque(maxlen=100)  # Copy trader trade history
 
 
@@ -1542,11 +1543,14 @@ def copy_trader_loop():
 
     while not stop_copy_trader.is_set():
         try:
-            copied = copy_trader.check_and_copy()
-            if copied > 0:
-                print(f"[ALGO] Copied {copied} trade(s)", flush=True)
+            # Only check for new trades if NOT paused
+            if not copy_trader_paused.is_set():
+                copied = copy_trader.check_and_copy()
+                if copied > 0:
+                    print(f"[ALGO] Copied {copied} trade(s)", flush=True)
 
-            # Check for resolved positions (updates win/loss tracking)
+            # ALWAYS check resolutions (even when paused) - this is the key behavior
+            # Paused = no new trades, but open positions still resolve
             copy_trader.check_resolutions()
         except Exception as e:
             print(f"[ALGO] Error in loop: {e}", flush=True)
@@ -1559,7 +1563,7 @@ def copy_trader_loop():
 @app.route('/api/copy-trader/start', methods=['POST'])
 def api_copy_trader_start():
     """Start copy trading"""
-    global copy_trader, copy_trader_thread, stop_copy_trader
+    global copy_trader, copy_trader_thread, stop_copy_trader, copy_trader_paused
 
     if not HAS_COPY_TRADER:
         return jsonify({"error": "Poly Algo module not available"}), 400
@@ -1570,6 +1574,8 @@ def api_copy_trader_start():
     data = request.get_json() or {}
     live_mode = data.get('live', False)
     crypto_only = data.get('crypto_only', True)
+    bet_amount = data.get('bet_amount')
+    starting_balance = data.get('starting_balance')
 
     # Require confirmation for live mode
     if live_mode and not data.get('confirm_live'):
@@ -1578,16 +1584,19 @@ def api_copy_trader_start():
             "message": "Set confirm_live=true to enable live algo trading"
         }), 403
 
-    # Create copy trader with dashboard callback
+    # Create copy trader with dashboard callback and optional overrides
     copy_trader = CopyTrader(
         dry_run=not live_mode,
         crypto_only=crypto_only,
-        on_trade=on_copy_trade
+        on_trade=on_copy_trade,
+        bet_amount=bet_amount,
+        starting_balance=starting_balance,
     )
     copy_trader.start()
 
     # Start background thread
     stop_copy_trader.clear()
+    copy_trader_paused.clear()  # Start in active (not paused) state
     copy_trader_thread = threading.Thread(target=copy_trader_loop, daemon=True)
     copy_trader_thread.start()
 
@@ -1602,12 +1611,13 @@ def api_copy_trader_start():
 @app.route('/api/copy-trader/stop', methods=['POST'])
 def api_copy_trader_stop():
     """Stop copy trading"""
-    global copy_trader, copy_trader_thread, stop_copy_trader
+    global copy_trader, copy_trader_thread, stop_copy_trader, copy_trader_paused
 
     if not copy_trader_thread or not copy_trader_thread.is_alive():
         return jsonify({"error": "Poly Algo not running"}), 400
 
     stop_copy_trader.set()
+    copy_trader_paused.clear()
     copy_trader_thread.join(timeout=5)
 
     stats = {
@@ -1622,6 +1632,116 @@ def api_copy_trader_stop():
         "success": True,
         "message": "Poly Algo stopped",
         "stats": stats
+    })
+
+
+@app.route('/api/copy-trader/pause', methods=['POST'])
+def api_copy_trader_pause():
+    """Pause copy trading - stops new trades but keeps resolution engine running"""
+    global copy_trader_paused
+
+    if not copy_trader_thread or not copy_trader_thread.is_alive():
+        return jsonify({"error": "Poly Algo not running"}), 400
+
+    if copy_trader_paused.is_set():
+        return jsonify({"error": "Already paused"}), 400
+
+    copy_trader_paused.set()
+    open_count = len(copy_trader.positions.get("open", [])) if copy_trader else 0
+    print(f"[ALGO] PAUSED - No new trades. Resolution engine still running for {open_count} open positions.", flush=True)
+
+    return jsonify({
+        "success": True,
+        "message": f"Paused. Resolution engine running for {open_count} open position(s).",
+        "open_positions": open_count,
+    })
+
+
+@app.route('/api/copy-trader/resume', methods=['POST'])
+def api_copy_trader_resume():
+    """Resume copy trading - start looking for new trades again"""
+    global copy_trader_paused
+
+    if not copy_trader_thread or not copy_trader_thread.is_alive():
+        return jsonify({"error": "Poly Algo not running"}), 400
+
+    if not copy_trader_paused.is_set():
+        return jsonify({"error": "Not paused"}), 400
+
+    copy_trader_paused.clear()
+    print(f"[ALGO] RESUMED - Now looking for new trades again.", flush=True)
+
+    return jsonify({
+        "success": True,
+        "message": "Resumed. Now looking for new trades.",
+    })
+
+
+@app.route('/api/copy-trader/settings', methods=['GET'])
+def api_copy_trader_settings_get():
+    """Get current copy trader settings"""
+    from copy_trader import BET_AMOUNT as DEFAULT_BET_AMOUNT, ALGO_STARTING_BALANCE
+
+    current_bet_amount = copy_trader.bet_amount if copy_trader else DEFAULT_BET_AMOUNT
+    current_balance = (copy_trader.positions.get("stats", {}).get("balance", ALGO_STARTING_BALANCE)
+                       if copy_trader else ALGO_STARTING_BALANCE)
+
+    return jsonify({
+        "bet_amount": current_bet_amount,
+        "balance": current_balance,
+        "default_bet_amount": DEFAULT_BET_AMOUNT,
+        "default_starting_balance": ALGO_STARTING_BALANCE,
+        "is_paused": copy_trader_paused.is_set(),
+        "is_running": copy_trader_thread is not None and copy_trader_thread.is_alive(),
+    })
+
+
+@app.route('/api/copy-trader/settings', methods=['POST'])
+def api_copy_trader_settings_update():
+    """Update copy trader settings at runtime.
+    Changes take effect immediately - new trades will use the new bet amount.
+    Opening balance resets the balance tracking."""
+    if not copy_trader:
+        return jsonify({"error": "Poly Algo not running. Start it first."}), 400
+
+    data = request.get_json() or {}
+    changes = []
+
+    # Update bet amount
+    if 'bet_amount' in data:
+        new_amount = float(data['bet_amount'])
+        if new_amount <= 0:
+            return jsonify({"error": "Bet amount must be positive"}), 400
+        old_amount = copy_trader.bet_amount
+        copy_trader.bet_amount = new_amount
+        changes.append(f"Bet amount: ${old_amount:.2f} -> ${new_amount:.2f}")
+        print(f"[ALGO] Bet amount changed: ${old_amount:.2f} -> ${new_amount:.2f}", flush=True)
+
+    # Update opening balance (resets balance tracking)
+    if 'starting_balance' in data:
+        new_balance = float(data['starting_balance'])
+        if new_balance <= 0:
+            return jsonify({"error": "Starting balance must be positive"}), 400
+        old_balance = copy_trader.positions["stats"].get("balance", 500)
+        copy_trader.positions["stats"]["balance"] = new_balance
+        copy_trader.positions["stats"]["balance_history"] = [
+            {"timestamp": datetime.now(timezone.utc).isoformat(), "balance": new_balance, "event": "reset"}
+        ]
+        from copy_trader import save_positions
+        save_positions(copy_trader.positions)
+        changes.append(f"Balance reset: ${old_balance:.2f} -> ${new_balance:.2f}")
+        print(f"[ALGO] Balance reset: ${old_balance:.2f} -> ${new_balance:.2f}", flush=True)
+
+    if not changes:
+        return jsonify({"error": "No settings provided. Send bet_amount and/or starting_balance."}), 400
+
+    return jsonify({
+        "success": True,
+        "changes": changes,
+        "current": {
+            "bet_amount": copy_trader.bet_amount,
+            "balance": copy_trader.positions["stats"]["balance"],
+        }
     })
 
 
@@ -1640,6 +1760,7 @@ def api_copy_trader_status():
     status = {
         "available": True,
         "running": running,
+        "paused": copy_trader_paused.is_set() if running else False,
         "target_address": TARGET_ADDRESS,
     }
 
@@ -1651,6 +1772,7 @@ def api_copy_trader_status():
             "trades_copied": copy_trader.trades_copied,
             "trades_skipped": copy_trader.trades_skipped,
             "total_spent": copy_trader.total_spent,
+            "bet_amount": copy_trader.bet_amount,
         })
 
     return jsonify(status)
@@ -1972,6 +2094,7 @@ def api_data():
         },
         "copy_trader": {
             "running": copy_trader_thread and copy_trader_thread.is_alive(),
+            "paused": copy_trader_paused.is_set() if (copy_trader_thread and copy_trader_thread.is_alive()) else False,
             "target": TARGET_ADDRESS[:20] + "..." if TARGET_ADDRESS else "",
             "target_name": copy_trader.target_name if copy_trader else "",
             **(copy_trader.get_stats() if copy_trader else {
@@ -1987,6 +2110,7 @@ def api_data():
                 "total_pnl": 0,
                 "balance": 500.0,
                 "balance_history": [],
+                "bet_amount": 2.0,
             }),
         },
         "trades_by_engine": {
