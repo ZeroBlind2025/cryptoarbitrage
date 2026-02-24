@@ -703,6 +703,26 @@ class CopyTrader:
             if not token_id and not condition_id and not slug:
                 continue
 
+            # Don't check resolution until position is old enough
+            # Short-term crypto markets need time to settle:
+            # - Market window must end (5-15 min)
+            # - Blockchain updates redeemable flag for winners
+            # - Gamma API updates outcome prices
+            # 20 minutes is safe for 5-15 min markets
+            MIN_AGE_SECONDS = 20 * 60  # 20 minutes
+            position_ts = position.get("timestamp", "")
+            if position_ts:
+                try:
+                    from dateutil.parser import parse as parse_date
+                    pos_dt = parse_date(position_ts)
+                    if pos_dt.tzinfo is None:
+                        pos_dt = pos_dt.replace(tzinfo=timezone.utc)
+                    age_seconds = (datetime.now(timezone.utc) - pos_dt).total_seconds()
+                    if age_seconds < MIN_AGE_SECONDS:
+                        continue  # Too young, skip
+                except Exception:
+                    pass
+
             result = get_market_resolution(
                 condition_id=condition_id,
                 slug=slug,
