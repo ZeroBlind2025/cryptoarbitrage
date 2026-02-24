@@ -138,8 +138,10 @@ def check_target_position(token_id: str) -> Optional[dict]:
                     size = float(pos.get("size", 0))
                     print(f"[ALGO] Target position: redeemable={redeemable}, curPrice={cur_price}, size={size}")
 
-                    if redeemable and size > 0:
-                        # Definitive WIN - can redeem for $1
+                    if redeemable:
+                        # Definitive WIN - blockchain says redeemable
+                        # Don't gate on size>0: if target already redeemed (size=0),
+                        # the position was still a WIN
                         return {"resolved": True, "won": True}
                     else:
                         # NOT redeemable - could be active market OR lost
@@ -202,57 +204,89 @@ def get_market_resolution(condition_id: str = "", slug: str = "", token_id: str 
             end_date = market.get("endDateIso") or market.get("end_date_iso")
             print(f"[ALGO] Market closed={closed}, resolved={resolved_flag}, endDate={end_date}")
 
-            # Determine if market has definitively ended
-            market_ended = bool(closed or resolved_flag)
+            # Determine if market has OFFICIALLY resolved
+            # closed/resolved from gamma = oracle determined the outcome
+            officially_resolved = bool(closed or resolved_flag)
 
-            # Also check end date - critical for short-term crypto markets
-            # where gamma API may not update closed/resolved promptly
-            if not market_ended and end_date:
+            # Check outcome prices for a clear winner (independent signal)
+            outcomes = market.get("outcomes", [])
+            outcome_prices = market.get("outcomePrices", [])
+            print(f"[ALGO] outcomes={outcomes}, prices={outcome_prices}")
+
+            winning_outcome_from_prices = None
+            winning_index_from_prices = None
+            if len(outcomes) == 2 and len(outcome_prices) == 2:
+                for i, price in enumerate(outcome_prices):
+                    try:
+                        if float(price) >= 0.99 and i < len(outcomes):
+                            winning_outcome_from_prices = outcomes[i]
+                            winning_index_from_prices = i
+                            break
+                    except (ValueError, TypeError):
+                        continue
+
+            # Check end date separately — passing does NOT mean resolved,
+            # it means the observation window closed. The oracle still needs
+            # time to determine the winner and update redeemable flags.
+            end_date_passed = False
+            minutes_since_end = 0
+            if end_date:
                 try:
                     from dateutil.parser import parse as parse_date
                     end_dt = parse_date(end_date)
                     if end_dt.tzinfo is None:
                         end_dt = end_dt.replace(tzinfo=timezone.utc)
-                    if datetime.now(timezone.utc) > end_dt:
-                        market_ended = True
-                        print(f"[ALGO] Market end date passed: {end_date}")
+                    minutes_since_end = (datetime.now(timezone.utc) - end_dt).total_seconds() / 60
+                    end_date_passed = minutes_since_end > 0
                 except Exception as e:
                     print(f"[ALGO] Could not parse end date: {e}")
 
-            if market_ended:
-                # Market has ended - now we can determine win/loss
+            # RESOLUTION LOGIC (ordered by confidence):
 
-                # If we have target position data showing not redeemable, it's a LOSS
+            # 1. Outcome prices show a clear winner → resolve immediately
+            if winning_outcome_from_prices:
+                print(f"[ALGO] Clear winner from prices: {winning_outcome_from_prices}")
+                return {
+                    "resolved": True,
+                    "winning_outcome": winning_outcome_from_prices,
+                    "winning_index": winning_index_from_prices,
+                }
+
+            # 2. Officially resolved (closed/resolved flag) → use target position
+            if officially_resolved:
                 if target_result and not target_result.get("redeemable", True):
-                    print(f"[ALGO] Market ended + not redeemable = LOSS")
+                    print(f"[ALGO] Officially resolved + not redeemable = LOSS")
                     return {
                         "resolved": True,
                         "our_token_won": False,
                         "winning_outcome": None,
                         "winning_index": None,
                     }
-
-                # Try gamma outcome prices to determine winner
-                outcomes = market.get("outcomes", [])
-                outcome_prices = market.get("outcomePrices", [])
-                print(f"[ALGO] outcomes={outcomes}, prices={outcome_prices}")
-
-                if len(outcomes) == 2 and len(outcome_prices) == 2:
-                    for i, price in enumerate(outcome_prices):
-                        try:
-                            if float(price) >= 0.99 and i < len(outcomes):
-                                return {
-                                    "resolved": True,
-                                    "winning_outcome": outcomes[i],
-                                    "winning_index": i,
-                                }
-                        except (ValueError, TypeError):
-                            continue
-
-                # Market ended but can't determine winner - resolve as unknown
+                # Resolved but can't determine winner
                 return {"resolved": True, "winning_outcome": None, "winning_index": None}
-            else:
-                print(f"[ALGO] Market still active")
+
+            # 3. End date passed but NOT officially resolved yet
+            if end_date_passed:
+                if minutes_since_end < 45:
+                    # Wait for oracle — don't declare LOSS prematurely
+                    # The oracle/blockchain needs time to update redeemable flags
+                    print(f"[ALGO] End date passed {minutes_since_end:.0f}m ago, waiting for official resolution (need 45m)")
+                    return {"resolved": False}
+                else:
+                    # 45+ minutes past end date — force resolve
+                    # Oracle should have updated by now
+                    print(f"[ALGO] End date passed {minutes_since_end:.0f}m ago, force-resolving")
+                    if target_result and not target_result.get("redeemable", True):
+                        print(f"[ALGO] Force: not redeemable = LOSS")
+                        return {
+                            "resolved": True,
+                            "our_token_won": False,
+                            "winning_outcome": None,
+                            "winning_index": None,
+                        }
+                    return {"resolved": True, "winning_outcome": None, "winning_index": None}
+
+            print(f"[ALGO] Market still active")
 
         return {"resolved": False}
 
@@ -329,6 +363,8 @@ def is_crypto_market(bet: dict) -> bool:
     # Also check for specific crypto keywords and timeframes (15, 30, 60 min)
     crypto_keywords = [
         "bitcoin", "ethereum", "solana", "xrp",
+        "btc", "eth",  # Short ticker symbols (activity API may use these in titles)
+        "crypto", "updown",
         "15m", "15-min", "15 min",
         "30m", "30-min", "30 min",
         "60m", "60-min", "60 min", "1h", "1-hour", "1 hour"
@@ -545,11 +581,14 @@ class CopyTrader:
 
             # Also check our LOCAL open positions to prevent duplicates
             # (critical for dry-run mode and when on-chain data is delayed)
+            # Only check if condition_id is non-empty — empty string would
+            # match ALL positions with missing condition_id, blocking everything
             already_tracking = False
-            for open_pos in self.positions.get("open", []):
-                if open_pos.get("condition_id") == condition_id:
-                    already_tracking = True
-                    break
+            if condition_id:
+                for open_pos in self.positions.get("open", []):
+                    if open_pos.get("condition_id") == condition_id:
+                        already_tracking = True
+                        break
             if already_tracking:
                 print(f"[ALGO] Skip (already tracking): {title}")
                 self.trades_skipped += 1
