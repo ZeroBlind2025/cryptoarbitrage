@@ -115,15 +115,13 @@ def save_positions(positions: dict):
 
 
 def check_target_position(token_id: str) -> Optional[dict]:
-    """Check target trader's position status for this token.
-
-    redeemable=True is a definitive WIN signal.
-    redeemable=False is INCONCLUSIVE - could be active or lost.
-    We return the raw data so the caller can combine with market status.
-    """
+    """Check target trader's position status for this token - ONLY trust redeemable field"""
     if not token_id:
         return None
     try:
+        # Check target trader's position to see if it's redeemable
+        # Redeemable = WON (can redeem for $1)
+        # NOT redeemable + market closed = LOST
         response = requests.get(
             f"{DATA_API}/positions",
             params={"user": TARGET_ADDRESS, "asset": token_id},
@@ -132,19 +130,19 @@ def check_target_position(token_id: str) -> Optional[dict]:
         if response.status_code == 200:
             positions = response.json()
             for pos in positions:
+                # Check if this is the right token
                 if str(pos.get("asset")) == str(token_id):
                     redeemable = pos.get("redeemable", False)
                     cur_price = float(pos.get("curPrice", 0.5))
                     size = float(pos.get("size", 0))
                     print(f"[ALGO] Target position: redeemable={redeemable}, curPrice={cur_price}, size={size}")
 
+                    # ONLY trust redeemable flag - price can be misleading
                     if redeemable and size > 0:
-                        # Definitive WIN - can redeem for $1
                         return {"resolved": True, "won": True}
-                    else:
-                        # NOT redeemable - could be active market OR lost
-                        # Return data so caller can combine with market end time
-                        return {"resolved": False, "redeemable": False, "cur_price": cur_price, "size": size}
+                    elif not redeemable and (cur_price >= 0.99 or cur_price <= 0.01):
+                        # Market resolved (extreme price) but not redeemable = lost
+                        return {"resolved": True, "won": False}
         return None
     except Exception as e:
         print(f"[ALGO] Target position check error: {e}")
@@ -152,31 +150,25 @@ def check_target_position(token_id: str) -> Optional[dict]:
 
 
 def get_market_resolution(condition_id: str = "", slug: str = "", token_id: str = "", our_outcome: str = "") -> Optional[dict]:
-    """Check if a market has resolved and get the winning outcome.
-
-    Strategy:
-    1. Check target position - redeemable=True is a definitive WIN
-    2. Check gamma API for market closed/resolved/expired status
-    3. Only mark as LOSS when market is CONFIRMED ended AND position not redeemable
-    """
+    """Check if a market has resolved and get the winning outcome"""
     try:
         print(f"[ALGO] Checking resolution: token={token_id[:20] if token_id else 'none'}... cid={condition_id[:20] if condition_id else 'none'}...")
 
-        # Step 1: Check target trader's position
-        target_result = None
+        # ONLY method that works: Check target trader's position redeemable status
+        # Token prices are unreliable (winners can show 0 due to no liquidity)
         if token_id:
             target_result = check_target_position(token_id)
             if target_result and target_result.get("resolved"):
-                # Definitive WIN from redeemable=True
-                print(f"[ALGO] Target position: WIN (redeemable)")
+                won = target_result.get("won")
+                print(f"[ALGO] Target position resolved: won={won}")
                 return {
                     "resolved": True,
-                    "our_token_won": True,
-                    "winning_outcome": our_outcome,
+                    "our_token_won": won,
+                    "winning_outcome": our_outcome if won else None,
                     "winning_index": None,
                 }
 
-        # Step 2: Check gamma API to see if market has ended
+        # Fallback: Try gamma API for market info
         params = {}
         if condition_id:
             params["condition_ids"] = condition_id
@@ -198,45 +190,16 @@ def get_market_resolution(condition_id: str = "", slug: str = "", token_id: str 
         if markets and len(markets) > 0:
             market = markets[0]
             closed = market.get("closed")
-            resolved_flag = market.get("resolved")
-            end_date = market.get("endDateIso") or market.get("end_date_iso")
-            print(f"[ALGO] Market closed={closed}, resolved={resolved_flag}, endDate={end_date}")
+            resolved = market.get("resolved")
+            print(f"[ALGO] Market closed={closed}, resolved={resolved}")
 
-            # Determine if market has definitively ended
-            market_ended = bool(closed or resolved_flag)
-
-            # Also check end date - critical for short-term crypto markets
-            # where gamma API may not update closed/resolved promptly
-            if not market_ended and end_date:
-                try:
-                    from dateutil.parser import parse as parse_date
-                    end_dt = parse_date(end_date)
-                    if end_dt.tzinfo is None:
-                        end_dt = end_dt.replace(tzinfo=timezone.utc)
-                    if datetime.now(timezone.utc) > end_dt:
-                        market_ended = True
-                        print(f"[ALGO] Market end date passed: {end_date}")
-                except Exception as e:
-                    print(f"[ALGO] Could not parse end date: {e}")
-
-            if market_ended:
-                # Market has ended - now we can determine win/loss
-
-                # If we have target position data showing not redeemable, it's a LOSS
-                if target_result and not target_result.get("redeemable", True):
-                    print(f"[ALGO] Market ended + not redeemable = LOSS")
-                    return {
-                        "resolved": True,
-                        "our_token_won": False,
-                        "winning_outcome": None,
-                        "winning_index": None,
-                    }
-
-                # Try gamma outcome prices to determine winner
+            # Check if resolved
+            if closed or resolved:
                 outcomes = market.get("outcomes", [])
                 outcome_prices = market.get("outcomePrices", [])
                 print(f"[ALGO] outcomes={outcomes}, prices={outcome_prices}")
 
+                # Only use gamma data if it looks valid (2 outcomes for binary market)
                 if len(outcomes) == 2 and len(outcome_prices) == 2:
                     for i, price in enumerate(outcome_prices):
                         try:
@@ -249,10 +212,8 @@ def get_market_resolution(condition_id: str = "", slug: str = "", token_id: str 
                         except (ValueError, TypeError):
                             continue
 
-                # Market ended but can't determine winner - resolve as unknown
+                # Market closed but can't determine winner reliably
                 return {"resolved": True, "winning_outcome": None, "winning_index": None}
-            else:
-                print(f"[ALGO] Market still active")
 
         return {"resolved": False}
 
@@ -539,19 +500,7 @@ class CopyTrader:
             outcome_index = bet.get("outcomeIndex") or bet.get("outcome_index") or 0
 
             if already_has_position(my_positions, condition_id, outcome_index):
-                print(f"[ALGO] Skip (already own on-chain): {title}")
-                self.trades_skipped += 1
-                continue
-
-            # Also check our LOCAL open positions to prevent duplicates
-            # (critical for dry-run mode and when on-chain data is delayed)
-            already_tracking = False
-            for open_pos in self.positions.get("open", []):
-                if open_pos.get("condition_id") == condition_id:
-                    already_tracking = True
-                    break
-            if already_tracking:
-                print(f"[ALGO] Skip (already tracking): {title}")
+                print(f"[ALGO] Skip (already own): {title}")
                 self.trades_skipped += 1
                 continue
 
@@ -618,19 +567,21 @@ class CopyTrader:
                 }
                 self.positions["open"].append(position)
 
-                # Deduct balance
-                stats = self.positions["stats"]
-                stats["balance"] = stats.get("balance", ALGO_STARTING_BALANCE) - BET_AMOUNT
-                now_ts = datetime.now(timezone.utc).isoformat()
-                stats.setdefault("balance_history", []).append({
-                    "timestamp": now_ts,
-                    "balance": stats["balance"],
-                    "event": "trade",
-                    "detail": f"{outcome} {title[:30]}"
-                })
+                # Deduct balance (non-fatal — must never break trading)
+                try:
+                    stats = self.positions["stats"]
+                    stats["balance"] = stats.get("balance", ALGO_STARTING_BALANCE) - BET_AMOUNT
+                    stats.setdefault("balance_history", []).append({
+                        "timestamp": trade_record["timestamp"],
+                        "balance": stats["balance"],
+                        "event": "trade",
+                        "detail": f"{outcome} {title[:30]}"
+                    })
+                except Exception:
+                    pass
 
                 save_positions(self.positions)
-                print(f"       Position saved. Potential payout: ${position['potential_payout']:.2f} | Balance: ${stats['balance']:.2f}")
+                print(f"       Position saved. Potential payout: ${position['potential_payout']:.2f} | Balance: ${self.positions['stats'].get('balance', 0):.2f}")
 
             # Call dashboard callback
             if self.on_trade:
@@ -702,26 +653,6 @@ class CopyTrader:
             # Need either token_id, condition_id, or slug to check resolution
             if not token_id and not condition_id and not slug:
                 continue
-
-            # Don't check resolution until position is old enough
-            # Short-term crypto markets need time to settle:
-            # - Market window must end (5-15 min)
-            # - Blockchain updates redeemable flag for winners
-            # - Gamma API updates outcome prices
-            # 20 minutes is safe for 5-15 min markets
-            MIN_AGE_SECONDS = 20 * 60  # 20 minutes
-            position_ts = position.get("timestamp", "")
-            if position_ts:
-                try:
-                    from dateutil.parser import parse as parse_date
-                    pos_dt = parse_date(position_ts)
-                    if pos_dt.tzinfo is None:
-                        pos_dt = pos_dt.replace(tzinfo=timezone.utc)
-                    age_seconds = (datetime.now(timezone.utc) - pos_dt).total_seconds()
-                    if age_seconds < MIN_AGE_SECONDS:
-                        continue  # Too young, skip
-                except Exception:
-                    pass
 
             result = get_market_resolution(
                 condition_id=condition_id,
@@ -806,16 +737,15 @@ class CopyTrader:
                         payout = amount / entry_price if entry_price > 0 else amount
                         bal += payout
                     stats["balance"] = bal
-                    now_ts = datetime.now(timezone.utc).isoformat()
                     event_type = "win" if won is True else "loss" if won is False else "resolved"
                     stats.setdefault("balance_history", []).append({
-                        "timestamp": now_ts,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
                         "balance": bal,
                         "event": event_type,
                         "detail": f"{position.get('outcome', '?')} {position.get('market', '?')[:30]}"
                     })
-                except Exception as e:
-                    print(f"[ALGO] Balance update error (non-fatal): {e}", flush=True)
+                except Exception:
+                    pass
 
                 # Move from open to resolved
                 position["resolved_at"] = datetime.now(timezone.utc).isoformat()
