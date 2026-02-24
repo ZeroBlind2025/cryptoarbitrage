@@ -120,7 +120,7 @@ copy_trades: deque = deque(maxlen=100)  # Copy trader trade history
 def on_copy_trade(trade_record: dict):
     """Callback when copy trader executes a trade"""
     copy_trades.append(trade_record)
-    print(f"[COPY] Trade recorded: {trade_record.get('market', '?')[:30]} - {trade_record.get('status', '?')}", flush=True)
+    print(f"[ALGO] Trade recorded: {trade_record.get('market', '?')[:30]} - {trade_record.get('status', '?')}", flush=True)
 
 
 # Sports WebSocket for real-time game data
@@ -1529,7 +1529,7 @@ def api_stop():
 
 
 # =============================================================================
-# COPY TRADER ENDPOINTS
+# POLY ALGO ENDPOINTS
 # =============================================================================
 
 def copy_trader_loop():
@@ -1538,22 +1538,22 @@ def copy_trader_loop():
     if not copy_trader:
         return
 
-    print(f"[COPY] Background monitoring started (every 10s)...", flush=True)
+    print(f"[ALGO] Background monitoring started (every 10s)...", flush=True)
 
     while not stop_copy_trader.is_set():
         try:
             copied = copy_trader.check_and_copy()
             if copied > 0:
-                print(f"[COPY] Copied {copied} trade(s)", flush=True)
+                print(f"[ALGO] Copied {copied} trade(s)", flush=True)
 
             # Check for resolved positions (updates win/loss tracking)
             copy_trader.check_resolutions()
         except Exception as e:
-            print(f"[COPY] Error in loop: {e}", flush=True)
+            print(f"[ALGO] Error in loop: {e}", flush=True)
 
         stop_copy_trader.wait(timeout=10)  # Check every 10 seconds
 
-    print("[COPY] Background monitoring stopped", flush=True)
+    print("[ALGO] Background monitoring stopped", flush=True)
 
 
 @app.route('/api/copy-trader/start', methods=['POST'])
@@ -1562,10 +1562,10 @@ def api_copy_trader_start():
     global copy_trader, copy_trader_thread, stop_copy_trader
 
     if not HAS_COPY_TRADER:
-        return jsonify({"error": "Copy trader module not available"}), 400
+        return jsonify({"error": "Poly Algo module not available"}), 400
 
     if copy_trader_thread and copy_trader_thread.is_alive():
-        return jsonify({"error": "Copy trader already running"}), 400
+        return jsonify({"error": "Poly Algo already running"}), 400
 
     data = request.get_json() or {}
     live_mode = data.get('live', False)
@@ -1575,7 +1575,7 @@ def api_copy_trader_start():
     if live_mode and not data.get('confirm_live'):
         return jsonify({
             "error": "Live mode requires confirmation",
-            "message": "Set confirm_live=true to enable live copy trading"
+            "message": "Set confirm_live=true to enable live algo trading"
         }), 403
 
     # Create copy trader with dashboard callback
@@ -1594,7 +1594,7 @@ def api_copy_trader_start():
     mode_str = "LIVE" if live_mode else "DRY RUN"
     return jsonify({
         "success": True,
-        "message": f"Copy trader started in {mode_str} mode, following {copy_trader.target_name}",
+        "message": f"Poly Algo started in {mode_str} mode, following {copy_trader.target_name}",
         "target": TARGET_ADDRESS,
     })
 
@@ -1605,7 +1605,7 @@ def api_copy_trader_stop():
     global copy_trader, copy_trader_thread, stop_copy_trader
 
     if not copy_trader_thread or not copy_trader_thread.is_alive():
-        return jsonify({"error": "Copy trader not running"}), 400
+        return jsonify({"error": "Poly Algo not running"}), 400
 
     stop_copy_trader.set()
     copy_trader_thread.join(timeout=5)
@@ -1620,7 +1620,7 @@ def api_copy_trader_stop():
 
     return jsonify({
         "success": True,
-        "message": "Copy trader stopped",
+        "message": "Poly Algo stopped",
         "stats": stats
     })
 
@@ -1632,7 +1632,7 @@ def api_copy_trader_status():
         return jsonify({
             "available": False,
             "running": False,
-            "error": "Copy trader module not available"
+            "error": "Poly Algo module not available"
         })
 
     running = copy_trader_thread and copy_trader_thread.is_alive()
@@ -1961,6 +1961,8 @@ def api_data():
                 "losses": 0,
                 "win_rate": 0,
                 "total_pnl": 0,
+                "balance": 500.0,
+                "balance_history": [],
             }),
         },
         "trades_by_engine": {
