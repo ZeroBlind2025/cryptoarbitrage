@@ -56,7 +56,7 @@ SIGNATURE_TYPE = int(os.getenv("POLYMARKET_SIGNATURE_TYPE", "0"))  # 0=EOA, 1=Em
 # Trading settings
 BET_AMOUNT = float(os.getenv("COPY_BET_AMOUNT", "2.0"))  # $ per copied bet
 POLL_INTERVAL = int(os.getenv("COPY_POLL_INTERVAL", "10"))  # seconds between checks
-ALGO_STARTING_BALANCE = 500.0  # Starting balance for Poly Algo
+ALGO_STARTING_BALANCE = float(os.getenv("ALGO_STARTING_BALANCE", "2300.0"))  # Starting balance for Poly Algo
 
 # Crypto market filter - only copy trades on these markets
 CRYPTO_SLUGS = ["btc-", "eth-", "sol-", "xrp-", "-updown-"]
