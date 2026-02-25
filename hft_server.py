@@ -51,13 +51,7 @@ try:
 except ImportError:
     HAS_WS_SCANNER = False
     print("[HFT] WebSocket scanner not available, will use polling mode")
-from arb_engines import (
-    EngineType,
-    EngineSignal,
-    SumToOneConfig,
-    TailEndConfig,
-)
-from sports_ws import SportsWebSocket
+# Engines removed - app is now single-purpose (Poly Algo copy trader)
 
 # Note: Using direct API calls for market discovery instead of GammaScanner
 # to be more targeted (only crypto 15-min and live sports markets)
@@ -124,9 +118,8 @@ def on_copy_trade(trade_record: dict):
     print(f"[ALGO] Trade recorded: {trade_record.get('market', '?')[:30]} - {trade_record.get('status', '?')}", flush=True)
 
 
-# Sports WebSocket for real-time game data
-sports_ws: Optional[SportsWebSocket] = None
-live_sports_data: dict[str, dict] = {}  # event_id -> data from WebSocket
+# Sports data (no longer using WebSocket)
+live_sports_data: dict[str, dict] = {}
 
 
 # =============================================================================
@@ -144,9 +137,12 @@ def on_trade_callback(trade: Trade):
     log_trade(trade)
 
 
-def on_signal_callback(signal: EngineSignal):
-    """Handle detected signal from any engine"""
-    signal_history.append(signal.to_dict())
+def on_signal_callback(signal):
+    """Handle detected signal"""
+    if hasattr(signal, 'to_dict'):
+        signal_history.append(signal.to_dict())
+    else:
+        signal_history.append(signal)
 
 
 def log_trade(trade: Trade):
@@ -159,28 +155,6 @@ def log_trade(trade: Trade):
         f.write(json.dumps(trade.to_dict()) + "\n")
 
 
-def on_sports_update(data: dict):
-    """Handle real-time sports update from WebSocket"""
-    global live_sports_data
-    event_id = data.get("eventId") or data.get("event_id") or data.get("id") or data.get("gameId")
-    if event_id:
-        live_sports_data[event_id] = {
-            "data": data,
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-        }
-        # Log significant updates (score changes, period changes)
-        if data.get("type") in ["score", "period_change", "game_end"]:
-            print(f"[SPORTS WS] {data.get('type')}: {data}", flush=True)
-
-
-def on_sports_connect():
-    """Handle sports WebSocket connection"""
-    print("[SPORTS WS] Connected to real-time sports feed!", flush=True)
-
-
-def on_sports_disconnect():
-    """Handle sports WebSocket disconnection"""
-    print("[SPORTS WS] Disconnected from sports feed", flush=True)
 
 
 # =============================================================================
@@ -863,37 +837,19 @@ def parse_market_data(raw: dict) -> dict | None:
 def start_hft_scanner(
     mode: str,
     scan_interval_ms: int = 500,
-    enable_sum_to_one: bool = True,
-    enable_tail_end: bool = True,
-    use_websocket: bool = True,  # Default to WebSocket for real-time detection
+    use_websocket: bool = True,
 ):
-    """Start the HFT scanner with configurable engines
+    """Start the HFT scanner
 
     Args:
         mode: Trading mode ('demo' or 'live')
         scan_interval_ms: Polling interval (ignored in WebSocket mode)
-        enable_sum_to_one: Enable sum-to-one arbitrage engine
-        enable_tail_end: Enable tail-end arbitrage engine
         use_websocket: Use WebSocket for real-time price feeds (recommended)
     """
-    global hft_client, hft_scanner, active_markets, server_state, sports_ws
+    global hft_client, hft_scanner, active_markets, server_state
 
     if server_state["is_running"]:
         return False, "Scanner already running"
-
-    # Start Sports WebSocket for real-time game data
-    print("[HFT] Starting Sports WebSocket...", flush=True)
-    try:
-        sports_ws = SportsWebSocket(
-            on_update=on_sports_update,
-            on_connect=on_sports_connect,
-            on_disconnect=on_sports_disconnect,
-        )
-        sports_ws.start()
-        # Give it a moment to connect and receive initial data
-        time.sleep(2)
-    except Exception as e:
-        print(f"[HFT] Sports WebSocket error (continuing without): {e}", flush=True)
 
     # Discover markets first
     print("[HFT] Discovering markets...")
@@ -904,26 +860,6 @@ def start_hft_scanner(
 
     print(f"[HFT] Found {len(active_markets)} markets to monitor")
 
-    # Configure engines - execute on ANY price_sum < $1.00
-    sum_to_one_config = SumToOneConfig(
-        max_price_sum=1.0,        # Execute if total < $1.00
-        min_edge_after_fees=0.0,  # No minimum edge required
-        max_position_usd=100.0,
-    )
-
-    tail_end_config = TailEndConfig(
-        min_probability=0.90,       # 90% = execute
-        max_probability=1.0,        # No max
-        min_price=0.90,             # 90¢ = execute
-        max_price=1.0,              # No max
-        max_minutes_until_resolution=10000,  # Ignore time
-        min_minutes_until_resolution=0,      # Ignore time
-        min_volume_24h=0.0,         # No volume requirement for demo
-        max_position_usd=50.0,
-        min_risk_adjusted_ev=0.0,   # Disable EV filter - sports edge comes from game state, not market price
-        min_depth_usd=5.0,          # Lower depth requirement to catch more opportunities
-    )
-
     # Create HFT client
     config = HFTConfig.from_env()
     trading_mode = TradingMode.LIVE if mode == "live" else TradingMode.DEMO
@@ -931,17 +867,9 @@ def start_hft_scanner(
     hft_client = HFTClient(
         config,
         mode=trading_mode,
-        sum_to_one_config=sum_to_one_config,
-        tail_end_config=tail_end_config,
     )
     hft_client.on_trade(on_trade_callback)
     hft_client.on_signal(on_signal_callback)
-
-    # Enable/disable engines based on config
-    if not enable_sum_to_one:
-        hft_client.disable_engine(EngineType.SUM_TO_ONE)
-    if not enable_tail_end:
-        hft_client.disable_engine(EngineType.TAIL_END)
 
     # Create scanner - WebSocket (real-time) or Polling mode
     scanner_mode = "websocket" if use_websocket and HAS_WS_SCANNER else "polling"
@@ -978,13 +906,12 @@ def start_hft_scanner(
     server_state["is_running"] = True
     server_state["started_at"] = datetime.now(timezone.utc).isoformat()
 
-    enabled = hft_client.get_enabled_engines()
-    return True, f"Started in {mode} mode ({scanner_mode}) with {len(active_markets)} markets. Engines: {', '.join(enabled)}. Market refresh every {MARKET_REFRESH_INTERVAL_MINUTES}min."
+    return True, f"Started in {mode} mode ({scanner_mode}) with {len(active_markets)} markets. Market refresh every {MARKET_REFRESH_INTERVAL_MINUTES}min."
 
 
 def stop_hft_scanner():
     """Stop the HFT scanner"""
-    global hft_scanner, server_state, refresh_thread, stop_refresh, sports_ws
+    global hft_scanner, server_state, refresh_thread, stop_refresh
 
     if not server_state["is_running"]:
         return False, "Scanner not running"
@@ -993,13 +920,6 @@ def stop_hft_scanner():
     stop_refresh.set()
     if refresh_thread and refresh_thread.is_alive():
         refresh_thread.join(timeout=5)
-
-    # Stop sports WebSocket
-    if sports_ws:
-        try:
-            sports_ws.stop()
-        except:
-            pass
 
     if hft_scanner:
         hft_scanner.stop()
@@ -1081,9 +1001,7 @@ def api_start():
     data = request.get_json() or {}
     mode = data.get('mode', 'demo')
     scan_interval_ms = data.get('scan_interval_ms', 500)
-    enable_sum_to_one = data.get('enable_sum_to_one', True)
-    enable_tail_end = data.get('enable_tail_end', True)
-    use_websocket = data.get('use_websocket', True)  # Default to WebSocket mode
+    use_websocket = data.get('use_websocket', True)
 
     if mode == 'live':
         # Require explicit confirmation for live mode
@@ -1096,8 +1014,6 @@ def api_start():
     success, message = start_hft_scanner(
         mode,
         scan_interval_ms,
-        enable_sum_to_one=enable_sum_to_one,
-        enable_tail_end=enable_tail_end,
         use_websocket=use_websocket,
     )
 
@@ -1106,126 +1022,6 @@ def api_start():
     return jsonify({"error": message}), 400
 
 
-@app.route('/api/engines', methods=['GET'])
-def api_engines():
-    """Get engine status"""
-    if hft_client is None:
-        return jsonify({
-            "sum_to_one": {"enabled": True, "stats": {}},
-            "tail_end": {"enabled": True, "stats": {}},
-        })
-
-    stats = hft_client.engine_manager.get_stats()
-    return jsonify(stats)
-
-
-@app.route('/api/debug/sum-to-one')
-def api_debug_sum_to_one():
-    """Debug endpoint showing why sum-to-one signals aren't triggering"""
-    if hft_client is None:
-        return jsonify({"error": "Scanner not initialized"}), 400
-
-    s2o = hft_client.engine_manager.sum_to_one
-    return jsonify({
-        "sum_to_one_debug": {
-            "enabled": s2o.enabled,
-            "signals_generated": s2o.signals_generated,
-            "config": {
-                "max_price_sum": s2o.config.max_price_sum,
-                "fee_rate": s2o.config.fee_rate,
-                "min_edge_after_fees": s2o.config.min_edge_after_fees,
-                "min_depth_usd": s2o.config.min_depth_usd,
-                "crypto_15min_only": s2o.config.crypto_15min_only,
-            },
-            "rejection_counts": {
-                "not_crypto_15min": s2o.debug_not_crypto,
-                "missing_asks_ORDERBOOK_FAILED": s2o.debug_missing_asks,
-                "price_sum_too_high_gte_1": s2o.debug_price_sum_high,
-                "edge_too_low_after_fees": s2o.debug_low_edge,
-                "depth_too_low": s2o.debug_low_depth,
-                "crypto_markets_checked": s2o.debug_markets_checked,
-                "PASSED_ALL_CHECKS": s2o.debug_passed,
-            },
-            "best_price_sum_seen": round(s2o.debug_best_price_sum, 4),
-            "interpretation": _interpret_s2o_stats(s2o),
-        }
-    })
-
-
-def _interpret_s2o_stats(s2o) -> str:
-    """Interpret sum-to-one debug stats"""
-    if s2o.debug_markets_checked == 0:
-        return f"PROBLEM: No crypto markets being checked! {s2o.debug_not_crypto} markets rejected as not crypto 15-min."
-    if s2o.debug_missing_asks > s2o.debug_markets_checked * 0.5:
-        return f"PROBLEM: {s2o.debug_missing_asks} order book fetches failed! Check CLOB API connectivity."
-    if s2o.debug_best_price_sum >= 1.0:
-        return f"Market is efficient. Best price_sum seen: {s2o.debug_best_price_sum:.4f} (need < 1.00 for opportunity)"
-    if s2o.debug_best_price_sum < 1.0 and s2o.debug_low_edge > 0:
-        return f"Opportunities exist but filtered by fees. Best: {s2o.debug_best_price_sum:.4f}, need < {1.0 - s2o.config.fee_rate:.2f} after {s2o.config.fee_rate*100}% fee"
-    if s2o.debug_passed > 0:
-        return f"SUCCESS: {s2o.debug_passed} opportunities passed all checks!"
-    return "Check individual rejection counts."
-
-
-@app.route('/api/debug/tail-end')
-def api_debug_tail_end():
-    """Debug endpoint showing why tail-end signals aren't triggering"""
-    if hft_client is None:
-        return jsonify({"error": "Scanner not initialized"}), 400
-
-    te = hft_client.engine_manager.tail_end
-    return jsonify({
-        "tail_end_debug": {
-            "enabled": te.enabled,
-            "signals_generated": te.signals_generated,
-            "config": {
-                "min_probability": te.config.min_probability,
-                "max_probability": te.config.max_probability,
-                "min_price": te.config.min_price,
-                "max_price": te.config.max_price,
-                "min_depth_usd": te.config.min_depth_usd,
-                "min_risk_adjusted_ev": te.config.min_risk_adjusted_ev,
-                "sports_only": te.config.sports_only,
-            },
-            "rejection_counts": {
-                "not_sports_category": te.debug_not_sports,
-                "no_resolution_time": te.debug_no_resolution_time,
-                "position_limit_hit": te.debug_position_limit,
-                "already_have_position": te.debug_already_positioned,
-                "resolution_too_far": te.debug_resolution_too_far,
-                "resolution_too_close": te.debug_resolution_too_close,
-                "volume_too_low": te.debug_low_volume,
-                "tokens_checked": te.debug_checked_tokens,
-                "probability_too_low": te.debug_low_prob,
-                "probability_too_high": te.debug_high_prob,
-                "price_too_low": te.debug_low_price,
-                "price_too_high": te.debug_high_price,
-                "depth_too_low": te.debug_low_depth,
-                "risk_adjusted_ev_too_low": te.debug_low_ev,
-                "PASSED_ALL_CHECKS": te.debug_passed_all,
-            },
-            "interpretation": _interpret_debug_stats(te),
-        }
-    })
-
-
-def _interpret_debug_stats(te) -> str:
-    """Provide human-readable interpretation of debug stats"""
-    if te.debug_not_sports > 0 and te.debug_checked_tokens == 0:
-        return f"PROBLEM: {te.debug_not_sports} markets rejected because market_category != 'sports'. Check if markets are being labeled correctly."
-    if te.debug_no_resolution_time > 0 and te.debug_checked_tokens == 0:
-        return f"PROBLEM: {te.debug_no_resolution_time} markets have no resolution time set. Check minutes_until_resolution in market data."
-    if te.debug_checked_tokens == 0:
-        return "PROBLEM: No tokens are being checked at all. Markets are failing pre-checks before token analysis."
-    if te.debug_low_prob > te.debug_checked_tokens * 0.9:
-        return f"Most rejections ({te.debug_low_prob}) due to probability < {te.config.min_probability*100}%. Markets don't have high-confidence outcomes."
-    if te.debug_low_depth > 0:
-        return f"{te.debug_low_depth} rejections due to low depth (< ${te.config.min_depth_usd}). Check order book depth."
-    if te.debug_low_ev > 0:
-        return f"{te.debug_low_ev} rejections due to risk-adjusted EV < {te.config.min_risk_adjusted_ev}. This filter may be too strict."
-    if te.debug_passed_all > 0:
-        return f"SUCCESS: {te.debug_passed_all} opportunities passed all checks! Check why signals aren't executing."
-    return "Unknown issue - check individual rejection counts."
 
 
 @app.route('/api/debug/books')
@@ -1468,55 +1264,6 @@ def api_debug_test_book(slug):
         return jsonify({"error": str(e)}), 500
 
 
-@app.route('/api/engines/toggle', methods=['POST'])
-def api_toggle_engine():
-    """Toggle an engine on/off"""
-    if hft_client is None:
-        return jsonify({"error": "Scanner not initialized"}), 400
-
-    data = request.get_json() or {}
-    engine_name = data.get('engine')
-
-    if engine_name == 'sum_to_one':
-        new_state = hft_client.toggle_engine(EngineType.SUM_TO_ONE)
-        return jsonify({"engine": "sum_to_one", "enabled": new_state})
-    elif engine_name == 'tail_end':
-        new_state = hft_client.toggle_engine(EngineType.TAIL_END)
-        return jsonify({"engine": "tail_end", "enabled": new_state})
-    else:
-        return jsonify({"error": f"Unknown engine: {engine_name}"}), 400
-
-
-@app.route('/api/engines/<engine_name>/enable', methods=['POST'])
-def api_enable_engine(engine_name):
-    """Enable a specific engine"""
-    if hft_client is None:
-        return jsonify({"error": "Scanner not initialized"}), 400
-
-    if engine_name == 'sum_to_one':
-        hft_client.enable_engine(EngineType.SUM_TO_ONE)
-        return jsonify({"engine": "sum_to_one", "enabled": True})
-    elif engine_name == 'tail_end':
-        hft_client.enable_engine(EngineType.TAIL_END)
-        return jsonify({"engine": "tail_end", "enabled": True})
-    else:
-        return jsonify({"error": f"Unknown engine: {engine_name}"}), 400
-
-
-@app.route('/api/engines/<engine_name>/disable', methods=['POST'])
-def api_disable_engine(engine_name):
-    """Disable a specific engine"""
-    if hft_client is None:
-        return jsonify({"error": "Scanner not initialized"}), 400
-
-    if engine_name == 'sum_to_one':
-        hft_client.disable_engine(EngineType.SUM_TO_ONE)
-        return jsonify({"engine": "sum_to_one", "enabled": False})
-    elif engine_name == 'tail_end':
-        hft_client.disable_engine(EngineType.TAIL_END)
-        return jsonify({"engine": "tail_end", "enabled": False})
-    else:
-        return jsonify({"error": f"Unknown engine: {engine_name}"}), 400
 
 
 @app.route('/api/stop', methods=['POST'])
@@ -1575,7 +1322,6 @@ def api_copy_trader_start():
     live_mode = data.get('live', False)
     crypto_only = data.get('crypto_only', True)
     bet_amount = data.get('bet_amount')
-    starting_balance = data.get('starting_balance')
 
     # Require confirmation for live mode
     if live_mode and not data.get('confirm_live'):
@@ -1584,13 +1330,13 @@ def api_copy_trader_start():
             "message": "Set confirm_live=true to enable live algo trading"
         }), 403
 
-    # Create copy trader with dashboard callback and optional overrides
+    # Create copy trader with dashboard callback
+    # Opening balance is set via ALGO_STARTING_BALANCE env var on Railway
     copy_trader = CopyTrader(
         dry_run=not live_mode,
         crypto_only=crypto_only,
         on_trade=on_copy_trade,
         bet_amount=bet_amount,
-        starting_balance=starting_balance,
     )
     copy_trader.start()
 
@@ -1717,26 +1463,12 @@ def api_copy_trader_settings_update():
         changes.append(f"Bet amount: ${old_amount:.2f} -> ${new_amount:.2f}")
         print(f"[ALGO] Bet amount changed: ${old_amount:.2f} -> ${new_amount:.2f}", flush=True)
 
-    # Update opening balance (resets balance tracking)
+    # Opening balance is now set via ALGO_STARTING_BALANCE env var on Railway
     if 'starting_balance' in data:
-        new_balance = float(data['starting_balance'])
-        if new_balance <= 0:
-            return jsonify({"error": "Starting balance must be positive"}), 400
-        old_balance = copy_trader.positions["stats"].get("balance", 500)
-        copy_trader.positions["stats"]["balance"] = new_balance
-        open_staked = sum(p.get("amount", 0) for p in copy_trader.positions.get("open", []))
-        copy_trader.positions["stats"]["balance_history"] = [
-            {"timestamp": datetime.now(timezone.utc).isoformat(), "balance": new_balance,
-             "pnl": copy_trader.positions["stats"].get("total_pnl", 0.0),
-             "equity": new_balance + open_staked, "event": "reset"}
-        ]
-        from copy_trader import save_positions
-        save_positions(copy_trader.positions)
-        changes.append(f"Balance reset: ${old_balance:.2f} -> ${new_balance:.2f}")
-        print(f"[ALGO] Balance reset: ${old_balance:.2f} -> ${new_balance:.2f}", flush=True)
+        return jsonify({"error": "Opening balance is set via ALGO_STARTING_BALANCE env var on Railway"}), 400
 
     if not changes:
-        return jsonify({"error": "No settings provided. Send bet_amount and/or starting_balance."}), 400
+        return jsonify({"error": "No settings provided. Send bet_amount."}), 400
 
     return jsonify({
         "success": True,
@@ -1990,11 +1722,11 @@ def api_markets():
 
 @app.route('/api/sports/live')
 def api_sports_live():
-    """Get live sports data from WebSocket"""
+    """Get live sports data"""
     return jsonify({
-        "connected": sports_ws.connected if sports_ws else False,
+        "connected": False,
         "events_tracked": len(live_sports_data),
-        "events": list(live_sports_data.values())[:50],  # Last 50 events
+        "events": list(live_sports_data.values())[:50],
     })
 
 
@@ -2038,12 +1770,10 @@ def api_data():
     stats = {}
     scanner_stats = {}
     latency = {}
-    engine_stats = {}
 
     if hft_client:
         stats = hft_client.get_stats()
         latency = hft_client.latency_stats.to_dict()
-        engine_stats = hft_client.engine_manager.get_stats()
 
     if hft_scanner:
         scanner_stats = hft_scanner.get_stats()
@@ -2058,12 +1788,6 @@ def api_data():
     live_filled = [t for t in live_trades if t.status == OrderStatus.FILLED]
     live_resolved = [t for t in live_trades if t.resolved]
 
-    # Trades by engine
-    demo_s2o = [t for t in demo_filled if t.engine == "sum_to_one"]
-    demo_tail = [t for t in demo_filled if t.engine == "tail_end"]
-    live_s2o = [t for t in live_filled if t.engine == "sum_to_one"]
-    live_tail = [t for t in live_filled if t.engine == "tail_end"]
-
     return jsonify({
         "status": {
             "mode": server_state["mode"],
@@ -2075,19 +1799,6 @@ def api_data():
             "scans_completed": scanner_stats.get("scans_completed", 0),
             "signals_detected": scanner_stats.get("signals_detected", 0),
             "trades_executed": scanner_stats.get("trades_executed", 0),
-            "signals_by_engine": scanner_stats.get("signals_by_engine", {}),
-        },
-        "engines": {
-            "sum_to_one": {
-                "enabled": engine_stats.get("sum_to_one", {}).get("enabled", True),
-                "signals": engine_stats.get("sum_to_one", {}).get("signals_generated", 0),
-            },
-            "tail_end": {
-                "enabled": engine_stats.get("tail_end", {}).get("enabled", True),
-                "signals": engine_stats.get("tail_end", {}).get("signals_generated", 0),
-                "avg_probability": engine_stats.get("tail_end", {}).get("avg_probability", 0),
-            },
-            "enabled_list": stats.get("enabled_engines", []),
         },
         "latency": latency,
         "trades": {
@@ -2116,16 +1827,6 @@ def api_data():
                 "balance_history": [],
                 "bet_amount": 2.0,
             }),
-        },
-        "trades_by_engine": {
-            "demo": {
-                "sum_to_one": len(demo_s2o),
-                "tail_end": len(demo_tail),
-            },
-            "live": {
-                "sum_to_one": len(live_s2o),
-                "tail_end": len(live_tail),
-            },
         },
         "pnl": {
             "demo": {
