@@ -86,8 +86,10 @@ def load_positions() -> dict:
             if "balance" not in stats:
                 stats["balance"] = ALGO_STARTING_BALANCE
             if "balance_history" not in stats:
+                open_staked = sum(p.get("amount", 0) for p in data.get("open", []))
                 stats["balance_history"] = [
-                    {"timestamp": datetime.now(timezone.utc).isoformat(), "balance": stats["balance"], "event": "init"}
+                    {"timestamp": datetime.now(timezone.utc).isoformat(), "balance": stats["balance"],
+                     "pnl": stats.get("total_pnl", 0.0), "equity": stats["balance"] + open_staked, "event": "init"}
                 ]
             data["stats"] = stats
             return data
@@ -99,7 +101,8 @@ def load_positions() -> dict:
             "wins": 0, "losses": 0, "total_pnl": 0.0,
             "balance": ALGO_STARTING_BALANCE,
             "balance_history": [
-                {"timestamp": datetime.now(timezone.utc).isoformat(), "balance": ALGO_STARTING_BALANCE, "event": "init"}
+                {"timestamp": datetime.now(timezone.utc).isoformat(), "balance": ALGO_STARTING_BALANCE,
+                 "pnl": 0.0, "equity": ALGO_STARTING_BALANCE, "event": "init"}
             ],
         }
     }
@@ -603,9 +606,12 @@ class CopyTrader:
                 try:
                     stats = self.positions["stats"]
                     stats["balance"] = stats.get("balance", ALGO_STARTING_BALANCE) - self.bet_amount
+                    open_staked = sum(p.get("amount", 0) for p in self.positions.get("open", []))
                     stats.setdefault("balance_history", []).append({
                         "timestamp": trade_record["timestamp"],
                         "balance": stats["balance"],
+                        "pnl": stats.get("total_pnl", 0.0),
+                        "equity": stats["balance"] + open_staked,
                         "event": "trade",
                         "detail": f"{outcome} {title[:30]}"
                     })
@@ -770,9 +776,13 @@ class CopyTrader:
                         bal += payout
                     stats["balance"] = bal
                     event_type = "win" if won is True else "loss" if won is False else "resolved"
+                    # Note: position is about to be removed from open, so exclude it from staked calc
+                    open_staked = sum(p.get("amount", 0) for p in self.positions.get("open", []) if p is not position)
                     stats.setdefault("balance_history", []).append({
                         "timestamp": datetime.now(timezone.utc).isoformat(),
                         "balance": bal,
+                        "pnl": stats.get("total_pnl", 0.0),
+                        "equity": bal + open_staked,
                         "event": event_type,
                         "detail": f"{position.get('outcome', '?')} {position.get('market', '?')[:30]}"
                     })
@@ -810,6 +820,9 @@ class CopyTrader:
         balance = stats.get("balance", ALGO_STARTING_BALANCE)
         balance_history = stats.get("balance_history", [])
 
+        open_staked = sum(p.get("amount", 0) for p in self.positions.get("open", []))
+        equity = balance + open_staked
+
         return {
             "trades_copied": self.trades_copied,
             "trades_skipped": self.trades_skipped,
@@ -822,6 +835,7 @@ class CopyTrader:
             "total_pnl": total_pnl,
             "dry_run": self.dry_run,
             "balance": balance,
+            "equity": equity,
             "balance_history": balance_history,
             "bet_amount": self.bet_amount,
         }
