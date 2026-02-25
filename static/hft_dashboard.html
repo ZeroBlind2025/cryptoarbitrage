@@ -460,11 +460,10 @@
             );
         };
 
-        // Algo Settings Component - Trade Amount & Opening Balance controls
+        // Algo Settings Component - Trade Amount control
         const AlgoSettings = ({ copyTrader, fetchData, setError }) => {
             const [isOpen, setIsOpen] = useState(false);
             const [betAmount, setBetAmount] = useState('');
-            const [startingBalance, setStartingBalance] = useState('');
             const [saving, setSaving] = useState(false);
             const [saveMsg, setSaveMsg] = useState('');
 
@@ -472,7 +471,6 @@
             useEffect(() => {
                 if (isOpen) {
                     setBetAmount(String(copyTrader.bet_amount || 2));
-                    setStartingBalance('');
                     setSaveMsg('');
                 }
             }, [isOpen]);
@@ -485,10 +483,6 @@
                     const amt = parseFloat(betAmount);
                     if (!isNaN(amt) && amt > 0 && amt !== copyTrader.bet_amount) {
                         body.bet_amount = amt;
-                    }
-                    const bal = parseFloat(startingBalance);
-                    if (!isNaN(bal) && bal > 0) {
-                        body.starting_balance = bal;
                     }
 
                     if (Object.keys(body).length === 0) {
@@ -505,7 +499,6 @@
                     const result = await resp.json();
                     if (result.success) {
                         setSaveMsg('Saved! ' + result.changes.join(', '));
-                        setStartingBalance('');
                         fetchData();
                     } else {
                         setSaveMsg(result.error || 'Save failed');
@@ -542,23 +535,6 @@
                                     onChange={(e) => setBetAmount(e.target.value)}
                                     className="w-full bg-slate-700/50 border border-slate-600 rounded-lg px-3 py-2 text-sm text-white font-mono focus:outline-none focus:border-cyan-500"
                                     placeholder="2.00"
-                                />
-                            </div>
-
-                            {/* Opening Balance */}
-                            <div>
-                                <label className="text-xs text-slate-400 block mb-1">
-                                    Set Balance ($)
-                                    <span className="text-slate-500 ml-1">- resets balance history</span>
-                                </label>
-                                <input
-                                    type="number"
-                                    min="1"
-                                    step="1"
-                                    value={startingBalance}
-                                    onChange={(e) => setStartingBalance(e.target.value)}
-                                    className="w-full bg-slate-700/50 border border-slate-600 rounded-lg px-3 py-2 text-sm text-white font-mono focus:outline-none focus:border-cyan-500"
-                                    placeholder={`Current: $${(copyTrader.balance || 500).toFixed(2)}`}
                                 />
                             </div>
 
