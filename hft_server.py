@@ -1724,8 +1724,11 @@ def api_copy_trader_settings_update():
             return jsonify({"error": "Starting balance must be positive"}), 400
         old_balance = copy_trader.positions["stats"].get("balance", 500)
         copy_trader.positions["stats"]["balance"] = new_balance
+        open_staked = sum(p.get("amount", 0) for p in copy_trader.positions.get("open", []))
         copy_trader.positions["stats"]["balance_history"] = [
-            {"timestamp": datetime.now(timezone.utc).isoformat(), "balance": new_balance, "event": "reset"}
+            {"timestamp": datetime.now(timezone.utc).isoformat(), "balance": new_balance,
+             "pnl": copy_trader.positions["stats"].get("total_pnl", 0.0),
+             "equity": new_balance + open_staked, "event": "reset"}
         ]
         from copy_trader import save_positions
         save_positions(copy_trader.positions)
@@ -2109,6 +2112,7 @@ def api_data():
                 "win_rate": 0,
                 "total_pnl": 0,
                 "balance": 500.0,
+                "equity": 500.0,
                 "balance_history": [],
                 "bet_amount": 2.0,
             }),
