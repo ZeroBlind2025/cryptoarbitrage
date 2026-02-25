@@ -375,7 +375,7 @@ def place_bet(client: "ClobClient", token_id: str, amount: float) -> bool:
 class CopyTrader:
     """Copy trading engine"""
 
-    def __init__(self, dry_run: bool = True, crypto_only: bool = True, on_trade: Optional[callable] = None, on_resolution: Optional[callable] = None, bet_amount: Optional[float] = None, starting_balance: Optional[float] = None):
+    def __init__(self, dry_run: bool = True, crypto_only: bool = True, on_trade: Optional[callable] = None, on_resolution: Optional[callable] = None, bet_amount: Optional[float] = None):
         self.dry_run = dry_run
         self.crypto_only = crypto_only
         self.client: Optional["ClobClient"] = None
@@ -396,15 +396,8 @@ class CopyTrader:
         self.trade_history: list = []
 
         # Position tracking (persisted to file)
+        # Opening balance set via ALGO_STARTING_BALANCE env var on Railway
         self.positions = load_positions()
-
-        # Override starting balance if provided
-        if starting_balance is not None:
-            self.positions["stats"]["balance"] = starting_balance
-            self.positions["stats"]["balance_history"] = [
-                {"timestamp": datetime.now(timezone.utc).isoformat(), "balance": starting_balance, "event": "init"}
-            ]
-            save_positions(self.positions)
 
         self.last_resolution_check = 0
         self.resolution_check_interval = 60  # Check every 60 seconds

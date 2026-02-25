@@ -38,14 +38,44 @@ import uuid
 
 import requests
 
-from arb_engines import (
-    EngineType,
-    EngineManager,
-    EngineSignal,
-    MarketState,
-    SumToOneConfig,
-    TailEndConfig,
-)
+# Engine imports (graceful - engines have been removed)
+try:
+    from arb_engines import (
+        EngineType,
+        EngineManager,
+        EngineSignal,
+        MarketState,
+        SumToOneConfig,
+        TailEndConfig,
+    )
+    HAS_ENGINES = True
+except ImportError:
+    HAS_ENGINES = False
+
+    # Stub classes so HFTClient still instantiates cleanly
+    class EngineType:
+        SUM_TO_ONE = "sum_to_one"
+        TAIL_END = "tail_end"
+
+    class EngineManager:
+        def __init__(self, **kwargs): pass
+        def analyze(self, market): return []
+        def get_stats(self): return {}
+        def get_enabled_engines(self): return []
+        def enable_engine(self, t): pass
+        def disable_engine(self, t): pass
+        def toggle_engine(self, t): return False
+        def is_enabled(self, t): return False
+
+    class EngineSignal: pass
+
+    class MarketState:
+        def __init__(self, **kwargs):
+            for k, v in kwargs.items():
+                setattr(self, k, v)
+
+    SumToOneConfig = None
+    TailEndConfig = None
 
 # Import WebSocket client
 try:

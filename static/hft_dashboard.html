@@ -82,23 +82,6 @@
             </div>
         );
 
-        // Engine Badge
-        const EngineBadge = ({ engine }) => {
-            const colors = {
-                sum_to_one: 'bg-purple-500/20 text-purple-400 border-purple-500/30',
-                tail_end: 'bg-orange-500/20 text-orange-400 border-orange-500/30',
-            };
-            const labels = {
-                sum_to_one: 'S2O',
-                tail_end: 'TAIL',
-            };
-            return (
-                <span className={`px-2 py-0.5 text-xs rounded border font-medium ${colors[engine] || colors.sum_to_one}`}>
-                    {labels[engine] || engine}
-                </span>
-            );
-        };
-
         // Trade Row
         const TradeRow = ({ trade, isNew }) => {
             const time = new Date(trade.timestamp).toLocaleTimeString();
@@ -109,7 +92,6 @@
                 <div className={`bg-slate-800/30 rounded-lg p-3 border border-slate-700/50 hover:border-slate-600/50 transition-all ${isNew ? 'flash-green' : ''}`}>
                     <div className="flex items-center justify-between mb-2">
                         <div className="flex items-center gap-2">
-                            <EngineBadge engine={trade.engine} />
                             <ModeBadge mode={trade.mode} />
                             <StatusBadge status={trade.status} />
                         </div>
@@ -128,12 +110,9 @@
                             <p className="text-white font-mono">${trade.total_cost.toFixed(2)}</p>
                         </div>
                         <div>
-                            <p className="text-slate-500">{trade.engine === 'tail_end' ? 'Prob' : 'Edge'}</p>
+                            <p className="text-slate-500">Edge</p>
                             <p className="text-green-400 font-mono">
-                                {trade.engine === 'tail_end' && trade.target_probability
-                                    ? `${(trade.target_probability * 100).toFixed(1)}%`
-                                    : `${edge}%`
-                                }
+                                {`${edge}%`}
                             </p>
                         </div>
                         <div>
@@ -417,67 +396,9 @@
             );
         };
 
-        // Engine Toggle Card
-        const EngineToggle = ({ name, label, description, enabled, stats, onToggle, isRunning }) => {
-            const colors = {
-                sum_to_one: { active: 'border-purple-500/50 bg-purple-500/10', text: 'text-purple-400' },
-                tail_end: { active: 'border-orange-500/50 bg-orange-500/10', text: 'text-orange-400' },
-            };
-            const color = colors[name] || colors.sum_to_one;
-
-            return (
-                <div className={`rounded-xl p-4 border transition-all ${
-                    enabled ? color.active : 'border-slate-700/50 bg-slate-800/30'
-                }`}>
-                    <div className="flex items-center justify-between mb-2">
-                        <div>
-                            <h3 className={`font-semibold ${enabled ? color.text : 'text-slate-400'}`}>
-                                {label}
-                            </h3>
-                            <p className="text-xs text-slate-500">{description}</p>
-                        </div>
-                        <button
-                            onClick={() => onToggle(name)}
-                            disabled={!isRunning}
-                            className={`relative w-12 h-6 rounded-full transition-colors ${
-                                enabled ? 'bg-green-500' : 'bg-slate-600'
-                            } ${!isRunning ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'}`}
-                        >
-                            <div className={`absolute top-1 w-4 h-4 rounded-full bg-white transition-transform ${
-                                enabled ? 'translate-x-7' : 'translate-x-1'
-                            }`} />
-                        </button>
-                    </div>
-                    <div className="grid grid-cols-2 gap-2 mt-3 text-xs">
-                        <div>
-                            <p className="text-slate-500">Signals</p>
-                            <p className="text-white font-mono">{stats?.signals || 0}</p>
-                        </div>
-                        {name === 'tail_end' && (
-                            <div>
-                                <p className="text-slate-500">Avg Prob</p>
-                                <p className="text-white font-mono">
-                                    {stats?.avg_probability ? `${(stats.avg_probability * 100).toFixed(1)}%` : '-'}
-                                </p>
-                            </div>
-                        )}
-                        {name === 'sum_to_one' && (
-                            <div>
-                                <p className="text-slate-500">Status</p>
-                                <p className={`font-mono ${enabled ? 'text-green-400' : 'text-slate-500'}`}>
-                                    {enabled ? 'Active' : 'Paused'}
-                                </p>
-                            </div>
-                        )}
-                    </div>
-                </div>
-            );
-        };
-
         // PnL Summary
-        const PnLSummary = ({ pnl, mode, tradesByEngine }) => {
+        const PnLSummary = ({ pnl, mode }) => {
             const data = pnl[mode] || {};
-            const engineData = tradesByEngine?.[mode] || {};
             const totalPnl = data.total_pnl || 0;
             const balance = data.balance || 10000;
             const roi = data.total_cost > 0 ? (totalPnl / data.total_cost * 100) : 0;
@@ -487,14 +408,6 @@
                     <div className="flex justify-between items-center">
                         <span className="text-slate-400">Filled Trades</span>
                         <span className="text-white font-mono">{data.filled || 0}</span>
-                    </div>
-                    <div className="flex justify-between items-center text-xs">
-                        <span className="text-slate-500 pl-2">Sum-to-One</span>
-                        <span className="text-purple-400 font-mono">{engineData.sum_to_one || 0}</span>
-                    </div>
-                    <div className="flex justify-between items-center text-xs">
-                        <span className="text-slate-500 pl-2">Tail-End</span>
-                        <span className="text-orange-400 font-mono">{engineData.tail_end || 0}</span>
                     </div>
                     <div className="flex justify-between items-center">
                         <span className="text-slate-400">Resolved</span>
@@ -742,18 +655,12 @@
                 return () => clearInterval(interval);
             }, []);
 
-            // Engine state for starting
-            const [enableSumToOne, setEnableSumToOne] = useState(true);
-            const [enableTailEnd, setEnableTailEnd] = useState(true);
-
             // Start/Stop scanner
             const toggleScanner = async () => {
                 try {
                     const endpoint = isRunning ? '/api/stop' : '/api/start';
                     const body = isRunning ? {} : {
                         mode: selectedMode,
-                        enable_sum_to_one: enableSumToOne,
-                        enable_tail_end: enableTailEnd,
                     };
 
                     if (!isRunning && selectedMode === 'live') {
@@ -787,28 +694,9 @@
             const latency = data?.latency || {};
             const pnl = data?.pnl || { demo: {}, live: {} };
             const trades = data?.trades || { demo: [], live: [], copy: [] };
-            const engines = data?.engines || { sum_to_one: {}, tail_end: {} };
-            const tradesByEngine = data?.trades_by_engine || { demo: {}, live: {} };
             const copyTrader = data?.copy_trader || {};
             const allTrades = [...(trades.demo || []), ...(trades.live || []), ...(trades.copy || [])]
                 .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
-
-            // Toggle engine
-            const toggleEngine = async (engineName) => {
-                try {
-                    const response = await fetch('/api/engines/toggle', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ engine: engineName }),
-                    });
-                    const result = await response.json();
-                    if (!result.error) {
-                        fetchData(); // Refresh data
-                    }
-                } catch (err) {
-                    setError('Failed to toggle engine');
-                }
-            };
 
             return (
                 <div className="min-h-screen bg-slate-900 text-white p-4 md:p-6">
@@ -924,28 +812,6 @@
                             value={`$${(pnl.demo?.balance || 10000).toFixed(0)}`}
                             subValue="Paper trading"
                             color="blue"
-                        />
-                    </div>
-
-                    {/* Engine Controls */}
-                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
-                        <EngineToggle
-                            name="sum_to_one"
-                            label="Sum-to-One"
-                            description="Buy YES+NO when combined < $1.00 (guaranteed profit)"
-                            enabled={engines.sum_to_one?.enabled ?? true}
-                            stats={engines.sum_to_one}
-                            onToggle={toggleEngine}
-                            isRunning={isRunning}
-                        />
-                        <EngineToggle
-                            name="tail_end"
-                            label="Tail-End"
-                            description="Buy 95-99% outcomes near resolution (directional)"
-                            enabled={engines.tail_end?.enabled ?? true}
-                            stats={engines.tail_end}
-                            onToggle={toggleEngine}
-                            isRunning={isRunning}
                         />
                     </div>
 
@@ -1186,7 +1052,7 @@
                                     <span className="text-blue-400"><DollarSign /></span>
                                     Demo PnL
                                 </h2>
-                                <PnLSummary pnl={pnl} mode="demo" tradesByEngine={tradesByEngine} />
+                                <PnLSummary pnl={pnl} mode="demo" />
                             </div>
 
                             {/* Live PnL */}
@@ -1195,7 +1061,7 @@
                                     <span className="text-red-400"><TrendingUp /></span>
                                     Live PnL
                                 </h2>
-                                <PnLSummary pnl={pnl} mode="live" tradesByEngine={tradesByEngine} />
+                                <PnLSummary pnl={pnl} mode="live" />
                             </div>
 
                             {/* Config */}
@@ -1269,11 +1135,7 @@
 
                     {/* Footer */}
                     <div className="mt-8 text-center text-xs text-slate-500">
-                        <p>HFT Arbitrage System - Sum-to-One &amp; Tail-End Engines</p>
-                        <p className="mt-1">
-                            <span className="text-purple-400">S2O</span>: Guaranteed profit (YES+NO &lt; $1) |
-                            <span className="text-orange-400 ml-1">TAIL</span>: Directional (95-99% near resolution)
-                        </p>
+                        <p>HFT Arbitrage System</p>
                         <p className="mt-1">Demo mode uses paper trading. Live mode executes real trades.</p>
                     </div>
 
