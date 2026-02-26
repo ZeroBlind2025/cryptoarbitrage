@@ -1946,24 +1946,9 @@ def main():
             print("Aborted.")
             return
 
-    # Auto-start if requested
+    # HFT scanner auto-start disabled — app is single-purpose (Poly Algo copy trader)
     if args.auto_start:
-        print(f"Auto-starting HFT scanner in {args.mode} mode...")
-        # Delay to allow Flask to start
-        def delayed_start():
-            import sys
-            time.sleep(2)
-            try:
-                print("[AUTO-START] Starting scanner...", flush=True)
-                success, message = start_hft_scanner(args.mode, args.scan_interval)
-                print(f"[AUTO-START] Result: success={success}, message={message}", flush=True)
-            except Exception as e:
-                import traceback
-                print(f"[AUTO-START] ERROR: {e}", flush=True)
-                traceback.print_exc()
-                sys.stdout.flush()
-
-        threading.Thread(target=delayed_start, daemon=True).start()
+        print("[AUTO-START] HFT scanner auto-start is disabled. App is Poly Algo only.", flush=True)
 
     print(f"\n{'=' * 60}")
     print("HFT ARBITRAGE SERVER")

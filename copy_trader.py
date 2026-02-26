@@ -268,43 +268,34 @@ def get_positions(wallet_address: str) -> list:
 
 
 def get_latest_bets(wallet_address: str, limit: int = 20, verbose: bool = False) -> list:
-    """Get recent buy trades for a wallet"""
+    """Get recent buy trades for a wallet using server-side filtering"""
     try:
         url = f"{DATA_API}/activity"
-        params = {"user": wallet_address, "limit": limit}
+        # Use server-side type/side filtering so BUY trades aren't pushed out
+        # of the result window by SELLs/REDEEMs/etc.
+        params = {
+            "user": wallet_address,
+            "limit": limit,
+            "type": "TRADE",
+            "side": "BUY",
+        }
         response = requests.get(url, params=params, timeout=10)
 
         if verbose:
-            print(f"[ALGO] API {url} => HTTP {response.status_code}", flush=True)
+            print(f"[ALGO] GET {url}?user={wallet_address[:12]}...&limit={limit}&type=TRADE&side=BUY => HTTP {response.status_code}", flush=True)
 
         response.raise_for_status()
 
         data = response.json()
         if verbose:
-            print(f"[ALGO] Got {len(data)} activities", flush=True)
-            # Log activity types/sides to debug filtering
-            if data:
-                types = {}
-                for a in data:
-                    key = f"{a.get('type','?')}/{a.get('side','?')}"
-                    types[key] = types.get(key, 0) + 1
-                print(f"[ALGO] Activity breakdown: {types}", flush=True)
-            elif isinstance(data, dict):
-                # API might have changed to return an object instead of array
-                print(f"[ALGO] Response is dict with keys: {list(data.keys())[:10]}", flush=True)
+            count = len(data) if isinstance(data, list) else "dict"
+            print(f"[ALGO] Got {count} BUY trades from API", flush=True)
 
         if not data:
             return []
 
         # Handle both array and dict responses
-        activities = data if isinstance(data, list) else data.get("data", data.get("results", data.get("activities", [])))
-
-        bets = []
-        for activity in activities:
-            if activity.get("type") == "TRADE" and activity.get("side") == "BUY":
-                bets.append(activity)
-        if verbose:
-            print(f"[ALGO] Filtered to {len(bets)} BUY trades", flush=True)
+        bets = data if isinstance(data, list) else data.get("data", data.get("results", data.get("activities", [])))
         return bets
     except Exception as e:
         print(f"[ALGO] Error fetching activity: {e}", flush=True)

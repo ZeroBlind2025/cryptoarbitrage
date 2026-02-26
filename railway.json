@@ -4,7 +4,7 @@
     "builder": "NIXPACKS"
   },
   "deploy": {
-    "startCommand": "/app/venv/bin/python3 hft_server.py --port $PORT --mode demo --auto-start",
+    "startCommand": "/app/venv/bin/python3 hft_server.py --port $PORT --mode demo",
     "restartPolicyType": "ON_FAILURE",
     "restartPolicyMaxRetries": 10
   }
