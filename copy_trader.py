@@ -215,7 +215,7 @@ def get_market_resolution(condition_id: str = "", slug: str = "", token_id: str 
                     if len(prices) == 2:
                         # Pick the outcome with the higher price if it's clearly dominant
                         high_idx = 0 if prices[0] >= prices[1] else 1
-                        if prices[high_idx] >= 0.90:
+                        if prices[high_idx] >= 0.99:
                             return {
                                 "resolved": True,
                                 "winning_outcome": outcomes[high_idx],
@@ -380,6 +380,7 @@ class CopyTrader:
         self.crypto_only = crypto_only
         self.client: Optional["ClobClient"] = None
         self.copied_trades: set = set()  # Track copied trade IDs
+        self.copied_sizes: set = set()  # Track (condition_id, target_size) to dedup re-scans
         self.target_name = get_profile_name(TARGET_ADDRESS)
         self.on_trade = on_trade  # Callback for dashboard integration
         self.on_resolution = on_resolution  # Callback when position resolves
@@ -428,7 +429,12 @@ class CopyTrader:
         for bet in existing_bets:
             trade_id = bet.get("id") or f"{bet.get('conditionId')}_{bet.get('timestamp')}"
             self.copied_trades.add(trade_id)
-        print(f"[ALGO] Marked {len(self.copied_trades)} existing trades as seen. Waiting for NEW trades...")
+            # Also snapshot target sizes so we don't re-copy existing positions
+            cid = bet.get("conditionId") or bet.get("condition_id") or ""
+            target_size = bet.get("size", 0)
+            if cid and target_size:
+                self.copied_sizes.add((cid, str(round(float(target_size), 2))))
+        print(f"[ALGO] Marked {len(self.copied_trades)} existing trades ({len(self.copied_sizes)} unique sizes) as seen. Waiting for NEW trades...")
 
         # Show position tracking stats
         stats = self.positions.get("stats", {})
@@ -531,6 +537,18 @@ class CopyTrader:
                 print(f"[ALGO] Skip (opposite side tracked): {title}")
                 self.trades_skipped += 1
                 continue
+
+            # Dedup by target share count — trader never repeats the same size on a market.
+            # If we've already copied this (condition, size) combo, it's our scan loop
+            # re-seeing the same position, not a new entry.
+            target_size = bet.get("size", 0)
+            if condition_id and target_size:
+                size_key = (condition_id, str(round(float(target_size), 2)))
+                if size_key in self.copied_sizes:
+                    print(f"[ALGO] Skip (same size already copied): {title} | {target_size} shares")
+                    self.trades_skipped += 1
+                    continue
+                self.copied_sizes.add(size_key)
 
             # Copy the trade!
             print(f"\n[ALGO] NEW TRADE DETECTED!")
