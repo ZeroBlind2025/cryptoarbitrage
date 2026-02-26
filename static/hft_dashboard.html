@@ -502,6 +502,7 @@
             const fetchData = useCallback(async () => {
                 try {
                     const response = await fetch('/api/data');
+                    if (!response.ok) throw new Error(`HTTP ${response.status}`);
                     const newData = await response.json();
 
                     // Track new trades for animation
