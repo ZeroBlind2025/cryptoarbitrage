@@ -751,11 +751,15 @@
                                             <button
                                                 onClick={async () => {
                                                     try {
-                                                        await fetch('/api/copy-trader/start', {
+                                                        const res = await fetch('/api/copy-trader/start', {
                                                             method: 'POST',
                                                             headers: { 'Content-Type': 'application/json' },
                                                             body: JSON.stringify({ crypto_only: true })
                                                         });
+                                                        if (!res.ok) {
+                                                            const err = await res.json().catch(() => ({}));
+                                                            alert(`Start failed: ${err.error || res.statusText}`);
+                                                        }
                                                         fetchData();
                                                     } catch (e) { console.error(e); }
                                                 }}

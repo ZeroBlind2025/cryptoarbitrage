@@ -101,7 +101,8 @@ stop_refresh = threading.Event()
 try:
     from copy_trader import CopyTrader, TARGET_ADDRESS
     HAS_COPY_TRADER = True
-except ImportError:
+except Exception as e:
+    print(f"[SERVER] Failed to import copy_trader: {e}")
     HAS_COPY_TRADER = False
     TARGET_ADDRESS = ""
 
@@ -1332,13 +1333,19 @@ def api_copy_trader_start():
 
     # Create copy trader with dashboard callback
     # Opening balance is set via ALGO_STARTING_BALANCE env var on Railway
-    copy_trader = CopyTrader(
-        dry_run=not live_mode,
-        crypto_only=crypto_only,
-        on_trade=on_copy_trade,
-        bet_amount=bet_amount,
-    )
-    copy_trader.start()
+    try:
+        copy_trader = CopyTrader(
+            dry_run=not live_mode,
+            crypto_only=crypto_only,
+            on_trade=on_copy_trade,
+            bet_amount=bet_amount,
+        )
+        copy_trader.start()
+    except Exception as e:
+        print(f"[SERVER] Failed to start Poly Algo: {e}")
+        import traceback; traceback.print_exc()
+        copy_trader = None
+        return jsonify({"error": f"Failed to start: {e}"}), 500
 
     # Start background thread
     stop_copy_trader.clear()
