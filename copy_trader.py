@@ -849,8 +849,8 @@ class CopyTrader:
         total_pnl = self._safe_float(stats.get("total_pnl", 0.0))
         win_rate = (wins / (wins + losses) * 100) if (wins + losses) > 0 else 0
         balance = self._safe_float(stats.get("balance", ALGO_STARTING_BALANCE))
-        # Cap balance_history to last 500 entries to keep API responses fast
-        balance_history = stats.get("balance_history", [])[-500:]
+        # Cap balance_history to last 10000 entries (enough for days of data)
+        balance_history = stats.get("balance_history", [])[-10000:]
 
         open_staked = sum(p.get("amount", 0) for p in self.positions.get("open", []))
         equity = self._safe_float(balance + open_staked)
