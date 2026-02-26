@@ -765,12 +765,7 @@ class CopyTrader:
                         # No valid entry price - use placeholder PnL
                         pnl = amount * 3  # Assume ~4x return (typical for 20-25% odds)
                         print(f"[ALGO] WIN (no price): {position['market'][:30]} | entry_price=0, estimating +${pnl:.2f}")
-                    elif entry_price > 0.95:
-                        # Suspiciously high price (>95%) - likely bad data
-                        pnl = amount * 0.05  # Minimal win
-                        print(f"[ALGO] WIN (high price): {position['market'][:30]} | entry={entry_price:.2f}, +${pnl:.2f}")
                     else:
-                        # Normal calculation
                         payout = amount / entry_price
                         pnl = payout - amount
                         print(f"[ALGO] WIN: {position['market'][:30]} | entry={entry_price:.4f}, payout=${payout:.2f}, pnl=+${pnl:.2f}")
