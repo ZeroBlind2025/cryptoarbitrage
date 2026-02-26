@@ -273,14 +273,34 @@ def get_latest_bets(wallet_address: str, limit: int = 20, verbose: bool = False)
         url = f"{DATA_API}/activity"
         params = {"user": wallet_address, "limit": limit}
         response = requests.get(url, params=params, timeout=10)
+
+        if verbose:
+            print(f"[ALGO] API {url} => HTTP {response.status_code}", flush=True)
+
         response.raise_for_status()
 
         data = response.json()
-        if verbose or not data:
-            print(f"[ALGO] API {url}?user={wallet_address[:12]}...&limit={limit} => {len(data)} activities", flush=True)
+        if verbose:
+            print(f"[ALGO] Got {len(data)} activities", flush=True)
+            # Log activity types/sides to debug filtering
+            if data:
+                types = {}
+                for a in data:
+                    key = f"{a.get('type','?')}/{a.get('side','?')}"
+                    types[key] = types.get(key, 0) + 1
+                print(f"[ALGO] Activity breakdown: {types}", flush=True)
+            elif isinstance(data, dict):
+                # API might have changed to return an object instead of array
+                print(f"[ALGO] Response is dict with keys: {list(data.keys())[:10]}", flush=True)
+
+        if not data:
+            return []
+
+        # Handle both array and dict responses
+        activities = data if isinstance(data, list) else data.get("data", data.get("results", data.get("activities", [])))
 
         bets = []
-        for activity in data:
+        for activity in activities:
             if activity.get("type") == "TRADE" and activity.get("side") == "BUY":
                 bets.append(activity)
         if verbose:
@@ -457,11 +477,8 @@ class CopyTrader:
         """Check for new trades and copy them. Returns number of trades copied."""
         copied = 0
 
-        # Get target's recent bets (verbose on first call)
-        first_scan = not hasattr(self, '_first_scan_done')
-        bets = get_latest_bets(TARGET_ADDRESS, verbose=first_scan)
-        if first_scan:
-            self._first_scan_done = True
+        # Get target's recent bets — always verbose to diagnose scanning
+        bets = get_latest_bets(TARGET_ADDRESS, verbose=True)
         if not bets:
             return 0
 
