@@ -367,16 +367,16 @@ def is_crypto_market(bet: dict) -> bool:
     return False
 
 
-def has_opposite_position(entered_markets: set, condition_id: str, outcome_index: int) -> bool:
+def has_opposite_position(entered_markets: dict, condition_id: str, outcome_index: int) -> bool:
     """Check if we already have the OPPOSITE side of this market.
 
-    Looks through entered_markets set for any entry on the same condition_id
+    Looks through entered_markets dict for any entry on the same condition_id
     but a different outcome_index.  Prevents betting both Up and Down on the
     same market, which just pays the vig and cancels out edge.
     """
     if not condition_id:
         return False
-    for cid, oi in entered_markets:
+    for (cid, oi) in entered_markets:
         if cid == condition_id and oi != outcome_index:
             return True
     return False
@@ -479,7 +479,7 @@ class CopyTrader:
         self.client: Optional["ClobClient"] = None
         self.copied_trades: set = set()  # Track copied trade IDs
         self.copied_sizes: set = set()  # Track (condition_id, target_size) to dedup re-scans
-        self.entered_markets: set = set()  # Track (condition_id, outcome_index) — one entry per side per market
+        self.entered_markets: dict = {}  # (condition_id, outcome_index) → entry_price
         self.target_name = get_profile_name(TARGET_ADDRESS)
         self.on_trade = on_trade  # Callback for dashboard integration
         self.on_resolution = on_resolution  # Callback when position resolves
@@ -551,12 +551,13 @@ class CopyTrader:
         print(f"[ALGO] Marked {len(self.copied_trades)} existing trades ({len(self.copied_sizes)} unique sizes) as seen. Waiting for NEW trades...")
 
         # Seed entered_markets from existing open positions so we don't
-        # re-enter markets we already have exposure to after a restart.
+        # chase markets we already have exposure to after a restart.
         for pos in self.positions.get("open", []):
             cid = pos.get("condition_id", "")
             oi = pos.get("outcome_index", 0)
+            ep = pos.get("entry_price", 0)
             if cid:
-                self.entered_markets.add((cid, oi))
+                self.entered_markets[(cid, oi)] = ep
         if self.entered_markets:
             print(f"[ALGO] Resumed {len(self.entered_markets)} active market entries from open positions")
 
@@ -705,14 +706,20 @@ class CopyTrader:
             if outcome_index is None:
                 outcome_index = 0
 
-            # --- GUARD 1: One entry per side per market ---
-            # Once we've entered a (condition_id, outcome_index), never re-enter.
-            # Prevents chasing the same market down with repeated $2 bets.
+            # --- GUARD 1: Block chasing, allow conviction ---
+            # If we already hold this side, only re-enter when the current
+            # price is ABOVE our initial entry (market moving in our favour).
+            # Block when price is at or below entry — that's throwing good
+            # money after bad (e.g. 47¢→35¢→20¢ spiral).
             market_key = (condition_id, outcome_index)
             if condition_id and market_key in self.entered_markets:
-                print(f"[ALGO] Skip (already entered this side): {title} | {outcome}")
-                self.trades_skipped += 1
-                continue
+                initial_entry = self.entered_markets[market_key]
+                if initial_entry and price <= initial_entry:
+                    print(f"[ALGO] Skip (chasing — price {price:.3f} <= entry {initial_entry:.3f}): {title} | {outcome}")
+                    self.trades_skipped += 1
+                    continue
+                else:
+                    print(f"[ALGO] Re-entry OK (conviction — price {price:.3f} > entry {initial_entry:.3f}): {title} | {outcome}")
 
             # --- GUARD 2: Block opposite side ---
             # Don't bet both Up and Down on the same market. Betting both
@@ -807,9 +814,11 @@ class CopyTrader:
 
             # Save position for tracking (if trade was successful or dry run)
             if trade_record["status"] in ["filled", "dry_run"]:
-                # Lock this market+side so we never re-enter or take the opposite
-                if condition_id:
-                    self.entered_markets.add((condition_id, outcome_index))
+                # Record market entry — only store the FIRST entry price so
+                # subsequent conviction re-entries are compared against the
+                # original, not against an already-elevated price.
+                if condition_id and market_key not in self.entered_markets:
+                    self.entered_markets[market_key] = price
                 token_id = bet.get("asset", "")
                 position = {
                     "id": trade_record["id"],
