@@ -964,6 +964,138 @@ class CopyTrader:
 
 
 # =============================================================================
+# TRADE RECONCILIATION
+# =============================================================================
+
+def get_target_trade_history(limit: int = 100) -> list:
+    """Fetch target trader's recent BUY trades for reconciliation.
+
+    Pulls up to `limit` crypto BUY trades from the Polymarket activity API
+    and normalises the fields we care about for comparison.
+    """
+    raw = get_latest_bets(TARGET_ADDRESS, limit=limit)
+    trades = []
+    for bet in raw:
+        if not is_crypto_market(bet):
+            continue
+
+        # Entry price: usdcSize / size
+        usdc_size = bet.get("usdcSize") or bet.get("usdc_size") or bet.get("amount") or 0
+        shares = bet.get("size") or 0
+        try:
+            usdc_size = float(usdc_size)
+            shares = float(shares)
+            entry_price = usdc_size / shares if shares > 0 else 0
+        except (ValueError, TypeError, ZeroDivisionError):
+            entry_price = 0
+
+        trades.append({
+            "id": bet.get("id", ""),
+            "timestamp": bet.get("timestamp") or bet.get("createdAt") or "",
+            "market": (bet.get("title") or "")[:80],
+            "slug": bet.get("slug", ""),
+            "outcome": bet.get("outcome", ""),
+            "condition_id": bet.get("conditionId") or bet.get("condition_id") or "",
+            "token_id": bet.get("asset") or bet.get("token_id") or "",
+            "entry_price": round(entry_price, 6),
+            "usdc_size": round(usdc_size, 4),
+            "shares": round(shares, 4),
+        })
+    return trades
+
+
+def build_reconciliation(positions: dict, target_limit: int = 100) -> list:
+    """Build a side-by-side reconciliation of target trades vs our trades.
+
+    Returns a list of dicts, one per row, ready to be written as CSV.
+    Each row shows the target's trade on the left and our matching copy
+    (if any) on the right, plus a status column flagging misses or
+    price divergence.
+    """
+    target_trades = get_target_trade_history(limit=target_limit)
+
+    # Index our trades by condition_id + outcome for matching
+    our_open = positions.get("open", [])
+    our_resolved = positions.get("resolved", [])
+    all_ours = our_open + our_resolved
+
+    # Build lookup: (condition_id, outcome_normalised) -> list of our positions
+    our_lookup: dict[tuple, list] = {}
+    for pos in all_ours:
+        cid = pos.get("condition_id", "")
+        outcome = (pos.get("outcome") or "").lower().strip()
+        key = (cid, outcome)
+        our_lookup.setdefault(key, []).append(pos)
+
+    # Also build a set of our condition_ids to detect trades we made that the
+    # target didn't (shouldn't happen, but good to flag)
+    our_cids_seen = set()
+
+    rows = []
+    for t in target_trades:
+        cid = t["condition_id"]
+        outcome_norm = t["outcome"].lower().strip()
+        key = (cid, outcome_norm)
+
+        matches = our_lookup.get(key, [])
+        our_cids_seen.add(cid)
+
+        if matches:
+            for m in matches:
+                our_price = m.get("entry_price", 0)
+                target_price = t["entry_price"]
+                price_diff = abs(our_price - target_price) if our_price and target_price else None
+                # Flag if our entry price diverges by >5% from target
+                if target_price and price_diff is not None:
+                    pct_diff = price_diff / target_price * 100
+                else:
+                    pct_diff = None
+
+                status = "MATCHED"
+                if pct_diff is not None and pct_diff > 5:
+                    status = f"PRICE_DIFF ({pct_diff:.1f}%)"
+
+                result = m.get("result", "OPEN")
+
+                rows.append({
+                    "target_timestamp": t["timestamp"],
+                    "target_market": t["market"],
+                    "target_outcome": t["outcome"],
+                    "target_entry_price": t["entry_price"],
+                    "target_usdc": t["usdc_size"],
+                    "target_shares": t["shares"],
+                    "our_timestamp": m.get("timestamp", ""),
+                    "our_outcome": m.get("outcome", ""),
+                    "our_entry_price": our_price,
+                    "our_amount": m.get("amount", 0),
+                    "our_result": result,
+                    "our_pnl": m.get("pnl", ""),
+                    "status": status,
+                    "condition_id": cid,
+                })
+        else:
+            # Target traded but we have no matching copy
+            rows.append({
+                "target_timestamp": t["timestamp"],
+                "target_market": t["market"],
+                "target_outcome": t["outcome"],
+                "target_entry_price": t["entry_price"],
+                "target_usdc": t["usdc_size"],
+                "target_shares": t["shares"],
+                "our_timestamp": "",
+                "our_outcome": "",
+                "our_entry_price": "",
+                "our_amount": "",
+                "our_result": "",
+                "our_pnl": "",
+                "status": "MISSED",
+                "condition_id": cid,
+            })
+
+    return rows
+
+
+# =============================================================================
 # MAIN
 # =============================================================================
 
