@@ -345,83 +345,6 @@
             );
         };
 
-        // Latency Chart
-        const LatencyDisplay = ({ latency }) => {
-            if (!latency || !latency.count) {
-                return (
-                    <div className="text-slate-500 text-center py-8">
-                        No latency data yet
-                    </div>
-                );
-            }
-
-            return (
-                <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-                    <div className="bg-slate-700/30 rounded-lg p-3 text-center">
-                        <p className="text-2xl font-bold text-cyan-400 font-mono">{latency.avg_ms.toFixed(1)}</p>
-                        <p className="text-xs text-slate-400">Avg (ms)</p>
-                    </div>
-                    <div className="bg-slate-700/30 rounded-lg p-3 text-center">
-                        <p className="text-2xl font-bold text-green-400 font-mono">{(latency.min_us / 1000).toFixed(1)}</p>
-                        <p className="text-xs text-slate-400">Min (ms)</p>
-                    </div>
-                    <div className="bg-slate-700/30 rounded-lg p-3 text-center">
-                        <p className="text-2xl font-bold text-yellow-400 font-mono">{latency.p99_ms.toFixed(1)}</p>
-                        <p className="text-xs text-slate-400">P99 (ms)</p>
-                    </div>
-                    <div className="bg-slate-700/30 rounded-lg p-3 text-center">
-                        <p className="text-2xl font-bold text-red-400 font-mono">{(latency.max_us / 1000).toFixed(1)}</p>
-                        <p className="text-xs text-slate-400">Max (ms)</p>
-                    </div>
-                </div>
-            );
-        };
-
-        // PnL Summary
-        const PnLSummary = ({ pnl, mode }) => {
-            const data = pnl[mode] || {};
-            const totalPnl = data.total_pnl || 0;
-            const balance = data.balance || 10000;
-            const roi = data.total_cost > 0 ? (totalPnl / data.total_cost * 100) : 0;
-
-            return (
-                <div className="space-y-3">
-                    <div className="flex justify-between items-center">
-                        <span className="text-slate-400">Filled Trades</span>
-                        <span className="text-white font-mono">{data.filled || 0}</span>
-                    </div>
-                    <div className="flex justify-between items-center">
-                        <span className="text-slate-400">Resolved</span>
-                        <span className="text-white font-mono">{data.resolved || 0}</span>
-                    </div>
-                    <div className="flex justify-between items-center">
-                        <span className="text-slate-400">Total Cost</span>
-                        <span className="text-white font-mono">${(data.total_cost || 0).toFixed(2)}</span>
-                    </div>
-                    <div className="border-t border-slate-700 pt-3">
-                        <div className="flex justify-between items-center">
-                            <span className="text-slate-400">Total PnL</span>
-                            <span className={`font-mono font-bold ${totalPnl >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-                                {totalPnl >= 0 ? '+' : ''}${totalPnl.toFixed(2)}
-                            </span>
-                        </div>
-                    </div>
-                    {mode === 'demo' && (
-                        <div className="flex justify-between items-center">
-                            <span className="text-slate-400">Balance</span>
-                            <span className="text-white font-mono">${balance.toFixed(2)}</span>
-                        </div>
-                    )}
-                    <div className="flex justify-between items-center">
-                        <span className="text-slate-400">ROI</span>
-                        <span className={`font-mono ${roi >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-                            {roi >= 0 ? '+' : ''}{roi.toFixed(2)}%
-                        </span>
-                    </div>
-                </div>
-            );
-        };
-
         // Modal Component
         const Modal = ({ isOpen, onClose, title, children }) => {
             if (!isOpen) return null;
@@ -648,8 +571,6 @@
 
             const status = data?.status || {};
             const scanner = data?.scanner || {};
-            const latency = data?.latency || {};
-            const pnl = data?.pnl || { demo: {}, live: {} };
             const trades = data?.trades || { demo: [], live: [], copy: [] };
             const copyTrader = data?.copy_trader || {};
             const allTrades = [...(trades.demo || []), ...(trades.live || []), ...(trades.copy || [])]
@@ -942,41 +863,10 @@
                                 />
                             </div>
 
-                            {/* Latency Metrics */}
-                            <div className="bg-slate-800/50 backdrop-blur rounded-xl border border-slate-700/50 p-4">
-                                <h2 className="text-lg font-semibold mb-4 flex items-center gap-2">
-                                    <span className="text-cyan-400"><Clock /></span>
-                                    Latency Metrics
-                                </h2>
-                                <LatencyDisplay latency={latency} />
-                                {latency.count > 0 && (
-                                    <p className="text-xs text-slate-500 mt-3 text-center">
-                                        Based on {latency.count} samples
-                                    </p>
-                                )}
-                            </div>
                         </div>
 
-                        {/* Right Column - PnL & Config */}
+                        {/* Right Column - Config & Markets */}
                         <div className="space-y-6">
-                            {/* Demo PnL */}
-                            <div className="bg-slate-800/50 backdrop-blur rounded-xl border border-slate-700/50 p-4">
-                                <h2 className="text-lg font-semibold mb-4 flex items-center gap-2">
-                                    <span className="text-blue-400"><DollarSign /></span>
-                                    Demo PnL
-                                </h2>
-                                <PnLSummary pnl={pnl} mode="demo" />
-                            </div>
-
-                            {/* Live PnL */}
-                            <div className="bg-slate-800/50 backdrop-blur rounded-xl border border-red-500/30 p-4">
-                                <h2 className="text-lg font-semibold mb-4 flex items-center gap-2">
-                                    <span className="text-red-400"><TrendingUp /></span>
-                                    Live PnL
-                                </h2>
-                                <PnLSummary pnl={pnl} mode="live" />
-                            </div>
-
                             {/* Config */}
                             <div className="bg-slate-800/50 backdrop-blur rounded-xl border border-slate-700/50 p-4">
                                 <h2 className="text-lg font-semibold mb-4">Configuration</h2>
