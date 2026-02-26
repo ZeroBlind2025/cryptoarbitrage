@@ -306,7 +306,7 @@ def get_positions(wallet_address: str) -> list:
         return []
 
 
-def get_latest_bets(wallet_address: str, limit: int = 20, verbose: bool = False) -> list:
+def get_latest_bets(wallet_address: str, limit: int = 20, verbose: bool = False, offset: int = 0) -> list:
     """Get recent buy trades for a wallet using server-side filtering"""
     try:
         url = f"{DATA_API}/activity"
@@ -318,6 +318,8 @@ def get_latest_bets(wallet_address: str, limit: int = 20, verbose: bool = False)
             "type": "TRADE",
             "side": "BUY",
         }
+        if offset > 0:
+            params["offset"] = offset
         response = requests.get(url, params=params, timeout=10)
 
         if verbose:
@@ -629,38 +631,47 @@ class CopyTrader:
             slug = bet.get("slug", "")
 
             # Calculate entry price from usdcSize / size (dollars spent / shares received)
-            # This is the TRUE entry price. The 'price' field from activity API is current price, not entry price!
+            # This is the TRUE entry price. The 'price' field from activity API is
+            # the CURRENT market price, NOT the entry price — using it as fallback
+            # causes 200%+ reconciliation diffs.
             price = None
+            price_source = "unknown"
             usdc_size = bet.get('usdcSize') or bet.get('usdc_size') or bet.get('amount')
             shares = bet.get('size')
 
-            print(f"[ALGO] Bet fields: {list(bet.keys())}")
-            print(f"[ALGO] Bet values: usdcSize={usdc_size}, size={shares}, price_field={bet.get('price')}")
-
             if usdc_size and shares:
                 try:
-                    usdc_size = float(usdc_size)
-                    shares = float(shares)
-                    if shares > 0:
-                        price = usdc_size / shares
-                        print(f"[ALGO] Entry price calculated: ${usdc_size} / {shares} shares = {price:.4f} ({price*100:.1f}¢)")
+                    usdc_f = float(usdc_size)
+                    shares_f = float(shares)
+                    if shares_f > 0:
+                        price = usdc_f / shares_f
+                        price_source = "calculated"
                 except (ValueError, TypeError):
                     pass
 
-            # Fallback to price field only if calculation failed (shouldn't happen)
+            # If calculation failed, DO NOT fall back to bet.get('price') — that's
+            # the current market price and would create a phantom entry price.
+            # Instead, log the gap and leave price at None so the WS live ask
+            # (or 0) is used, which is more honest.
             if not price or price <= 0:
-                raw_price = bet.get('price')
-                if raw_price:
+                # Last resort: try cashAmount field (some API versions)
+                cash_amt = bet.get("cashAmount") or bet.get("cash_amount")
+                if cash_amt and shares:
                     try:
-                        price = float(raw_price)
-                        print(f"[ALGO] WARNING: Using price field as fallback: {price}")
-                    except (ValueError, TypeError):
+                        price = float(cash_amt) / float(shares)
+                        price_source = "cashAmount"
+                    except (ValueError, TypeError, ZeroDivisionError):
                         pass
 
-            # Final fallback
             if not price or price <= 0:
                 price = 0
-                print(f"[ALGO] WARNING: Could not determine entry price, defaulting to 0")
+                price_source = "none"
+                print(f"[ALGO] WARNING: Could not calculate entry price "
+                      f"(usdcSize={usdc_size}, size={shares}). "
+                      f"API price field={bet.get('price')} (NOT used — it's current price, not entry)")
+
+            if price_source == "calculated":
+                print(f"[ALGO] Entry: ${float(usdc_size):.4f} / {float(shares):.2f} shares = {price:.4f} ({price*100:.1f}¢)")
 
             # Filter for crypto markets only
             if self.crypto_only and not is_crypto_market(bet):
@@ -1140,53 +1151,88 @@ class CopyTrader:
 # TRADE RECONCILIATION
 # =============================================================================
 
-def get_target_trade_history(limit: int = 100) -> list:
+def _parse_target_bet(bet: dict) -> Optional[dict]:
+    """Parse a single API bet into a normalized trade dict, or None if not crypto."""
+    if not is_crypto_market(bet):
+        return None
+
+    usdc_size = bet.get("usdcSize") or bet.get("usdc_size") or bet.get("amount") or 0
+    shares = bet.get("size") or 0
+    try:
+        usdc_size = float(usdc_size)
+        shares = float(shares)
+        entry_price = usdc_size / shares if shares > 0 else 0
+    except (ValueError, TypeError, ZeroDivisionError):
+        entry_price = 0
+
+    return {
+        "id": bet.get("id", ""),
+        "timestamp": bet.get("timestamp") or bet.get("createdAt") or "",
+        "market": (bet.get("title") or "")[:80],
+        "slug": bet.get("slug", ""),
+        "outcome": bet.get("outcome", ""),
+        "condition_id": bet.get("conditionId") or bet.get("condition_id") or "",
+        "token_id": bet.get("asset") or bet.get("token_id") or "",
+        "entry_price": round(entry_price, 6),
+        "usdc_size": round(usdc_size, 4),
+        "shares": round(shares, 4),
+    }
+
+
+def get_target_trade_history(limit: int = 100, max_pages: int = 10) -> list:
     """Fetch target trader's recent BUY trades for reconciliation.
 
-    Pulls up to `limit` crypto BUY trades from the Polymarket activity API
-    and normalises the fields we care about for comparison.
+    Paginates through the Polymarket activity API using offset to get ALL
+    crypto BUY trades (up to page_size * max_pages).  Without pagination
+    the API cap of ~100 rows only covers the most recent window, making
+    everything from earlier windows look like EXTRA_COPY.
     """
-    raw = get_latest_bets(TARGET_ADDRESS, limit=limit)
-    trades = []
-    for bet in raw:
-        if not is_crypto_market(bet):
-            continue
+    all_trades: list = []
+    seen_ids: set = set()
+    page_size = min(limit, 100)  # API max per page
 
-        # Entry price: usdcSize / size
-        usdc_size = bet.get("usdcSize") or bet.get("usdc_size") or bet.get("amount") or 0
-        shares = bet.get("size") or 0
-        try:
-            usdc_size = float(usdc_size)
-            shares = float(shares)
-            entry_price = usdc_size / shares if shares > 0 else 0
-        except (ValueError, TypeError, ZeroDivisionError):
-            entry_price = 0
+    for page in range(max_pages):
+        offset = page * page_size
+        raw = get_latest_bets(TARGET_ADDRESS, limit=page_size, offset=offset)
+        if not raw:
+            break
 
-        trades.append({
-            "id": bet.get("id", ""),
-            "timestamp": bet.get("timestamp") or bet.get("createdAt") or "",
-            "market": (bet.get("title") or "")[:80],
-            "slug": bet.get("slug", ""),
-            "outcome": bet.get("outcome", ""),
-            "condition_id": bet.get("conditionId") or bet.get("condition_id") or "",
-            "token_id": bet.get("asset") or bet.get("token_id") or "",
-            "entry_price": round(entry_price, 6),
-            "usdc_size": round(usdc_size, 4),
-            "shares": round(shares, 4),
-        })
-    return trades
+        new_this_page = 0
+        for bet in raw:
+            bet_id = bet.get("id", "")
+            if bet_id in seen_ids:
+                continue
+            seen_ids.add(bet_id)
+
+            trade = _parse_target_bet(bet)
+            if trade:
+                all_trades.append(trade)
+                new_this_page += 1
+
+        # If API returned fewer than page_size, we've hit the end
+        if len(raw) < page_size or new_this_page == 0:
+            break
+
+    print(f"[RECONCILE] Fetched {len(all_trades)} target trades across {min(page + 1, max_pages)} pages", flush=True)
+    return all_trades
 
 
-def build_reconciliation(positions: dict, target_limit: int = 100) -> list:
+def build_reconciliation(positions: dict, target_limit: int = 100, max_pages: int = 10) -> list:
     """Build a side-by-side reconciliation of target trades vs our trades.
 
     Returns a list of dicts, one per row, ready to be written as CSV.
     Uses 1-to-1 matching: each target trade is paired with the closest
-    (by timestamp) unmatched copy on the same condition_id + outcome.
+    (by entry price) unmatched copy on the same condition_id + outcome.
     Unmatched target trades are flagged as MISSED; extra copies we made
     beyond what the target traded are flagged as EXTRA_COPY.
+
+    The function paginates through the target's API activity to avoid the
+    limit=100 truncation bug that caused all earlier-window copies to appear
+    as EXTRA_COPY.  It also scopes comparison to the time window covered by
+    target trades — positions outside that window are flagged UNMATCHED_WINDOW
+    instead of EXTRA_COPY.
     """
-    target_trades = get_target_trade_history(limit=target_limit)
+    target_trades = get_target_trade_history(limit=target_limit, max_pages=max_pages)
 
     # Index our trades by condition_id + outcome for matching
     our_open = positions.get("open", [])
@@ -1280,10 +1326,26 @@ def build_reconciliation(positions: dict, target_limit: int = 100) -> list:
                 "condition_id": cid,
             })
 
-    # Flag our extra copies that weren't matched to any target trade
+    # Determine the condition_ids the target actually traded so we can
+    # distinguish "extra copy on a target market" (true EXTRA_COPY) from
+    # "we traded a market the target never touched in the API window"
+    # (UNMATCHED_WINDOW — likely a pagination gap, not a real problem).
+    target_condition_ids = set(t["condition_id"] for t in target_trades)
+
     for key, positions_list in our_lookup.items():
+        cid = key[0]
         for m in positions_list:
             if id(m) not in claimed:
+                # If this condition_id appears in target trades, it's a true
+                # extra copy (we copied more times than the target traded).
+                # If the target never shows up for this market, it's an
+                # API-window gap — the target probably traded it but those
+                # rows fell outside the paginated fetch.
+                if cid in target_condition_ids:
+                    status = "EXTRA_COPY"
+                else:
+                    status = "UNMATCHED_WINDOW"
+
                 rows.append({
                     "target_timestamp": "",
                     "target_market": m.get("market", ""),
@@ -1297,9 +1359,14 @@ def build_reconciliation(positions: dict, target_limit: int = 100) -> list:
                     "our_amount": m.get("amount", 0),
                     "our_result": m.get("result", "OPEN"),
                     "our_pnl": m.get("pnl", ""),
-                    "status": "EXTRA_COPY",
-                    "condition_id": key[0],
+                    "status": status,
+                    "condition_id": cid,
                 })
+
+    # Summary stats
+    from collections import Counter
+    status_counts = Counter(r["status"] for r in rows)
+    print(f"[RECONCILE] Results: {dict(status_counts)}", flush=True)
 
     return rows
 
