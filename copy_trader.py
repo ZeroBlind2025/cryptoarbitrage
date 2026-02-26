@@ -57,6 +57,7 @@ SIGNATURE_TYPE = int(os.getenv("POLYMARKET_SIGNATURE_TYPE", "0"))  # 0=EOA, 1=Em
 BET_AMOUNT = float(os.getenv("COPY_BET_AMOUNT", "2.0"))  # $ per copied bet
 POLL_INTERVAL = int(os.getenv("COPY_POLL_INTERVAL", "10"))  # seconds between checks
 ALGO_STARTING_BALANCE = float(os.getenv("ALGO_STARTING_BALANCE", "2300.0"))  # Starting balance for Poly Algo
+PRICE_BUFFER_BPS = int(os.getenv("COPY_PRICE_BUFFER_BPS", "50"))  # Max overbid vs target's price (50 bps = 0.5%)
 
 # Crypto market filter - only copy trades on these markets
 CRYPTO_SLUGS = ["btc-", "eth-", "sol-", "xrp-", "-updown-"]
@@ -365,22 +366,48 @@ def get_clob_client() -> Optional["ClobClient"]:
         return None
 
 
-def place_bet(client: "ClobClient", token_id: str, amount: float) -> dict:
-    """Place a market buy order. Returns fill details or empty dict on failure."""
+def place_bet(client: "ClobClient", token_id: str, amount: float, max_price: float = 0) -> dict:
+    """Place a price-protected limit order. Returns fill details or empty dict on failure.
+
+    Uses a GTC limit order at max_price (target's entry + buffer) so the order
+    won't fill at absurd prices if the market has moved. Falls back to FOK market
+    order only if no max_price is provided.
+    """
     try:
-        order = MarketOrderArgs(
-            token_id=token_id,
-            amount=amount,
-            side=BUY,
-            order_type=OrderType.FOK
-        )
-        signed_order = client.create_market_order(order)
-        result = client.post_order(signed_order, OrderType.FOK)
+        if max_price and max_price > 0:
+            # Price-protected limit order: won't pay more than max_price
+            limit_price = min(round(max_price, 4), 0.99)
+            size = amount / limit_price  # shares to buy at this price
+
+            print(f"[ALGO] Limit order: {size:.2f} shares @ {limit_price:.4f} (max ${amount:.2f})")
+            order = client.create_order(
+                token_id=token_id,
+                price=limit_price,
+                size=round(size, 2),
+                side=BUY,
+            )
+            result = client.post_order(order)
+        else:
+            # Fallback: FOK market order (no price protection)
+            print(f"[ALGO] WARNING: No max_price, using FOK market order")
+            order = MarketOrderArgs(
+                token_id=token_id,
+                amount=amount,
+                side=BUY,
+                order_type=OrderType.FOK
+            )
+            signed_order = client.create_market_order(order)
+            result = client.post_order(signed_order, OrderType.FOK)
 
         # Extract fill details from CLOB response
         fill_info = {"success": True}
         if isinstance(result, dict):
-            # Average fill price: USDC spent / shares received
+            status = result.get("status", "").lower()
+            # Check if order was rejected / not matched
+            if status in ("rejected", "failed", "expired"):
+                print(f"[ALGO] Order {status}: price moved beyond limit. Result: {result}")
+                return {}
+
             usdc_filled = float(result.get("matchedAmount") or result.get("amount") or 0)
             shares_filled = float(result.get("size") or result.get("filledSize") or 0)
             if shares_filled > 0:
@@ -606,7 +633,10 @@ class CopyTrader:
             else:
                 token_id = bet.get("asset", "")
                 if token_id and self.client:
-                    fill = place_bet(self.client, token_id, self.bet_amount)
+                    # Price-protect: max we'll pay = target's entry + buffer
+                    buffer = PRICE_BUFFER_BPS / 10000
+                    max_price = price * (1 + buffer) if price > 0 else 0
+                    fill = place_bet(self.client, token_id, self.bet_amount, max_price=max_price)
                     if fill.get("success"):
                         # Use our actual fill price instead of target's entry price
                         if fill.get("fill_price"):
