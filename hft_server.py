@@ -1715,6 +1715,62 @@ def api_copy_download():
     )
 
 
+@app.route('/api/copy-trader/compare')
+def api_copy_compare():
+    """Download reconciliation CSV comparing target trader's trades to ours"""
+    import csv
+    from io import StringIO
+    from copy_trader import build_reconciliation, load_positions
+
+    target_limit = int(request.args.get('limit', 100))
+
+    # Use live positions if algo is running, otherwise load from file
+    positions_data = None
+    if copy_trader:
+        positions_data = copy_trader.positions
+    else:
+        try:
+            positions_data = load_positions()
+        except Exception as e:
+            return jsonify({"error": f"Failed to load positions: {e}"}), 500
+
+    if not positions_data:
+        return jsonify({"error": "No position data available"}), 404
+
+    try:
+        rows = build_reconciliation(positions_data, target_limit=target_limit)
+    except Exception as e:
+        return jsonify({"error": f"Reconciliation failed: {e}"}), 500
+
+    if not rows:
+        return jsonify({"error": "No target trades found to compare"}), 404
+
+    # Build CSV
+    output = StringIO()
+    fieldnames = [
+        "status",
+        "target_timestamp", "target_market", "target_outcome",
+        "target_entry_price", "target_usdc", "target_shares",
+        "our_timestamp", "our_outcome", "our_entry_price",
+        "our_amount", "our_result", "our_pnl",
+        "condition_id",
+    ]
+    writer = csv.DictWriter(output, fieldnames=fieldnames, extrasaction='ignore')
+    writer.writeheader()
+    for row in rows:
+        writer.writerow(row)
+
+    csv_content = output.getvalue()
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"poly_algo_reconciliation_{timestamp}.csv"
+
+    return Response(
+        csv_content,
+        mimetype='text/csv',
+        headers={"Content-Disposition": f"attachment; filename={filename}"}
+    )
+
+
 @app.route('/api/trades/demo')
 def api_trades_demo():
     """Get demo trades"""
