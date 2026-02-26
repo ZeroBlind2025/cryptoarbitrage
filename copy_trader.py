@@ -365,8 +365,8 @@ def get_clob_client() -> Optional["ClobClient"]:
         return None
 
 
-def place_bet(client: "ClobClient", token_id: str, amount: float) -> bool:
-    """Place a market buy order"""
+def place_bet(client: "ClobClient", token_id: str, amount: float) -> dict:
+    """Place a market buy order. Returns fill details or empty dict on failure."""
     try:
         order = MarketOrderArgs(
             token_id=token_id,
@@ -376,10 +376,22 @@ def place_bet(client: "ClobClient", token_id: str, amount: float) -> bool:
         )
         signed_order = client.create_market_order(order)
         result = client.post_order(signed_order, OrderType.FOK)
-        return True
+
+        # Extract fill details from CLOB response
+        fill_info = {"success": True}
+        if isinstance(result, dict):
+            # Average fill price: USDC spent / shares received
+            usdc_filled = float(result.get("matchedAmount") or result.get("amount") or 0)
+            shares_filled = float(result.get("size") or result.get("filledSize") or 0)
+            if shares_filled > 0:
+                fill_info["fill_price"] = usdc_filled / shares_filled
+                fill_info["shares"] = shares_filled
+                fill_info["usdc"] = usdc_filled
+            print(f"[ALGO] Fill details: {result}")
+        return fill_info
     except Exception as e:
         print(f"[ALGO] Order error: {e}")
-        return False
+        return {}
 
 
 # =============================================================================
@@ -594,9 +606,15 @@ class CopyTrader:
             else:
                 token_id = bet.get("asset", "")
                 if token_id and self.client:
-                    success = place_bet(self.client, token_id, self.bet_amount)
-                    if success:
-                        print(f"       EXECUTED!")
+                    fill = place_bet(self.client, token_id, self.bet_amount)
+                    if fill.get("success"):
+                        # Use our actual fill price instead of target's entry price
+                        if fill.get("fill_price"):
+                            price = fill["fill_price"]
+                            trade_record["price"] = price
+                            print(f"       EXECUTED! Fill price: {price:.4f} ({price*100:.1f}¢)")
+                        else:
+                            print(f"       EXECUTED! (fill price unavailable, using target's entry)")
                         trade_record["status"] = "filled"
                         copied += 1
                         self.total_spent += self.bet_amount
@@ -1009,9 +1027,10 @@ def build_reconciliation(positions: dict, target_limit: int = 100) -> list:
     """Build a side-by-side reconciliation of target trades vs our trades.
 
     Returns a list of dicts, one per row, ready to be written as CSV.
-    Each row shows the target's trade on the left and our matching copy
-    (if any) on the right, plus a status column flagging misses or
-    price divergence.
+    Uses 1-to-1 matching: each target trade is paired with the closest
+    (by timestamp) unmatched copy on the same condition_id + outcome.
+    Unmatched target trades are flagged as MISSED; extra copies we made
+    beyond what the target traded are flagged as EXTRA_COPY.
     """
     target_trades = get_target_trade_history(limit=target_limit)
 
@@ -1021,6 +1040,7 @@ def build_reconciliation(positions: dict, target_limit: int = 100) -> list:
     all_ours = our_open + our_resolved
 
     # Build lookup: (condition_id, outcome_normalised) -> list of our positions
+    # Each position can only be matched once (1-to-1)
     our_lookup: dict[tuple, list] = {}
     for pos in all_ours:
         cid = pos.get("condition_id", "")
@@ -1028,9 +1048,12 @@ def build_reconciliation(positions: dict, target_limit: int = 100) -> list:
         key = (cid, outcome)
         our_lookup.setdefault(key, []).append(pos)
 
-    # Also build a set of our condition_ids to detect trades we made that the
-    # target didn't (shouldn't happen, but good to flag)
-    our_cids_seen = set()
+    # Sort each bucket by timestamp so closest-match works well
+    for key in our_lookup:
+        our_lookup[key] = sorted(our_lookup[key], key=lambda p: p.get("timestamp", ""))
+
+    # Track which of our positions have been claimed by a target trade
+    claimed: set = set()
 
     rows = []
     for t in target_trades:
@@ -1038,42 +1061,52 @@ def build_reconciliation(positions: dict, target_limit: int = 100) -> list:
         outcome_norm = t["outcome"].lower().strip()
         key = (cid, outcome_norm)
 
-        matches = our_lookup.get(key, [])
-        our_cids_seen.add(cid)
+        candidates = our_lookup.get(key, [])
 
-        if matches:
-            for m in matches:
-                our_price = m.get("entry_price", 0)
-                target_price = t["entry_price"]
-                price_diff = abs(our_price - target_price) if our_price and target_price else None
-                # Flag if our entry price diverges by >5% from target
-                if target_price and price_diff is not None:
-                    pct_diff = price_diff / target_price * 100
-                else:
-                    pct_diff = None
+        # Pick the best unclaimed match (closest entry price to target)
+        best = None
+        best_diff = float("inf")
+        for m in candidates:
+            mid = id(m)
+            if mid in claimed:
+                continue
+            diff = abs((m.get("entry_price", 0) or 0) - (t["entry_price"] or 0))
+            if diff < best_diff:
+                best_diff = diff
+                best = m
 
-                status = "MATCHED"
-                if pct_diff is not None and pct_diff > 5:
-                    status = f"PRICE_DIFF ({pct_diff:.1f}%)"
+        if best is not None:
+            claimed.add(id(best))
+            our_price = best.get("entry_price", 0)
+            target_price = t["entry_price"]
+            price_diff = abs(our_price - target_price) if our_price and target_price else None
+            if target_price and price_diff is not None:
+                pct_diff = price_diff / target_price * 100
+            else:
+                pct_diff = None
 
-                result = m.get("result", "OPEN")
+            status = "MATCHED"
+            if pct_diff is not None and pct_diff > 5:
+                status = f"PRICE_DIFF ({pct_diff:.1f}%)"
 
-                rows.append({
-                    "target_timestamp": t["timestamp"],
-                    "target_market": t["market"],
-                    "target_outcome": t["outcome"],
-                    "target_entry_price": t["entry_price"],
-                    "target_usdc": t["usdc_size"],
-                    "target_shares": t["shares"],
-                    "our_timestamp": m.get("timestamp", ""),
-                    "our_outcome": m.get("outcome", ""),
-                    "our_entry_price": our_price,
-                    "our_amount": m.get("amount", 0),
-                    "our_result": result,
-                    "our_pnl": m.get("pnl", ""),
-                    "status": status,
-                    "condition_id": cid,
-                })
+            result = best.get("result", "OPEN")
+
+            rows.append({
+                "target_timestamp": t["timestamp"],
+                "target_market": t["market"],
+                "target_outcome": t["outcome"],
+                "target_entry_price": t["entry_price"],
+                "target_usdc": t["usdc_size"],
+                "target_shares": t["shares"],
+                "our_timestamp": best.get("timestamp", ""),
+                "our_outcome": best.get("outcome", ""),
+                "our_entry_price": our_price,
+                "our_amount": best.get("amount", 0),
+                "our_result": result,
+                "our_pnl": best.get("pnl", ""),
+                "status": status,
+                "condition_id": cid,
+            })
         else:
             # Target traded but we have no matching copy
             rows.append({
@@ -1092,6 +1125,27 @@ def build_reconciliation(positions: dict, target_limit: int = 100) -> list:
                 "status": "MISSED",
                 "condition_id": cid,
             })
+
+    # Flag our extra copies that weren't matched to any target trade
+    for key, positions_list in our_lookup.items():
+        for m in positions_list:
+            if id(m) not in claimed:
+                rows.append({
+                    "target_timestamp": "",
+                    "target_market": m.get("market", ""),
+                    "target_outcome": "",
+                    "target_entry_price": "",
+                    "target_usdc": "",
+                    "target_shares": "",
+                    "our_timestamp": m.get("timestamp", ""),
+                    "our_outcome": m.get("outcome", ""),
+                    "our_entry_price": m.get("entry_price", ""),
+                    "our_amount": m.get("amount", 0),
+                    "our_result": m.get("result", "OPEN"),
+                    "our_pnl": m.get("pnl", ""),
+                    "status": "EXTRA_COPY",
+                    "condition_id": key[0],
+                })
 
     return rows
 
