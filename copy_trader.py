@@ -841,6 +841,80 @@ class CopyTrader:
             return default
         return v
 
+    @staticmethod
+    def _thin_balance_history(history: list) -> list:
+        """Downsample balance history so all timeframes (1H to 1M) have data.
+
+        Strategy: keep full resolution for recent data, progressively thin older data.
+        - Last 1 hour:   every point
+        - 1h - 6h:       every 5th point
+        - 6h - 24h:      every 20th point
+        - 1d - 7d:       every 100th point
+        - 7d - 30d:      every 500th point
+        Result: ~5-6k points max regardless of how long the algo runs.
+        """
+        if len(history) <= 2000:
+            return history
+
+        now_ms = time.time() * 1000
+        buckets = [
+            (1 * 3600 * 1000, 1),      # last 1h: every point
+            (6 * 3600 * 1000, 5),       # 1h-6h: every 5th
+            (24 * 3600 * 1000, 20),     # 6h-1d: every 20th
+            (7 * 24 * 3600 * 1000, 100),   # 1d-7d: every 100th
+            (30 * 24 * 3600 * 1000, 500),  # 7d-30d: every 500th
+        ]
+
+        result = []
+        for entry in history:
+            try:
+                ts = entry.get("timestamp", "")
+                entry_ms = datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp() * 1000
+            except Exception:
+                continue
+            age_ms = now_ms - entry_ms
+            if age_ms < 0:
+                age_ms = 0
+
+            # Find which bucket this entry belongs to
+            keep = False
+            prev_boundary = 0
+            for boundary, step in buckets:
+                if age_ms < boundary:
+                    # Use index within this bucket's portion of the list for thinning
+                    keep = True
+                    break
+                prev_boundary = boundary
+
+            if not keep:
+                # Older than 30 days - skip
+                continue
+
+            result.append((age_ms, entry))
+
+        # Now thin each bucket
+        # Sort by age descending (oldest first) so indices are stable per bucket
+        result.sort(key=lambda x: -x[0])
+
+        thinned = []
+        bucket_counters = {}
+        for age_ms, entry in result:
+            # Determine step for this age
+            step = 1
+            for boundary, s in buckets:
+                if age_ms < boundary:
+                    step = s
+                    break
+
+            bucket_key = step
+            bucket_counters[bucket_key] = bucket_counters.get(bucket_key, 0) + 1
+            if bucket_counters[bucket_key] % step == 0 or step == 1:
+                thinned.append(entry)
+
+        # Sort chronologically
+        thinned.sort(key=lambda e: e.get("timestamp", ""))
+        return thinned
+
     def get_stats(self) -> dict:
         """Get current statistics for dashboard"""
         stats = self.positions.get("stats", {})
@@ -849,8 +923,9 @@ class CopyTrader:
         total_pnl = self._safe_float(stats.get("total_pnl", 0.0))
         win_rate = (wins / (wins + losses) * 100) if (wins + losses) > 0 else 0
         balance = self._safe_float(stats.get("balance", ALGO_STARTING_BALANCE))
-        # Cap balance_history to last 10000 entries (enough for days of data)
-        balance_history = stats.get("balance_history", [])[-10000:]
+        # Downsample balance_history for long timeframes (1D/1W/1M)
+        # Keep recent data at full resolution, thin older data progressively
+        balance_history = self._thin_balance_history(stats.get("balance_history", []))
 
         open_staked = sum(p.get("amount", 0) for p in self.positions.get("open", []))
         equity = self._safe_float(balance + open_staked)
