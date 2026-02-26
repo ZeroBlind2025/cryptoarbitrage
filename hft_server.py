@@ -1567,16 +1567,31 @@ def api_copy_reset_stats():
     if not copy_trader:
         return jsonify({"error": "Copy trader not running"})
 
-    # Reset stats
-    copy_trader.positions["stats"] = {"wins": 0, "losses": 0, "total_pnl": 0.0}
+    from copy_trader import save_positions, ALGO_STARTING_BALANCE
+    from datetime import datetime, timezone
 
-    # Also clear resolved to start fresh
     data = request.get_json() or {}
+
+    # Reset stats including balance and history
+    copy_trader.positions["stats"] = {
+        "wins": 0, "losses": 0, "total_pnl": 0.0,
+        "balance": ALGO_STARTING_BALANCE,
+        "balance_history": [
+            {"timestamp": datetime.now(timezone.utc).isoformat(),
+             "balance": ALGO_STARTING_BALANCE, "pnl": 0.0,
+             "equity": ALGO_STARTING_BALANCE, "event": "reset"}
+        ],
+    }
+
+    # Also clear positions and in-memory dedup sets
     if data.get("clear_all"):
         copy_trader.positions["open"] = []
         copy_trader.positions["resolved"] = []
+        copy_trader.copied_sizes.clear()
+        copy_trader.trades_copied = 0
+        copy_trader.trades_skipped = 0
+        copy_trader.total_spent = 0.0
 
-    from copy_trader import save_positions
     save_positions(copy_trader.positions)
 
     return jsonify({
@@ -1764,6 +1779,29 @@ def api_pnl():
     })
 
 
+def _get_copy_trader_data() -> dict:
+    """Get copy trader data for /api/data, with error isolation"""
+    _ct_defaults = {
+        "dry_run": True, "trades_copied": 0, "trades_skipped": 0,
+        "total_spent": 0, "open_positions": 0, "resolved_positions": 0,
+        "wins": 0, "losses": 0, "win_rate": 0, "total_pnl": 0,
+        "balance": 500.0, "equity": 500.0, "balance_history": [], "bet_amount": 2.0,
+    }
+    base = {
+        "running": copy_trader_thread and copy_trader_thread.is_alive(),
+        "paused": copy_trader_paused.is_set() if (copy_trader_thread and copy_trader_thread.is_alive()) else False,
+        "target": TARGET_ADDRESS[:20] + "..." if TARGET_ADDRESS else "",
+        "target_name": copy_trader.target_name if copy_trader else "",
+    }
+    try:
+        stats = copy_trader.get_stats() if copy_trader else _ct_defaults
+        base.update(stats)
+    except Exception as e:
+        print(f"[ALGO] get_stats error (using defaults): {e}", flush=True)
+        base.update(_ct_defaults)
+    return base
+
+
 @app.route('/api/data')
 def api_data():
     """Get all dashboard data in one call"""
@@ -1806,28 +1844,7 @@ def api_data():
             "live": recent_live,
             "copy": list(copy_trades)[-20:],
         },
-        "copy_trader": {
-            "running": copy_trader_thread and copy_trader_thread.is_alive(),
-            "paused": copy_trader_paused.is_set() if (copy_trader_thread and copy_trader_thread.is_alive()) else False,
-            "target": TARGET_ADDRESS[:20] + "..." if TARGET_ADDRESS else "",
-            "target_name": copy_trader.target_name if copy_trader else "",
-            **(copy_trader.get_stats() if copy_trader else {
-                "dry_run": True,
-                "trades_copied": 0,
-                "trades_skipped": 0,
-                "total_spent": 0,
-                "open_positions": 0,
-                "resolved_positions": 0,
-                "wins": 0,
-                "losses": 0,
-                "win_rate": 0,
-                "total_pnl": 0,
-                "balance": 500.0,
-                "equity": 500.0,
-                "balance_history": [],
-                "bet_amount": 2.0,
-            }),
-        },
+        "copy_trader": _get_copy_trader_data(),
         "pnl": {
             "demo": {
                 "filled": len(demo_filled),

@@ -821,34 +821,45 @@ class CopyTrader:
             stats = self.positions["stats"]
             print(f"[ALGO] {resolved_this_check} position(s) resolved. Record: {stats['wins']}W/{stats['losses']}L, PnL: ${stats['total_pnl']:+.2f}")
 
+    @staticmethod
+    def _safe_float(v, default=0.0):
+        """Ensure a float is JSON-safe (no NaN/Inf)"""
+        import math
+        if not isinstance(v, (int, float)):
+            return default
+        if math.isnan(v) or math.isinf(v):
+            return default
+        return v
+
     def get_stats(self) -> dict:
         """Get current statistics for dashboard"""
         stats = self.positions.get("stats", {})
         wins = stats.get("wins", 0)
         losses = stats.get("losses", 0)
-        total_pnl = stats.get("total_pnl", 0.0)
+        total_pnl = self._safe_float(stats.get("total_pnl", 0.0))
         win_rate = (wins / (wins + losses) * 100) if (wins + losses) > 0 else 0
-        balance = stats.get("balance", ALGO_STARTING_BALANCE)
-        balance_history = stats.get("balance_history", [])
+        balance = self._safe_float(stats.get("balance", ALGO_STARTING_BALANCE))
+        # Cap balance_history to last 500 entries to keep API responses fast
+        balance_history = stats.get("balance_history", [])[-500:]
 
         open_staked = sum(p.get("amount", 0) for p in self.positions.get("open", []))
-        equity = balance + open_staked
+        equity = self._safe_float(balance + open_staked)
 
         return {
             "trades_copied": self.trades_copied,
             "trades_skipped": self.trades_skipped,
-            "total_spent": self.total_spent,
+            "total_spent": self._safe_float(self.total_spent),
             "open_positions": len(self.positions.get("open", [])),
             "resolved_positions": len(self.positions.get("resolved", [])),
             "wins": wins,
             "losses": losses,
-            "win_rate": win_rate,
+            "win_rate": self._safe_float(win_rate),
             "total_pnl": total_pnl,
             "dry_run": self.dry_run,
             "balance": balance,
             "equity": equity,
             "balance_history": balance_history,
-            "bet_amount": self.bet_amount,
+            "bet_amount": self._safe_float(self.bet_amount),
         }
 
     def print_stats(self):
