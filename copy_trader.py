@@ -267,23 +267,38 @@ def get_positions(wallet_address: str) -> list:
         return []
 
 
-def get_latest_bets(wallet_address: str, limit: int = 20) -> list:
-    """Get recent buy trades for a wallet"""
+def get_latest_bets(wallet_address: str, limit: int = 20, verbose: bool = False) -> list:
+    """Get recent buy trades for a wallet using server-side filtering"""
     try:
-        response = requests.get(
-            f"{DATA_API}/activity",
-            params={"user": wallet_address, "limit": limit},
-            timeout=10
-        )
+        url = f"{DATA_API}/activity"
+        # Use server-side type/side filtering so BUY trades aren't pushed out
+        # of the result window by SELLs/REDEEMs/etc.
+        params = {
+            "user": wallet_address,
+            "limit": limit,
+            "type": "TRADE",
+            "side": "BUY",
+        }
+        response = requests.get(url, params=params, timeout=10)
+
+        if verbose:
+            print(f"[ALGO] GET {url}?user={wallet_address[:12]}...&limit={limit}&type=TRADE&side=BUY => HTTP {response.status_code}", flush=True)
+
         response.raise_for_status()
 
-        bets = []
-        for activity in response.json():
-            if activity.get("type") == "TRADE" and activity.get("side") == "BUY":
-                bets.append(activity)
+        data = response.json()
+        if verbose:
+            count = len(data) if isinstance(data, list) else "dict"
+            print(f"[ALGO] Got {count} BUY trades from API", flush=True)
+
+        if not data:
+            return []
+
+        # Handle both array and dict responses
+        bets = data if isinstance(data, list) else data.get("data", data.get("results", data.get("activities", [])))
         return bets
     except Exception as e:
-        print(f"[ALGO] Error fetching activity: {e}")
+        print(f"[ALGO] Error fetching activity: {e}", flush=True)
         return []
 
 
@@ -453,8 +468,8 @@ class CopyTrader:
         """Check for new trades and copy them. Returns number of trades copied."""
         copied = 0
 
-        # Get target's recent bets
-        bets = get_latest_bets(TARGET_ADDRESS)
+        # Get target's recent bets — always verbose to diagnose scanning
+        bets = get_latest_bets(TARGET_ADDRESS, verbose=True)
         if not bets:
             return 0
 
