@@ -765,12 +765,7 @@ class CopyTrader:
                         # No valid entry price - use placeholder PnL
                         pnl = amount * 3  # Assume ~4x return (typical for 20-25% odds)
                         print(f"[ALGO] WIN (no price): {position['market'][:30]} | entry_price=0, estimating +${pnl:.2f}")
-                    elif entry_price > 0.95:
-                        # Suspiciously high price (>95%) - likely bad data
-                        pnl = amount * 0.05  # Minimal win
-                        print(f"[ALGO] WIN (high price): {position['market'][:30]} | entry={entry_price:.2f}, +${pnl:.2f}")
                     else:
-                        # Normal calculation
                         payout = amount / entry_price
                         pnl = payout - amount
                         print(f"[ALGO] WIN: {position['market'][:30]} | entry={entry_price:.4f}, payout=${payout:.2f}, pnl=+${pnl:.2f}")
@@ -854,8 +849,8 @@ class CopyTrader:
         total_pnl = self._safe_float(stats.get("total_pnl", 0.0))
         win_rate = (wins / (wins + losses) * 100) if (wins + losses) > 0 else 0
         balance = self._safe_float(stats.get("balance", ALGO_STARTING_BALANCE))
-        # Cap balance_history to last 500 entries to keep API responses fast
-        balance_history = stats.get("balance_history", [])[-500:]
+        # Cap balance_history to last 10000 entries (enough for days of data)
+        balance_history = stats.get("balance_history", [])[-10000:]
 
         open_staked = sum(p.get("amount", 0) for p in self.positions.get("open", []))
         equity = self._safe_float(balance + open_staked)
