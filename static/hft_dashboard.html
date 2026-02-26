@@ -63,25 +63,6 @@
             </span>
         );
 
-        // Stat Card
-        const StatCard = ({ icon: Icon, label, value, subValue, color = 'blue', trend }) => (
-            <div className="bg-slate-800/50 backdrop-blur rounded-xl p-4 border border-slate-700/50">
-                <div className="flex items-center justify-between mb-2">
-                    <div className={`p-2 rounded-lg bg-${color}-500/20 text-${color}-400`}>
-                        <Icon />
-                    </div>
-                    {trend !== undefined && (
-                        <span className={`text-xs font-medium ${trend >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-                            {trend >= 0 ? '+' : ''}{trend.toFixed(2)}%
-                        </span>
-                    )}
-                </div>
-                <p className="text-2xl font-bold text-white font-mono">{value}</p>
-                <p className="text-sm text-slate-400">{label}</p>
-                {subValue && <p className="text-xs text-slate-500 mt-1">{subValue}</p>}
-            </div>
-        );
-
         // Trade Row
         const TradeRow = ({ trade, isNew }) => {
             const time = new Date(trade.timestamp).toLocaleTimeString();
@@ -745,30 +726,7 @@
                         </div>
                     </div>
 
-                    {/* Stats Row */}
-                    <div className="grid grid-cols-2 md:grid-cols-3 gap-4 mb-6">
-                        <StatCard
-                            icon={Target}
-                            label="Markets"
-                            value={scanner.markets_monitored || 0}
-                            subValue="Monitored"
-                            color="purple"
-                        />
-                        <StatCard
-                            icon={CheckCircle}
-                            label="Trades"
-                            value={scanner.trades_executed || 0}
-                            subValue="Executed"
-                            color="green"
-                        />
-                        <StatCard
-                            icon={DollarSign}
-                            label="Balance"
-                            value={`$${(pnl.demo?.balance || 2300).toFixed(0)}`}
-                            subValue="Opening"
-                            color="blue"
-                        />
-                    </div>
+
 
                     {/* Main Grid */}
                     <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
