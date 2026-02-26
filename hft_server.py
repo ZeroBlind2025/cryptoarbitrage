@@ -1728,6 +1728,7 @@ def api_copy_compare():
     from copy_trader import build_reconciliation, load_positions
 
     target_limit = int(request.args.get('limit', 100))
+    max_pages = int(request.args.get('pages', 10))
 
     # Use live positions if algo is running, otherwise load from file
     positions_data = None
@@ -1743,7 +1744,7 @@ def api_copy_compare():
         return jsonify({"error": "No position data available"}), 404
 
     try:
-        rows = build_reconciliation(positions_data, target_limit=target_limit)
+        rows = build_reconciliation(positions_data, target_limit=target_limit, max_pages=max_pages)
     except Exception as e:
         return jsonify({"error": f"Reconciliation failed: {e}"}), 500
 
