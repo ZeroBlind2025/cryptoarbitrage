@@ -367,13 +367,18 @@ def is_crypto_market(bet: dict) -> bool:
     return False
 
 
-def has_opposite_position(my_positions: list, condition_id: str, outcome_index: int) -> bool:
+def has_opposite_position(entered_markets: set, condition_id: str, outcome_index: int) -> bool:
     """Check if we already have the OPPOSITE side of this market.
 
-    Returns False (allows the trade) because the target trader's strategy
-    deliberately buys both sides of the same market as a hedge/arbitrage.
-    Blocking the opposite side caused all Down-side orders to be MISSED.
+    Looks through entered_markets set for any entry on the same condition_id
+    but a different outcome_index.  Prevents betting both Up and Down on the
+    same market, which just pays the vig and cancels out edge.
     """
+    if not condition_id:
+        return False
+    for cid, oi in entered_markets:
+        if cid == condition_id and oi != outcome_index:
+            return True
     return False
 
 
@@ -474,6 +479,7 @@ class CopyTrader:
         self.client: Optional["ClobClient"] = None
         self.copied_trades: set = set()  # Track copied trade IDs
         self.copied_sizes: set = set()  # Track (condition_id, target_size) to dedup re-scans
+        self.entered_markets: set = set()  # Track (condition_id, outcome_index) — one entry per side per market
         self.target_name = get_profile_name(TARGET_ADDRESS)
         self.on_trade = on_trade  # Callback for dashboard integration
         self.on_resolution = on_resolution  # Callback when position resolves
@@ -543,6 +549,16 @@ class CopyTrader:
             if cid and target_size:
                 self.copied_sizes.add((cid, str(oi), str(round(float(target_size), 2))))
         print(f"[ALGO] Marked {len(self.copied_trades)} existing trades ({len(self.copied_sizes)} unique sizes) as seen. Waiting for NEW trades...")
+
+        # Seed entered_markets from existing open positions so we don't
+        # re-enter markets we already have exposure to after a restart.
+        for pos in self.positions.get("open", []):
+            cid = pos.get("condition_id", "")
+            oi = pos.get("outcome_index", 0)
+            if cid:
+                self.entered_markets.add((cid, oi))
+        if self.entered_markets:
+            print(f"[ALGO] Resumed {len(self.entered_markets)} active market entries from open positions")
 
         # Show position tracking stats
         stats = self.positions.get("stats", {})
@@ -679,9 +695,6 @@ class CopyTrader:
                 self.trades_skipped += 1
                 continue
 
-            # No price filter - copy all trades to match target trader's strategy
-            # Target trades at low prices (20-30¢) for 4-5x returns
-
             # Check if we already have this position
             # Try multiple field names for condition_id (API may use camelCase or snake_case)
             condition_id = bet.get("conditionId") or bet.get("condition_id") or bet.get("market_condition_id") or ""
@@ -692,15 +705,24 @@ class CopyTrader:
             if outcome_index is None:
                 outcome_index = 0
 
-            # NOTE: opposite-position check removed. The target trader's strategy
-            # deliberately buys both Up and Down on the same market as a hedge/arb.
-            # Blocking the opposite side was causing all Down-side orders to be MISSED.
+            # --- GUARD 1: One entry per side per market ---
+            # Once we've entered a (condition_id, outcome_index), never re-enter.
+            # Prevents chasing the same market down with repeated $2 bets.
+            market_key = (condition_id, outcome_index)
+            if condition_id and market_key in self.entered_markets:
+                print(f"[ALGO] Skip (already entered this side): {title} | {outcome}")
+                self.trades_skipped += 1
+                continue
 
-            # Dedup by target share count — trader never repeats the same size on a market.
-            # If we've already copied this (condition, outcome, size) combo, it's our
-            # scan loop re-seeing the same position, not a new entry.
-            # NOTE: outcome_index is included so Up and Down on the same market
-            # are treated as separate trades (required for hedge/arb strategy).
+            # --- GUARD 2: Block opposite side ---
+            # Don't bet both Up and Down on the same market. Betting both
+            # sides cancels out any edge and just pays the vig.
+            if condition_id and has_opposite_position(self.entered_markets, condition_id, outcome_index):
+                print(f"[ALGO] Skip (opposite side already entered): {title} | {outcome}")
+                self.trades_skipped += 1
+                continue
+
+            # Legacy size-based dedup kept as a secondary safety net
             target_size = bet.get("size", 0)
             if condition_id and target_size:
                 size_key = (condition_id, str(outcome_index), str(round(float(target_size), 2)))
@@ -785,6 +807,9 @@ class CopyTrader:
 
             # Save position for tracking (if trade was successful or dry run)
             if trade_record["status"] in ["filled", "dry_run"]:
+                # Lock this market+side so we never re-enter or take the opposite
+                if condition_id:
+                    self.entered_markets.add((condition_id, outcome_index))
                 token_id = bet.get("asset", "")
                 position = {
                     "id": trade_record["id"],
