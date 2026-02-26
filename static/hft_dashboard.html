@@ -746,27 +746,13 @@
                     </div>
 
                     {/* Stats Row */}
-                    <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-4 mb-6">
+                    <div className="grid grid-cols-2 md:grid-cols-3 gap-4 mb-6">
                         <StatCard
                             icon={Target}
                             label="Markets"
                             value={scanner.markets_monitored || 0}
                             subValue="Monitored"
                             color="purple"
-                        />
-                        <StatCard
-                            icon={Activity}
-                            label="Scans"
-                            value={scanner.scans_completed?.toLocaleString() || 0}
-                            subValue="Completed"
-                            color="blue"
-                        />
-                        <StatCard
-                            icon={Zap}
-                            label="Signals"
-                            value={scanner.signals_detected || 0}
-                            subValue="Detected"
-                            color="yellow"
                         />
                         <StatCard
                             icon={CheckCircle}
@@ -776,17 +762,10 @@
                             color="green"
                         />
                         <StatCard
-                            icon={Clock}
-                            label="Avg Latency"
-                            value={latency.avg_ms ? `${latency.avg_ms.toFixed(1)}ms` : '-'}
-                            subValue="Detection to fill"
-                            color="cyan"
-                        />
-                        <StatCard
                             icon={DollarSign}
-                            label="Demo Balance"
-                            value={`$${(pnl.demo?.balance || 10000).toFixed(0)}`}
-                            subValue="Paper trading"
+                            label="Balance"
+                            value={`$${(pnl.demo?.balance || 2300).toFixed(0)}`}
+                            subValue="Opening"
                             color="blue"
                         />
                     </div>
