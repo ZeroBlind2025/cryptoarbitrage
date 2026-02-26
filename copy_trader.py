@@ -328,12 +328,11 @@ def is_crypto_market(bet: dict) -> bool:
 
 def has_opposite_position(my_positions: list, condition_id: str, outcome_index: int) -> bool:
     """Check if we already have the OPPOSITE side of this market.
-    Allows stacking into the same side (UP, UP, UP) but blocks buying DOWN when we hold UP."""
-    if not condition_id:
-        return False
-    for p in my_positions:
-        if p.get('conditionId', '') == condition_id and p.get('outcomeIndex') != outcome_index:
-            return True
+
+    Returns False (allows the trade) because the target trader's strategy
+    deliberately buys both sides of the same market as a hedge/arbitrage.
+    Blocking the opposite side caused all Down-side orders to be MISSED.
+    """
     return False
 
 
@@ -446,9 +445,14 @@ class CopyTrader:
             self.copied_trades.add(trade_id)
             # Also snapshot target sizes so we don't re-copy existing positions
             cid = bet.get("conditionId") or bet.get("condition_id") or ""
+            oi = bet.get("outcomeIndex")
+            if oi is None:
+                oi = bet.get("outcome_index")
+            if oi is None:
+                oi = 0
             target_size = bet.get("size", 0)
             if cid and target_size:
-                self.copied_sizes.add((cid, str(round(float(target_size), 2))))
+                self.copied_sizes.add((cid, str(oi), str(round(float(target_size), 2))))
         print(f"[ALGO] Marked {len(self.copied_trades)} existing trades ({len(self.copied_sizes)} unique sizes) as seen. Waiting for NEW trades...")
 
         # Show position tracking stats
@@ -537,30 +541,27 @@ class CopyTrader:
             # Check if we already have this position
             # Try multiple field names for condition_id (API may use camelCase or snake_case)
             condition_id = bet.get("conditionId") or bet.get("condition_id") or bet.get("market_condition_id") or ""
-            outcome_index = bet.get("outcomeIndex") or bet.get("outcome_index") or 0
+            # Use explicit None checks -- outcome_index=0 is valid (not falsy)
+            outcome_index = bet.get("outcomeIndex")
+            if outcome_index is None:
+                outcome_index = bet.get("outcome_index")
+            if outcome_index is None:
+                outcome_index = 0
 
-            if has_opposite_position(my_positions, condition_id, outcome_index):
-                print(f"[ALGO] Skip (opposite side on-chain): {title}")
-                self.trades_skipped += 1
-                continue
-
-            # Also check our local open positions (covers indexing delay)
-            if condition_id and any(
-                op.get("condition_id") == condition_id and op.get("outcome_index") != outcome_index
-                for op in self.positions.get("open", [])
-            ):
-                print(f"[ALGO] Skip (opposite side tracked): {title}")
-                self.trades_skipped += 1
-                continue
+            # NOTE: opposite-position check removed. The target trader's strategy
+            # deliberately buys both Up and Down on the same market as a hedge/arb.
+            # Blocking the opposite side was causing all Down-side orders to be MISSED.
 
             # Dedup by target share count — trader never repeats the same size on a market.
-            # If we've already copied this (condition, size) combo, it's our scan loop
-            # re-seeing the same position, not a new entry.
+            # If we've already copied this (condition, outcome, size) combo, it's our
+            # scan loop re-seeing the same position, not a new entry.
+            # NOTE: outcome_index is included so Up and Down on the same market
+            # are treated as separate trades (required for hedge/arb strategy).
             target_size = bet.get("size", 0)
             if condition_id and target_size:
-                size_key = (condition_id, str(round(float(target_size), 2)))
+                size_key = (condition_id, str(outcome_index), str(round(float(target_size), 2)))
                 if size_key in self.copied_sizes:
-                    print(f"[ALGO] Skip (same size already copied): {title} | {target_size} shares")
+                    print(f"[ALGO] Skip (same size already copied): {title} | {outcome} {target_size} shares")
                     self.trades_skipped += 1
                     continue
                 self.copied_sizes.add(size_key)
