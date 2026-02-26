@@ -99,7 +99,7 @@ stop_refresh = threading.Event()
 
 # Copy trader
 try:
-    from copy_trader import CopyTrader, TARGET_ADDRESS
+    from copy_trader import CopyTrader, TARGET_ADDRESS, POLL_INTERVAL as COPY_POLL_INTERVAL
     HAS_COPY_TRADER = True
 except Exception as e:
     print(f"[SERVER] Failed to import copy_trader: {e}")
@@ -1288,7 +1288,8 @@ def copy_trader_loop():
         print("[ALGO] Loop abort: copy_trader is None", flush=True)
         return
 
-    print(f"[ALGO] Background monitoring started (every 10s)...", flush=True)
+    poll_s = COPY_POLL_INTERVAL if HAS_COPY_TRADER else 10
+    print(f"[ALGO] Background monitoring started (every {poll_s}s)...", flush=True)
     loop_count = 0
 
     while not stop_copy_trader.is_set():
@@ -1304,8 +1305,9 @@ def copy_trader_loop():
             # Paused = no new trades, but open positions still resolve
             copy_trader.check_resolutions()
 
-            # Heartbeat every ~5 min (30 loops × 10s)
-            if loop_count % 30 == 0:
+            # Heartbeat every ~5 min
+            heartbeat_every = max(1, 300 // poll_s)
+            if loop_count % heartbeat_every == 0:
                 stats = copy_trader.positions.get("stats", {})
                 open_count = len(copy_trader.positions.get("open", []))
                 paused = "PAUSED" if copy_trader_paused.is_set() else "ACTIVE"
@@ -1316,7 +1318,7 @@ def copy_trader_loop():
             print(f"[ALGO] Error in loop: {e}", flush=True)
             import traceback; traceback.print_exc()
 
-        stop_copy_trader.wait(timeout=10)  # Check every 10 seconds
+        stop_copy_trader.wait(timeout=poll_s)  # Use configured poll interval
 
     print("[ALGO] Background monitoring stopped", flush=True)
 
@@ -1392,6 +1394,9 @@ def api_copy_trader_stop():
         "total_spent": copy_trader.total_spent if copy_trader else 0,
     }
 
+    # Clean up WebSocket
+    if copy_trader:
+        copy_trader.stop()
     copy_trader = None
 
     return jsonify({

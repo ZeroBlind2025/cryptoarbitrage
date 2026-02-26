@@ -40,6 +40,12 @@ except ImportError:
     HAS_CLOB_CLIENT = False
     print("[ALGO] Warning: py_clob_client not installed. Install with: pip install py-clob-client")
 
+try:
+    from clob_ws import CLOBWebSocket
+    HAS_CLOB_WS = True
+except ImportError:
+    HAS_CLOB_WS = False
+
 
 # =============================================================================
 # CONFIGURATION
@@ -57,6 +63,7 @@ SIGNATURE_TYPE = int(os.getenv("POLYMARKET_SIGNATURE_TYPE", "0"))  # 0=EOA, 1=Em
 BET_AMOUNT = float(os.getenv("COPY_BET_AMOUNT", "2.0"))  # $ per copied bet
 POLL_INTERVAL = int(os.getenv("COPY_POLL_INTERVAL", "10"))  # seconds between checks
 ALGO_STARTING_BALANCE = float(os.getenv("ALGO_STARTING_BALANCE", "2300.0"))  # Starting balance for Poly Algo
+PRICE_BUFFER_BPS = int(os.getenv("COPY_PRICE_BUFFER_BPS", "50"))  # Max overbid vs target's price (50 bps = 0.5%)
 
 # Crypto market filter - only copy trades on these markets
 CRYPTO_SLUGS = ["btc-", "eth-", "sol-", "xrp-", "-updown-"]
@@ -237,6 +244,38 @@ def get_market_resolution(condition_id: str = "", slug: str = "", token_id: str 
 # API FUNCTIONS
 # =============================================================================
 
+def get_active_crypto_tokens() -> list[str]:
+    """Fetch token IDs for currently active crypto updown markets.
+
+    Queries the Gamma API for open crypto markets and returns all CLOB
+    token IDs so the WebSocket can subscribe to real-time prices.
+    """
+    try:
+        response = requests.get(
+            f"{GAMMA_API}/markets",
+            params={"closed": "false", "limit": 50},
+            timeout=10,
+        )
+        response.raise_for_status()
+        markets = response.json()
+        token_ids = []
+        for m in markets:
+            slug = (m.get("slug") or m.get("conditionId") or "").lower()
+            question = (m.get("question") or "").lower()
+            # Only crypto updown markets
+            if not any(p in slug or p in question for p in CRYPTO_SLUGS):
+                continue
+            # Collect both token IDs (Up and Down)
+            clob_ids = m.get("clobTokenIds") or []
+            if isinstance(clob_ids, str):
+                clob_ids = json.loads(clob_ids) if clob_ids.startswith("[") else [clob_ids]
+            token_ids.extend(clob_ids)
+        return token_ids
+    except Exception as e:
+        print(f"[ALGO] Error fetching active crypto tokens: {e}")
+        return []
+
+
 def get_profile_name(wallet_address: str) -> str:
     """Get trader's profile name"""
     try:
@@ -365,21 +404,59 @@ def get_clob_client() -> Optional["ClobClient"]:
         return None
 
 
-def place_bet(client: "ClobClient", token_id: str, amount: float) -> bool:
-    """Place a market buy order"""
+def place_bet(client: "ClobClient", token_id: str, amount: float, max_price: float = 0) -> dict:
+    """Place a price-protected limit order. Returns fill details or empty dict on failure.
+
+    Uses a GTC limit order at max_price (target's entry + buffer) so the order
+    won't fill at absurd prices if the market has moved. Falls back to FOK market
+    order only if no max_price is provided.
+    """
     try:
-        order = MarketOrderArgs(
-            token_id=token_id,
-            amount=amount,
-            side=BUY,
-            order_type=OrderType.FOK
-        )
-        signed_order = client.create_market_order(order)
-        result = client.post_order(signed_order, OrderType.FOK)
-        return True
+        if max_price and max_price > 0:
+            # Price-protected limit order: won't pay more than max_price
+            limit_price = min(round(max_price, 4), 0.99)
+            size = amount / limit_price  # shares to buy at this price
+
+            print(f"[ALGO] Limit order: {size:.2f} shares @ {limit_price:.4f} (max ${amount:.2f})")
+            order = client.create_order(
+                token_id=token_id,
+                price=limit_price,
+                size=round(size, 2),
+                side=BUY,
+            )
+            result = client.post_order(order)
+        else:
+            # Fallback: FOK market order (no price protection)
+            print(f"[ALGO] WARNING: No max_price, using FOK market order")
+            order = MarketOrderArgs(
+                token_id=token_id,
+                amount=amount,
+                side=BUY,
+                order_type=OrderType.FOK
+            )
+            signed_order = client.create_market_order(order)
+            result = client.post_order(signed_order, OrderType.FOK)
+
+        # Extract fill details from CLOB response
+        fill_info = {"success": True}
+        if isinstance(result, dict):
+            status = result.get("status", "").lower()
+            # Check if order was rejected / not matched
+            if status in ("rejected", "failed", "expired"):
+                print(f"[ALGO] Order {status}: price moved beyond limit. Result: {result}")
+                return {}
+
+            usdc_filled = float(result.get("matchedAmount") or result.get("amount") or 0)
+            shares_filled = float(result.get("size") or result.get("filledSize") or 0)
+            if shares_filled > 0:
+                fill_info["fill_price"] = usdc_filled / shares_filled
+                fill_info["shares"] = shares_filled
+                fill_info["usdc"] = usdc_filled
+            print(f"[ALGO] Fill details: {result}")
+        return fill_info
     except Exception as e:
         print(f"[ALGO] Order error: {e}")
-        return False
+        return {}
 
 
 # =============================================================================
@@ -417,6 +494,11 @@ class CopyTrader:
         self.last_resolution_check = 0
         self.resolution_check_interval = 60  # Check every 60 seconds
 
+        # WebSocket for real-time prices (replaces stale REST prices)
+        self.ws: Optional["CLOBWebSocket"] = None
+        self.ws_token_refresh_interval = 300  # Refresh subscribed tokens every 5 min
+        self.last_ws_token_refresh = 0
+
     def start(self):
         """Initialize the algo trader"""
         balance = self.positions.get("stats", {}).get("balance", ALGO_STARTING_BALANCE)
@@ -428,6 +510,8 @@ class CopyTrader:
         print(f"  Balance: ${balance:.2f}")
         print(f"  Mode: {'DRY RUN' if self.dry_run else 'LIVE'}")
         print(f"  Filter: {'Crypto only' if self.crypto_only else 'All markets'}")
+        print(f"  Poll interval: {POLL_INTERVAL}s")
+        print(f"  Price buffer: {PRICE_BUFFER_BPS} bps")
         print("=" * 60 + "\n")
 
         if not self.dry_run:
@@ -435,6 +519,9 @@ class CopyTrader:
             if not self.client:
                 print("[ALGO] Failed to initialize client. Running in dry-run mode.")
                 self.dry_run = True
+
+        # Start WebSocket for real-time prices
+        self._start_ws()
 
         # Snapshot existing trades so we don't copy historical trades
         # Only copy NEW trades that happen AFTER we start monitoring
@@ -468,9 +555,55 @@ class CopyTrader:
         print(f"[ALGO] Record: {wins}W / {losses}L ({win_rate:.1f}% win rate)")
         print(f"[ALGO] Total PnL: ${total_pnl:+.2f}")
 
+    def _start_ws(self):
+        """Start WebSocket for real-time market prices."""
+        if not HAS_CLOB_WS:
+            print("[ALGO] WebSocket not available (clob_ws.py not found)")
+            return
+
+        try:
+            self.ws = CLOBWebSocket(
+                on_connect=lambda: print("[ALGO] WebSocket connected — live prices active", flush=True),
+                on_disconnect=lambda: print("[ALGO] WebSocket disconnected — will reconnect", flush=True),
+            )
+            self.ws.start()
+            # Give the connection a moment to establish
+            time.sleep(1)
+            self._refresh_ws_tokens()
+        except Exception as e:
+            print(f"[ALGO] WebSocket start failed: {e}")
+            self.ws = None
+
+    def _refresh_ws_tokens(self):
+        """Subscribe to token IDs for active crypto markets."""
+        if not self.ws:
+            return
+
+        now = time.time()
+        if now - self.last_ws_token_refresh < self.ws_token_refresh_interval:
+            return
+        self.last_ws_token_refresh = now
+
+        token_ids = get_active_crypto_tokens()
+        if token_ids:
+            self.ws.subscribe(token_ids)
+            print(f"[ALGO] WebSocket subscribed to {len(token_ids)} crypto tokens")
+        else:
+            print("[ALGO] No active crypto tokens found for WebSocket")
+
+    def get_live_ask(self, token_id: str) -> Optional[float]:
+        """Get real-time best ask price from WebSocket, or None if unavailable."""
+        if not self.ws or not token_id:
+            return None
+        _, best_ask = self.ws.get_best_prices(token_id)
+        return best_ask
+
     def check_and_copy(self) -> int:
         """Check for new trades and copy them. Returns number of trades copied."""
         copied = 0
+
+        # Periodically refresh WebSocket token subscriptions (new markets open)
+        self._refresh_ws_tokens()
 
         # Get target's recent bets — always verbose to diagnose scanning
         bets = get_latest_bets(TARGET_ADDRESS, verbose=True)
@@ -588,15 +721,44 @@ class CopyTrader:
             }
 
             if self.dry_run:
-                print(f"       DRY RUN - would execute")
+                token_id = bet.get("asset", "")
+                # In dry run: use WebSocket live price if available for realistic tracking
+                live_ask = self.get_live_ask(token_id) if token_id else None
+                if live_ask:
+                    price = live_ask
+                    trade_record["price"] = price
+                    print(f"       DRY RUN - would buy @ {price*100:.1f}¢ (live ask)")
+                else:
+                    print(f"       DRY RUN - would buy @ {price*100:.1f}¢ (target entry)")
+                    # Subscribe to this token for next time
+                    if token_id and self.ws:
+                        self.ws.subscribe([token_id])
                 trade_record["status"] = "dry_run"
                 copied += 1
             else:
                 token_id = bet.get("asset", "")
                 if token_id and self.client:
-                    success = place_bet(self.client, token_id, self.bet_amount)
-                    if success:
-                        print(f"       EXECUTED!")
+                    # Use live WebSocket best_ask as the limit price (most accurate)
+                    # Falls back to target's entry price + buffer if WS unavailable
+                    live_ask = self.get_live_ask(token_id)
+                    buffer = PRICE_BUFFER_BPS / 10000
+                    if live_ask:
+                        max_price = min(live_ask * (1 + buffer), 0.99)
+                        print(f"       Limit: {max_price:.4f} (live ask {live_ask:.4f} + {PRICE_BUFFER_BPS}bps)")
+                    elif price > 0:
+                        max_price = price * (1 + buffer)
+                        print(f"       Limit: {max_price:.4f} (target entry + {PRICE_BUFFER_BPS}bps, no WS)")
+                    else:
+                        max_price = 0
+                    fill = place_bet(self.client, token_id, self.bet_amount, max_price=max_price)
+                    if fill.get("success"):
+                        # Use our actual fill price instead of target's entry price
+                        if fill.get("fill_price"):
+                            price = fill["fill_price"]
+                            trade_record["price"] = price
+                            print(f"       EXECUTED! Fill price: {price:.4f} ({price*100:.1f}¢)")
+                        else:
+                            print(f"       EXECUTED! (fill price unavailable, using target's entry)")
                         trade_record["status"] = "filled"
                         copied += 1
                         self.total_spent += self.bet_amount
@@ -673,11 +835,21 @@ class CopyTrader:
 
         self.print_stats()
 
+    def stop(self):
+        """Clean up resources (WebSocket, etc.)"""
+        if self.ws:
+            try:
+                self.ws.stop()
+            except Exception:
+                pass
+            self.ws = None
+
     def run_loop(self):
         """Continuous monitoring loop"""
         self.start()
 
-        print(f"[ALGO] Starting continuous monitoring (every {POLL_INTERVAL}s)...")
+        ws_status = "WebSocket active" if self.ws and self.ws.connected else "REST only"
+        print(f"[ALGO] Starting continuous monitoring (every {POLL_INTERVAL}s, {ws_status})...")
         print("[ALGO] Press Ctrl+C to stop\n")
 
         try:
@@ -1009,9 +1181,10 @@ def build_reconciliation(positions: dict, target_limit: int = 100) -> list:
     """Build a side-by-side reconciliation of target trades vs our trades.
 
     Returns a list of dicts, one per row, ready to be written as CSV.
-    Each row shows the target's trade on the left and our matching copy
-    (if any) on the right, plus a status column flagging misses or
-    price divergence.
+    Uses 1-to-1 matching: each target trade is paired with the closest
+    (by timestamp) unmatched copy on the same condition_id + outcome.
+    Unmatched target trades are flagged as MISSED; extra copies we made
+    beyond what the target traded are flagged as EXTRA_COPY.
     """
     target_trades = get_target_trade_history(limit=target_limit)
 
@@ -1021,6 +1194,7 @@ def build_reconciliation(positions: dict, target_limit: int = 100) -> list:
     all_ours = our_open + our_resolved
 
     # Build lookup: (condition_id, outcome_normalised) -> list of our positions
+    # Each position can only be matched once (1-to-1)
     our_lookup: dict[tuple, list] = {}
     for pos in all_ours:
         cid = pos.get("condition_id", "")
@@ -1028,9 +1202,12 @@ def build_reconciliation(positions: dict, target_limit: int = 100) -> list:
         key = (cid, outcome)
         our_lookup.setdefault(key, []).append(pos)
 
-    # Also build a set of our condition_ids to detect trades we made that the
-    # target didn't (shouldn't happen, but good to flag)
-    our_cids_seen = set()
+    # Sort each bucket by timestamp so closest-match works well
+    for key in our_lookup:
+        our_lookup[key] = sorted(our_lookup[key], key=lambda p: p.get("timestamp", ""))
+
+    # Track which of our positions have been claimed by a target trade
+    claimed: set = set()
 
     rows = []
     for t in target_trades:
@@ -1038,42 +1215,52 @@ def build_reconciliation(positions: dict, target_limit: int = 100) -> list:
         outcome_norm = t["outcome"].lower().strip()
         key = (cid, outcome_norm)
 
-        matches = our_lookup.get(key, [])
-        our_cids_seen.add(cid)
+        candidates = our_lookup.get(key, [])
 
-        if matches:
-            for m in matches:
-                our_price = m.get("entry_price", 0)
-                target_price = t["entry_price"]
-                price_diff = abs(our_price - target_price) if our_price and target_price else None
-                # Flag if our entry price diverges by >5% from target
-                if target_price and price_diff is not None:
-                    pct_diff = price_diff / target_price * 100
-                else:
-                    pct_diff = None
+        # Pick the best unclaimed match (closest entry price to target)
+        best = None
+        best_diff = float("inf")
+        for m in candidates:
+            mid = id(m)
+            if mid in claimed:
+                continue
+            diff = abs((m.get("entry_price", 0) or 0) - (t["entry_price"] or 0))
+            if diff < best_diff:
+                best_diff = diff
+                best = m
 
-                status = "MATCHED"
-                if pct_diff is not None and pct_diff > 5:
-                    status = f"PRICE_DIFF ({pct_diff:.1f}%)"
+        if best is not None:
+            claimed.add(id(best))
+            our_price = best.get("entry_price", 0)
+            target_price = t["entry_price"]
+            price_diff = abs(our_price - target_price) if our_price and target_price else None
+            if target_price and price_diff is not None:
+                pct_diff = price_diff / target_price * 100
+            else:
+                pct_diff = None
 
-                result = m.get("result", "OPEN")
+            status = "MATCHED"
+            if pct_diff is not None and pct_diff > 5:
+                status = f"PRICE_DIFF ({pct_diff:.1f}%)"
 
-                rows.append({
-                    "target_timestamp": t["timestamp"],
-                    "target_market": t["market"],
-                    "target_outcome": t["outcome"],
-                    "target_entry_price": t["entry_price"],
-                    "target_usdc": t["usdc_size"],
-                    "target_shares": t["shares"],
-                    "our_timestamp": m.get("timestamp", ""),
-                    "our_outcome": m.get("outcome", ""),
-                    "our_entry_price": our_price,
-                    "our_amount": m.get("amount", 0),
-                    "our_result": result,
-                    "our_pnl": m.get("pnl", ""),
-                    "status": status,
-                    "condition_id": cid,
-                })
+            result = best.get("result", "OPEN")
+
+            rows.append({
+                "target_timestamp": t["timestamp"],
+                "target_market": t["market"],
+                "target_outcome": t["outcome"],
+                "target_entry_price": t["entry_price"],
+                "target_usdc": t["usdc_size"],
+                "target_shares": t["shares"],
+                "our_timestamp": best.get("timestamp", ""),
+                "our_outcome": best.get("outcome", ""),
+                "our_entry_price": our_price,
+                "our_amount": best.get("amount", 0),
+                "our_result": result,
+                "our_pnl": best.get("pnl", ""),
+                "status": status,
+                "condition_id": cid,
+            })
         else:
             # Target traded but we have no matching copy
             rows.append({
@@ -1092,6 +1279,27 @@ def build_reconciliation(positions: dict, target_limit: int = 100) -> list:
                 "status": "MISSED",
                 "condition_id": cid,
             })
+
+    # Flag our extra copies that weren't matched to any target trade
+    for key, positions_list in our_lookup.items():
+        for m in positions_list:
+            if id(m) not in claimed:
+                rows.append({
+                    "target_timestamp": "",
+                    "target_market": m.get("market", ""),
+                    "target_outcome": "",
+                    "target_entry_price": "",
+                    "target_usdc": "",
+                    "target_shares": "",
+                    "our_timestamp": m.get("timestamp", ""),
+                    "our_outcome": m.get("outcome", ""),
+                    "our_entry_price": m.get("entry_price", ""),
+                    "our_amount": m.get("amount", 0),
+                    "our_result": m.get("result", "OPEN"),
+                    "our_pnl": m.get("pnl", ""),
+                    "status": "EXTRA_COPY",
+                    "condition_id": key[0],
+                })
 
     return rows
 
