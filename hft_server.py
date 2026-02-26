@@ -1285,12 +1285,15 @@ def copy_trader_loop():
     """Background loop for copy trader"""
     global copy_trader
     if not copy_trader:
+        print("[ALGO] Loop abort: copy_trader is None", flush=True)
         return
 
     print(f"[ALGO] Background monitoring started (every 10s)...", flush=True)
+    loop_count = 0
 
     while not stop_copy_trader.is_set():
         try:
+            loop_count += 1
             # Only check for new trades if NOT paused
             if not copy_trader_paused.is_set():
                 copied = copy_trader.check_and_copy()
@@ -1300,8 +1303,18 @@ def copy_trader_loop():
             # ALWAYS check resolutions (even when paused) - this is the key behavior
             # Paused = no new trades, but open positions still resolve
             copy_trader.check_resolutions()
+
+            # Heartbeat every ~5 min (30 loops × 10s)
+            if loop_count % 30 == 0:
+                stats = copy_trader.positions.get("stats", {})
+                open_count = len(copy_trader.positions.get("open", []))
+                paused = "PAUSED" if copy_trader_paused.is_set() else "ACTIVE"
+                print(f"[ALGO] Heartbeat #{loop_count}: {paused} | {open_count} open | "
+                      f"PnL ${stats.get('total_pnl', 0):.2f} | "
+                      f"seen {len(copy_trader.copied_trades)} trades", flush=True)
         except Exception as e:
             print(f"[ALGO] Error in loop: {e}", flush=True)
+            import traceback; traceback.print_exc()
 
         stop_copy_trader.wait(timeout=10)  # Check every 10 seconds
 
