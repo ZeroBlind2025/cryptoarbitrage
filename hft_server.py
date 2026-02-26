@@ -1567,16 +1567,31 @@ def api_copy_reset_stats():
     if not copy_trader:
         return jsonify({"error": "Copy trader not running"})
 
-    # Reset stats
-    copy_trader.positions["stats"] = {"wins": 0, "losses": 0, "total_pnl": 0.0}
+    from copy_trader import save_positions, ALGO_STARTING_BALANCE
+    from datetime import datetime, timezone
 
-    # Also clear resolved to start fresh
     data = request.get_json() or {}
+
+    # Reset stats including balance and history
+    copy_trader.positions["stats"] = {
+        "wins": 0, "losses": 0, "total_pnl": 0.0,
+        "balance": ALGO_STARTING_BALANCE,
+        "balance_history": [
+            {"timestamp": datetime.now(timezone.utc).isoformat(),
+             "balance": ALGO_STARTING_BALANCE, "pnl": 0.0,
+             "equity": ALGO_STARTING_BALANCE, "event": "reset"}
+        ],
+    }
+
+    # Also clear positions and in-memory dedup sets
     if data.get("clear_all"):
         copy_trader.positions["open"] = []
         copy_trader.positions["resolved"] = []
+        copy_trader.copied_sizes.clear()
+        copy_trader.trades_copied = 0
+        copy_trader.trades_skipped = 0
+        copy_trader.total_spent = 0.0
 
-    from copy_trader import save_positions
     save_positions(copy_trader.positions)
 
     return jsonify({
