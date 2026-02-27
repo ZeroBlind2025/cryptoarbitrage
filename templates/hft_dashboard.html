@@ -123,17 +123,27 @@
             const [error, setError] = useState(null);
             const [newTradeIds, setNewTradeIds] = useState(new Set());
 
-            // Fetch data
+            // Fetch data — use ref to avoid stale closures in setInterval
+            const dataRef = React.useRef(null);
+            const fetchingRef = React.useRef(false);
+
             const fetchData = useCallback(async () => {
+                // Skip if previous fetch is still in-flight (prevents stacking)
+                if (fetchingRef.current) return;
+                fetchingRef.current = true;
                 try {
-                    const response = await fetch('/api/data');
+                    const controller = new AbortController();
+                    const timeout = setTimeout(() => controller.abort(), 5000);
+                    const response = await fetch('/api/data', { signal: controller.signal });
+                    clearTimeout(timeout);
                     const newData = await response.json();
 
                     // Track new trades for animation
-                    if (data) {
+                    const prev = dataRef.current;
+                    if (prev) {
                         const oldIds = new Set([
-                            ...(data.trades?.demo || []).map(t => t.trade_id),
-                            ...(data.trades?.live || []).map(t => t.trade_id),
+                            ...(prev.trades?.demo || []).map(t => t.trade_id),
+                            ...(prev.trades?.live || []).map(t => t.trade_id),
                         ]);
                         const currentIds = [
                             ...(newData.trades?.demo || []).map(t => t.trade_id),
@@ -146,19 +156,24 @@
                         }
                     }
 
+                    dataRef.current = newData;
                     setData(newData);
                     setIsRunning(newData.status?.is_running || false);
                     setError(null);
                 } catch (err) {
-                    setError('Failed to fetch data');
+                    if (err.name !== 'AbortError') {
+                        setError('Failed to fetch data');
+                    }
+                } finally {
+                    fetchingRef.current = false;
                 }
-            }, [data]);
+            }, []);
 
             useEffect(() => {
                 fetchData();
                 const interval = setInterval(fetchData, 1000);
                 return () => clearInterval(interval);
-            }, []);
+            }, [fetchData]);
 
             // Start/Stop scanner
             const toggleScanner = async () => {

@@ -103,27 +103,38 @@
             const [isRunning, setIsRunning] = useState(false);
             const [error, setError] = useState(null);
 
-            // Fetch data from API
-            const fetchData = async () => {
+            // Fetch data from API — guard against stacking requests
+            const fetchingRef = React.useRef(false);
+
+            const fetchData = useCallback(async () => {
+                if (fetchingRef.current) return;
+                fetchingRef.current = true;
                 try {
-                    const response = await fetch('/api/data');
+                    const controller = new AbortController();
+                    const timeout = setTimeout(() => controller.abort(), 5000);
+                    const response = await fetch('/api/data', { signal: controller.signal });
+                    clearTimeout(timeout);
                     const newData = await response.json();
                     setData(newData);
                     setIsRunning(newData.status?.isRunning || false);
                     setMode(newData.status?.mode || 'scan');
                     setError(null);
                 } catch (err) {
-                    console.error('Fetch error:', err);
-                    setError('Failed to fetch data');
+                    if (err.name !== 'AbortError') {
+                        console.error('Fetch error:', err);
+                        setError('Failed to fetch data');
+                    }
+                } finally {
+                    fetchingRef.current = false;
                 }
-            };
+            }, []);
 
             // Poll for updates
             useEffect(() => {
                 fetchData();
                 const interval = setInterval(fetchData, 2000);
                 return () => clearInterval(interval);
-            }, []);
+            }, [fetchData]);
 
             // Start/Stop scanner
             const toggleScanner = async () => {

@@ -1235,25 +1235,40 @@ class CopyTrader:
         return thinned
 
     def get_stats(self) -> dict:
-        """Get current statistics for dashboard"""
+        """Get current statistics for dashboard.
+
+        Called every 1-2s by the Flask request handler on a different thread.
+        Uses a cached balance_history snapshot to avoid re-thinning thousands
+        of entries on every poll, and snapshots lists to avoid thread-safety
+        issues with concurrent mutations.
+        """
         stats = self.positions.get("stats", {})
         wins = stats.get("wins", 0)
         losses = stats.get("losses", 0)
         total_pnl = self._safe_float(stats.get("total_pnl", 0.0))
         win_rate = (wins / (wins + losses) * 100) if (wins + losses) > 0 else 0
         balance = self._safe_float(stats.get("balance", ALGO_STARTING_BALANCE))
-        # Downsample balance_history for long timeframes (1D/1W/1M)
-        # Keep recent data at full resolution, thin older data progressively
-        balance_history = self._thin_balance_history(stats.get("balance_history", []))
 
-        open_staked = sum(p.get("amount", 0) for p in self.positions.get("open", []))
+        # Cache thinned balance_history — only recompute when new entries arrive
+        raw_history = stats.get("balance_history", [])
+        raw_len = len(raw_history)
+        cache = getattr(self, "_bh_cache", None)
+        if cache and cache[0] == raw_len:
+            balance_history = cache[1]
+        else:
+            balance_history = self._thin_balance_history(raw_history)
+            self._bh_cache = (raw_len, balance_history)
+
+        # Snapshot lists to avoid RuntimeError from concurrent mutation
+        open_positions = list(self.positions.get("open", []))
+        open_staked = sum(p.get("amount", 0) for p in open_positions)
         equity = self._safe_float(balance + open_staked)
 
         return {
             "trades_copied": self.trades_copied,
             "trades_skipped": self.trades_skipped,
             "total_spent": self._safe_float(self.total_spent),
-            "open_positions": len(self.positions.get("open", [])),
+            "open_positions": len(open_positions),
             "resolved_positions": len(self.positions.get("resolved", [])),
             "wins": wins,
             "losses": losses,
