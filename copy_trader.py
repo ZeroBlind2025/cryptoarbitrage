@@ -124,6 +124,62 @@ def save_positions(positions: dict):
         print(f"[ALGO] Error saving positions: {e}")
 
 
+def check_clob_market_resolution(condition_id: str, token_id: str = "") -> Optional[dict]:
+    """Query CLOB API for definitive market resolution.
+
+    GET /markets/{condition_id} returns tokens with a 'winner' boolean.
+    This is the most reliable source — it's Polymarket's own resolution record.
+    """
+    if not condition_id:
+        return None
+    try:
+        response = requests.get(
+            f"{CLOB_API}/markets/{condition_id}",
+            timeout=10
+        )
+        if response.status_code != 200:
+            return None
+
+        market = response.json()
+
+        # Market must be closed to be resolved
+        if not market.get("closed"):
+            return None
+
+        tokens = market.get("tokens", [])
+        if not tokens:
+            return None
+
+        # Find the winning token
+        winning_token = None
+        for t in tokens:
+            if t.get("winner") is True:
+                winning_token = t
+                break
+
+        if winning_token is None:
+            # Market is closed but no winner flag set yet
+            return None
+
+        # Determine if OUR token won
+        winning_token_id = str(winning_token.get("token_id", ""))
+        our_token_won = (str(token_id) == winning_token_id) if token_id else None
+
+        print(f"[ALGO] CLOB resolution: winner={winning_token.get('outcome')} "
+              f"(token={winning_token_id[:20]}...), our_token_won={our_token_won}")
+
+        return {
+            "resolved": True,
+            "our_token_won": our_token_won,
+            "winning_outcome": winning_token.get("outcome"),
+            "winning_token_id": winning_token_id,
+        }
+
+    except Exception as e:
+        print(f"[ALGO] CLOB market resolution error: {e}")
+        return None
+
+
 def check_target_position(token_id: str) -> Optional[dict]:
     """Check target trader's position status for this token - ONLY trust redeemable field"""
     if not token_id:
@@ -163,12 +219,23 @@ def check_target_position(token_id: str) -> Optional[dict]:
 
 
 def get_market_resolution(condition_id: str = "", slug: str = "", token_id: str = "", our_outcome: str = "") -> Optional[dict]:
-    """Check if a market has resolved and get the winning outcome"""
+    """Check if a market has resolved and get the winning outcome.
+
+    Resolution priority:
+    1. CLOB API /markets/{condition_id} — has definitive 'winner' boolean per token
+    2. Target trader position check — redeemable field
+    3. Gamma API fallback — outcome prices
+    """
     try:
         print(f"[ALGO] Checking resolution: token={token_id[:20] if token_id else 'none'}... cid={condition_id[:20] if condition_id else 'none'}...")
 
-        # ONLY method that works: Check target trader's position redeemable status
-        # Token prices are unreliable (winners can show 0 due to no liquidity)
+        # Method 1: CLOB API — most reliable, returns winner boolean directly
+        if condition_id:
+            clob_result = check_clob_market_resolution(condition_id, token_id)
+            if clob_result and clob_result.get("resolved"):
+                return clob_result
+
+        # Method 2: Target trader's position redeemable status
         if token_id:
             target_result = check_target_position(token_id)
             if target_result and target_result.get("resolved"):
