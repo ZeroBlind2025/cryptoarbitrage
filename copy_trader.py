@@ -1352,30 +1352,44 @@ def get_target_trade_history(limit: int = 100, max_pages: int = 10) -> list:
     return all_trades
 
 
+def _base_market_name(title: str) -> str:
+    """Extract base asset name from a time-windowed market title.
+
+    "Bitcoin Up or Down - February 27, 8:50AM-8:55AM ET" -> "bitcoin up or down"
+    "XRP Up or Down - February 27, 8:45AM-8:50AM ET"     -> "xrp up or down"
+    """
+    import re
+    m = re.match(r'^(.+?)\s*-\s*\w+\s+\d+', title)
+    if m:
+        return m.group(1).strip().lower()
+    return title.strip().lower()
+
+
 def build_reconciliation(positions: dict, target_limit: int = 100, max_pages: int = 10) -> list:
     """Build a side-by-side reconciliation of target trades vs our trades.
 
     Returns a list of dicts, one per row, ready to be written as CSV.
-    Uses 1-to-1 matching: each target trade is paired with the closest
-    (by entry price) unmatched copy on the same condition_id + outcome.
-    Unmatched target trades are flagged as MISSED; extra copies we made
-    beyond what the target traded are flagged as EXTRA_COPY.
 
-    The function paginates through the target's API activity to avoid the
-    limit=100 truncation bug that caused all earlier-window copies to appear
-    as EXTRA_COPY.  It also scopes comparison to the time window covered by
-    target trades — positions outside that window are flagged UNMATCHED_WINDOW
-    instead of EXTRA_COPY.
+    Two-tier matching:
+      1. Exact: condition_id + outcome (same market window).
+      2. Fuzzy: base_market_name + outcome, closest by timestamp.
+         This catches copy trades that land on a different 5-min window
+         than the target (different condition_id, same underlying asset).
+
+    Unmatched target trades are flagged as MISSED; extra copies we made
+    beyond what the target traded are flagged as EXTRA_COPY.  Positions
+    that can't be matched even by fuzzy logic are UNMATCHED_WINDOW.
     """
+    from datetime import datetime as _dt
+
     target_trades = get_target_trade_history(limit=target_limit, max_pages=max_pages)
 
-    # Index our trades by condition_id + outcome for matching
+    # Index our trades by condition_id + outcome for exact matching
     our_open = positions.get("open", [])
     our_resolved = positions.get("resolved", [])
     all_ours = our_open + our_resolved
 
-    # Build lookup: (condition_id, outcome_normalised) -> list of our positions
-    # Each position can only be matched once (1-to-1)
+    # Build exact lookup: (condition_id, outcome_normalised) -> list
     our_lookup: dict[tuple, list] = {}
     for pos in all_ours:
         cid = pos.get("condition_id", "")
@@ -1383,27 +1397,66 @@ def build_reconciliation(positions: dict, target_limit: int = 100, max_pages: in
         key = (cid, outcome)
         our_lookup.setdefault(key, []).append(pos)
 
-    # Sort each bucket by timestamp so closest-match works well
+    # Build fuzzy lookup: (base_market_name, outcome_normalised) -> list
+    fuzzy_lookup: dict[tuple, list] = {}
+    for pos in all_ours:
+        market_title = pos.get("market") or pos.get("slug") or ""
+        base = _base_market_name(market_title)
+        outcome = (pos.get("outcome") or "").lower().strip()
+        fkey = (base, outcome)
+        fuzzy_lookup.setdefault(fkey, []).append(pos)
+
+    # Sort each bucket by timestamp
     for key in our_lookup:
         our_lookup[key] = sorted(our_lookup[key], key=lambda p: p.get("timestamp", ""))
+    for fkey in fuzzy_lookup:
+        fuzzy_lookup[fkey] = sorted(fuzzy_lookup[fkey], key=lambda p: p.get("timestamp", ""))
 
     # Track which of our positions have been claimed by a target trade
     claimed: set = set()
+
+    def _parse_ts(s: str):
+        """Parse ISO timestamp for time-proximity comparison."""
+        if not s:
+            return None
+        try:
+            return _dt.fromisoformat(s)
+        except (ValueError, TypeError):
+            return None
+
+    def _make_row(t: dict, best: dict, status: str) -> dict:
+        """Build a reconciliation row from a target trade + our matched position."""
+        our_price = best.get("entry_price", 0)
+        target_price = t["entry_price"]
+        result = best.get("result", "OPEN")
+        return {
+            "target_timestamp": t["timestamp"],
+            "target_market": t["market"],
+            "target_outcome": t["outcome"],
+            "target_entry_price": target_price,
+            "target_usdc": t["usdc_size"],
+            "target_shares": t["shares"],
+            "our_timestamp": best.get("timestamp", ""),
+            "our_outcome": best.get("outcome", ""),
+            "our_entry_price": our_price,
+            "our_amount": best.get("amount", 0),
+            "our_result": result,
+            "our_pnl": best.get("pnl", ""),
+            "status": status,
+            "condition_id": best.get("condition_id") or t.get("condition_id", ""),
+        }
 
     rows = []
     for t in target_trades:
         cid = t["condition_id"]
         outcome_norm = t["outcome"].lower().strip()
-        key = (cid, outcome_norm)
+        exact_key = (cid, outcome_norm)
 
-        candidates = our_lookup.get(key, [])
-
-        # Pick the best unclaimed match (closest entry price to target)
+        # --- Tier 1: exact condition_id match ---
         best = None
         best_diff = float("inf")
-        for m in candidates:
-            mid = id(m)
-            if mid in claimed:
+        for m in our_lookup.get(exact_key, []):
+            if id(m) in claimed:
                 continue
             diff = abs((m.get("entry_price", 0) or 0) - (t["entry_price"] or 0))
             if diff < best_diff:
@@ -1415,68 +1468,84 @@ def build_reconciliation(positions: dict, target_limit: int = 100, max_pages: in
             our_price = best.get("entry_price", 0)
             target_price = t["entry_price"]
             price_diff = abs(our_price - target_price) if our_price and target_price else None
-            if target_price and price_diff is not None:
-                pct_diff = price_diff / target_price * 100
-            else:
-                pct_diff = None
-
+            pct_diff = (price_diff / target_price * 100) if target_price and price_diff is not None else None
             status = "MATCHED"
             if pct_diff is not None and pct_diff > 5:
                 status = f"PRICE_DIFF ({pct_diff:.1f}%)"
+            rows.append(_make_row(t, best, status))
+            continue
 
-            result = best.get("result", "OPEN")
+        # --- Tier 2: fuzzy match on base market name + outcome ---
+        t_market = t.get("market") or t.get("slug") or ""
+        t_base = _base_market_name(t_market)
+        fkey = (t_base, outcome_norm)
+        t_ts = _parse_ts(t.get("timestamp", ""))
 
-            rows.append({
-                "target_timestamp": t["timestamp"],
-                "target_market": t["market"],
-                "target_outcome": t["outcome"],
-                "target_entry_price": t["entry_price"],
-                "target_usdc": t["usdc_size"],
-                "target_shares": t["shares"],
-                "our_timestamp": best.get("timestamp", ""),
-                "our_outcome": best.get("outcome", ""),
-                "our_entry_price": our_price,
-                "our_amount": best.get("amount", 0),
-                "our_result": result,
-                "our_pnl": best.get("pnl", ""),
-                "status": status,
-                "condition_id": cid,
-            })
-        else:
-            # Target traded but we have no matching copy
-            rows.append({
-                "target_timestamp": t["timestamp"],
-                "target_market": t["market"],
-                "target_outcome": t["outcome"],
-                "target_entry_price": t["entry_price"],
-                "target_usdc": t["usdc_size"],
-                "target_shares": t["shares"],
-                "our_timestamp": "",
-                "our_outcome": "",
-                "our_entry_price": "",
-                "our_amount": "",
-                "our_result": "",
-                "our_pnl": "",
-                "status": "MISSED",
-                "condition_id": cid,
-            })
+        best = None
+        best_delta = float("inf")
+        for m in fuzzy_lookup.get(fkey, []):
+            if id(m) in claimed:
+                continue
+            m_ts = _parse_ts(m.get("timestamp", ""))
+            if t_ts and m_ts:
+                delta = abs((t_ts - m_ts).total_seconds())
+            else:
+                # No timestamp — fall back to entry price proximity
+                delta = abs((m.get("entry_price", 0) or 0) - (t["entry_price"] or 0)) * 1e6
+            if delta < best_delta:
+                best_delta = delta
+                best = m
 
-    # Determine the condition_ids the target actually traded so we can
-    # distinguish "extra copy on a target market" (true EXTRA_COPY) from
-    # "we traded a market the target never touched in the API window"
-    # (UNMATCHED_WINDOW — likely a pagination gap, not a real problem).
+        if best is not None:
+            claimed.add(id(best))
+            our_price = best.get("entry_price", 0)
+            target_price = t["entry_price"]
+            price_diff = abs(our_price - target_price) if our_price and target_price else None
+            pct_diff = (price_diff / target_price * 100) if target_price and price_diff is not None else None
+            status = "FUZZY_MATCHED"
+            if pct_diff is not None and pct_diff > 5:
+                status = f"FUZZY_PRICE_DIFF ({pct_diff:.1f}%)"
+            rows.append(_make_row(t, best, status))
+            continue
+
+        # No match at all — target traded but we have no copy
+        rows.append({
+            "target_timestamp": t["timestamp"],
+            "target_market": t["market"],
+            "target_outcome": t["outcome"],
+            "target_entry_price": t["entry_price"],
+            "target_usdc": t["usdc_size"],
+            "target_shares": t["shares"],
+            "our_timestamp": "",
+            "our_outcome": "",
+            "our_entry_price": "",
+            "our_amount": "",
+            "our_result": "",
+            "our_pnl": "",
+            "status": "MISSED",
+            "condition_id": cid,
+        })
+
+    # --- Leftover unclaimed positions ---
+    # Build set of base market names the target traded for fuzzy classification
+    target_bases = set()
+    for t in target_trades:
+        t_market = t.get("market") or t.get("slug") or ""
+        target_bases.add(_base_market_name(t_market))
     target_condition_ids = set(t["condition_id"] for t in target_trades)
 
     for key, positions_list in our_lookup.items():
         cid = key[0]
         for m in positions_list:
             if id(m) not in claimed:
-                # If this condition_id appears in target trades, it's a true
-                # extra copy (we copied more times than the target traded).
-                # If the target never shows up for this market, it's an
-                # API-window gap — the target probably traded it but those
-                # rows fell outside the paginated fetch.
+                market_title = m.get("market") or m.get("slug") or ""
+                m_base = _base_market_name(market_title)
+
                 if cid in target_condition_ids:
+                    status = "EXTRA_COPY"
+                elif m_base in target_bases:
+                    # Same asset, different time window, but no target trade
+                    # was close enough to claim it
                     status = "EXTRA_COPY"
                 else:
                     status = "UNMATCHED_WINDOW"
