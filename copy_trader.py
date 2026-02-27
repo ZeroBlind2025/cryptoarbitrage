@@ -222,15 +222,37 @@ def get_market_resolution(condition_id: str = "", slug: str = "", token_id: str 
                     if len(prices) == 2:
                         # Pick the outcome with the higher price if it's clearly dominant
                         high_idx = 0 if prices[0] >= prices[1] else 1
-                        if prices[high_idx] >= 0.99:
+                        # Use stricter threshold for merely "closed" markets,
+                        # relaxed threshold for explicitly "resolved" markets
+                        # (resolved markets often settle at 0.90-0.98 not exactly 1.0)
+                        threshold = 0.60 if resolved else 0.99
+                        if prices[high_idx] >= threshold:
+                            print(f"[ALGO] Winner determined: {outcomes[high_idx]} (price={prices[high_idx]:.4f}, threshold={threshold})")
                             return {
                                 "resolved": True,
                                 "winning_outcome": outcomes[high_idx],
                                 "winning_index": high_idx,
                             }
 
-                # Market closed but can't determine winner reliably
-                return {"resolved": True, "winning_outcome": None, "winning_index": None}
+                # Market closed but can't determine winner from prices.
+                # If market is only "closed" (not "resolved"), don't mark as resolved yet
+                # so it stays open for retry. If explicitly "resolved", we must accept it.
+                if resolved:
+                    # Last resort: try matching our_outcome against available outcomes
+                    if our_outcome and outcomes:
+                        our_norm = our_outcome.lower().strip()
+                        for idx, oc in enumerate(outcomes):
+                            if oc.lower().strip() == our_norm:
+                                # We have a valid outcome name but couldn't determine price winner.
+                                # Return resolved with the outcome info so caller can attempt matching.
+                                print(f"[ALGO] Market resolved, no clear price winner. Returning outcome names for matching.")
+                                return {"resolved": True, "winning_outcome": None, "winning_index": None}
+                    print(f"[ALGO] Market resolved but cannot determine winner. Marking resolved.")
+                    return {"resolved": True, "winning_outcome": None, "winning_index": None}
+                else:
+                    # Only closed, not resolved — keep checking
+                    print(f"[ALGO] Market closed but not resolved and no clear winner. Will retry.")
+                    return {"resolved": False}
 
         return {"resolved": False}
 
@@ -997,11 +1019,23 @@ class CopyTrader:
                     self.positions["stats"]["losses"] = self.positions["stats"].get("losses", 0) + 1
                     print(f"[ALGO] LOSS: {position['market'][:30]} | -${amount:.2f}")
                 else:
-                    # Unknown result
+                    # Could not determine winner — defer resolution so we retry
+                    # on the next check cycle instead of permanently marking UNKNOWN.
+                    # Track attempts to avoid infinite retries.
+                    attempts = position.get("_resolve_attempts", 0) + 1
+                    position["_resolve_attempts"] = attempts
+                    max_attempts = 5
+
+                    if attempts < max_attempts:
+                        print(f"[ALGO] Cannot determine winner for {position['market'][:30]} "
+                              f"(attempt {attempts}/{max_attempts}). Will retry.")
+                        continue  # Skip — leave position open for next cycle
+
+                    # Exhausted retries — mark UNKNOWN but log loudly
                     pnl = 0
                     position["result"] = "UNKNOWN"
                     position["pnl"] = 0
-                    print(f"[ALGO] RESOLVED (unknown): {position['market'][:30]}")
+                    print(f"[ALGO] RESOLVED (unknown after {max_attempts} attempts): {position['market'][:30]}")
 
                 # Update totals
                 self.positions["stats"]["total_pnl"] = self.positions["stats"].get("total_pnl", 0) + pnl
