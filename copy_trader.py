@@ -785,6 +785,14 @@ class CopyTrader:
                 self.trades_skipped += 1
                 continue
 
+            # Price band filter: only trade when entry price is in the profitable range
+            MIN_ENTRY_PRICE = 0.60
+            MAX_ENTRY_PRICE = 0.95
+            if price and (price < MIN_ENTRY_PRICE or price > MAX_ENTRY_PRICE):
+                print(f"[ALGO] Skip (price {price:.3f} outside {MIN_ENTRY_PRICE}-{MAX_ENTRY_PRICE}): {title} | {outcome}")
+                self.trades_skipped += 1
+                continue
+
             # Check if we already have this position
             # Try multiple field names for condition_id (API may use camelCase or snake_case)
             condition_id = bet.get("conditionId") or bet.get("condition_id") or bet.get("market_condition_id") or ""
