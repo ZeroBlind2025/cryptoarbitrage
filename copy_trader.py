@@ -124,6 +124,62 @@ def save_positions(positions: dict):
         print(f"[ALGO] Error saving positions: {e}")
 
 
+def check_clob_market_resolution(condition_id: str, token_id: str = "") -> Optional[dict]:
+    """Query CLOB API for definitive market resolution.
+
+    GET /markets/{condition_id} returns tokens with a 'winner' boolean.
+    This is the most reliable source — it's Polymarket's own resolution record.
+    """
+    if not condition_id:
+        return None
+    try:
+        response = requests.get(
+            f"{CLOB_API}/markets/{condition_id}",
+            timeout=10
+        )
+        if response.status_code != 200:
+            return None
+
+        market = response.json()
+
+        # Market must be closed to be resolved
+        if not market.get("closed"):
+            return None
+
+        tokens = market.get("tokens", [])
+        if not tokens:
+            return None
+
+        # Find the winning token
+        winning_token = None
+        for t in tokens:
+            if t.get("winner") is True:
+                winning_token = t
+                break
+
+        if winning_token is None:
+            # Market is closed but no winner flag set yet
+            return None
+
+        # Determine if OUR token won
+        winning_token_id = str(winning_token.get("token_id", ""))
+        our_token_won = (str(token_id) == winning_token_id) if token_id else None
+
+        print(f"[ALGO] CLOB resolution: winner={winning_token.get('outcome')} "
+              f"(token={winning_token_id[:20]}...), our_token_won={our_token_won}")
+
+        return {
+            "resolved": True,
+            "our_token_won": our_token_won,
+            "winning_outcome": winning_token.get("outcome"),
+            "winning_token_id": winning_token_id,
+        }
+
+    except Exception as e:
+        print(f"[ALGO] CLOB market resolution error: {e}")
+        return None
+
+
 def check_target_position(token_id: str) -> Optional[dict]:
     """Check target trader's position status for this token - ONLY trust redeemable field"""
     if not token_id:
@@ -163,12 +219,23 @@ def check_target_position(token_id: str) -> Optional[dict]:
 
 
 def get_market_resolution(condition_id: str = "", slug: str = "", token_id: str = "", our_outcome: str = "") -> Optional[dict]:
-    """Check if a market has resolved and get the winning outcome"""
+    """Check if a market has resolved and get the winning outcome.
+
+    Resolution priority:
+    1. CLOB API /markets/{condition_id} — has definitive 'winner' boolean per token
+    2. Target trader position check — redeemable field
+    3. Gamma API fallback — outcome prices
+    """
     try:
         print(f"[ALGO] Checking resolution: token={token_id[:20] if token_id else 'none'}... cid={condition_id[:20] if condition_id else 'none'}...")
 
-        # ONLY method that works: Check target trader's position redeemable status
-        # Token prices are unreliable (winners can show 0 due to no liquidity)
+        # Method 1: CLOB API — most reliable, returns winner boolean directly
+        if condition_id:
+            clob_result = check_clob_market_resolution(condition_id, token_id)
+            if clob_result and clob_result.get("resolved"):
+                return clob_result
+
+        # Method 2: Target trader's position redeemable status
         if token_id:
             target_result = check_target_position(token_id)
             if target_result and target_result.get("resolved"):
@@ -222,15 +289,37 @@ def get_market_resolution(condition_id: str = "", slug: str = "", token_id: str 
                     if len(prices) == 2:
                         # Pick the outcome with the higher price if it's clearly dominant
                         high_idx = 0 if prices[0] >= prices[1] else 1
-                        if prices[high_idx] >= 0.99:
+                        # Use stricter threshold for merely "closed" markets,
+                        # relaxed threshold for explicitly "resolved" markets
+                        # (resolved markets often settle at 0.90-0.98 not exactly 1.0)
+                        threshold = 0.60 if resolved else 0.99
+                        if prices[high_idx] >= threshold:
+                            print(f"[ALGO] Winner determined: {outcomes[high_idx]} (price={prices[high_idx]:.4f}, threshold={threshold})")
                             return {
                                 "resolved": True,
                                 "winning_outcome": outcomes[high_idx],
                                 "winning_index": high_idx,
                             }
 
-                # Market closed but can't determine winner reliably
-                return {"resolved": True, "winning_outcome": None, "winning_index": None}
+                # Market closed but can't determine winner from prices.
+                # If market is only "closed" (not "resolved"), don't mark as resolved yet
+                # so it stays open for retry. If explicitly "resolved", we must accept it.
+                if resolved:
+                    # Last resort: try matching our_outcome against available outcomes
+                    if our_outcome and outcomes:
+                        our_norm = our_outcome.lower().strip()
+                        for idx, oc in enumerate(outcomes):
+                            if oc.lower().strip() == our_norm:
+                                # We have a valid outcome name but couldn't determine price winner.
+                                # Return resolved with the outcome info so caller can attempt matching.
+                                print(f"[ALGO] Market resolved, no clear price winner. Returning outcome names for matching.")
+                                return {"resolved": True, "winning_outcome": None, "winning_index": None}
+                    print(f"[ALGO] Market resolved but cannot determine winner. Marking resolved.")
+                    return {"resolved": True, "winning_outcome": None, "winning_index": None}
+                else:
+                    # Only closed, not resolved — keep checking
+                    print(f"[ALGO] Market closed but not resolved and no clear winner. Will retry.")
+                    return {"resolved": False}
 
         return {"resolved": False}
 
@@ -997,11 +1086,23 @@ class CopyTrader:
                     self.positions["stats"]["losses"] = self.positions["stats"].get("losses", 0) + 1
                     print(f"[ALGO] LOSS: {position['market'][:30]} | -${amount:.2f}")
                 else:
-                    # Unknown result
+                    # Could not determine winner — defer resolution so we retry
+                    # on the next check cycle instead of permanently marking UNKNOWN.
+                    # Track attempts to avoid infinite retries.
+                    attempts = position.get("_resolve_attempts", 0) + 1
+                    position["_resolve_attempts"] = attempts
+                    max_attempts = 5
+
+                    if attempts < max_attempts:
+                        print(f"[ALGO] Cannot determine winner for {position['market'][:30]} "
+                              f"(attempt {attempts}/{max_attempts}). Will retry.")
+                        continue  # Skip — leave position open for next cycle
+
+                    # Exhausted retries — mark UNKNOWN but log loudly
                     pnl = 0
                     position["result"] = "UNKNOWN"
                     position["pnl"] = 0
-                    print(f"[ALGO] RESOLVED (unknown): {position['market'][:30]}")
+                    print(f"[ALGO] RESOLVED (unknown after {max_attempts} attempts): {position['market'][:30]}")
 
                 # Update totals
                 self.positions["stats"]["total_pnl"] = self.positions["stats"].get("total_pnl", 0) + pnl
