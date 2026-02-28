@@ -71,14 +71,15 @@ COIN_BET_AMOUNTS = {
     "btc": float(os.getenv("COIN_BET_BTC", str(BET_AMOUNT))),
     "eth": float(os.getenv("COIN_BET_ETH", str(BET_AMOUNT))),
     "sol": float(os.getenv("COIN_BET_SOL", str(BET_AMOUNT))),
+    "xrp": float(os.getenv("COIN_BET_XRP", str(BET_AMOUNT))),
 }
 
 # Crypto market filter - only copy trades on these markets
-CRYPTO_SLUGS = ["btc-", "eth-", "sol-", "-updown-"]
+CRYPTO_SLUGS = ["btc-", "eth-", "sol-", "xrp-", "-updown-"]
 
 
 def detect_coin(slug: str, title: str) -> str:
-    """Detect which coin a trade is for from slug/title. Returns 'btc', 'eth', 'sol', or ''."""
+    """Detect which coin a trade is for from slug/title. Returns 'btc', 'eth', 'sol', 'xrp', or ''."""
     s = (slug + " " + title).lower()
     if "btc-" in s or "bitcoin" in s:
         return "btc"
@@ -86,6 +87,8 @@ def detect_coin(slug: str, title: str) -> str:
         return "eth"
     if "sol-" in s or "solana" in s:
         return "sol"
+    if "xrp-" in s or "xrp" in s or "ripple" in s:
+        return "xrp"
     return ""
 
 # API endpoints
@@ -464,7 +467,7 @@ def is_crypto_market(bet: dict) -> bool:
 
     # Also check for specific crypto keywords and timeframes (15, 30, 60 min)
     crypto_keywords = [
-        "bitcoin", "ethereum", "solana",
+        "bitcoin", "ethereum", "solana", "xrp", "ripple",
         "15m", "15-min", "15 min",
         "30m", "30-min", "30 min",
         "60m", "60-min", "60 min", "1h", "1-hour", "1 hour"
@@ -589,6 +592,8 @@ class CopyTrader:
         self.copied_trades: set = set()  # Track copied trade IDs
         self.copied_sizes: set = set()  # Track (condition_id, target_size) to dedup re-scans
         self.entered_markets: dict = {}  # (condition_id, outcome_index) → entry_price
+        self.market_entry_count: dict = {}  # (condition_id, outcome_index) → number of entries
+        self.max_entries_per_market = int(os.getenv("COPY_MAX_ENTRIES_PER_MARKET", "2"))  # Cap re-entries per market window
         self.target_name = get_profile_name(TARGET_ADDRESS)
         self.on_trade = on_trade  # Callback for dashboard integration
         self.on_resolution = on_resolution  # Callback when position resolves
@@ -670,14 +675,18 @@ class CopyTrader:
                 self.copied_sizes.add((cid, str(oi), str(round(float(target_size), 2))))
         print(f"[ALGO] Marked {len(self.copied_trades)} existing trades ({len(self.copied_sizes)} unique sizes) as seen. Waiting for NEW trades...")
 
-        # Seed entered_markets from existing open positions so we don't
-        # chase markets we already have exposure to after a restart.
+        # Seed entered_markets and market_entry_count from existing open
+        # positions so we don't chase markets we already have exposure to
+        # after a restart.
         for pos in self.positions.get("open", []):
             cid = pos.get("condition_id", "")
             oi = pos.get("outcome_index", 0)
             ep = pos.get("entry_price", 0)
             if cid:
-                self.entered_markets[(cid, oi)] = ep
+                mk = (cid, oi)
+                if mk not in self.entered_markets:
+                    self.entered_markets[mk] = ep
+                self.market_entry_count[mk] = self.market_entry_count.get(mk, 0) + 1
         if self.entered_markets:
             print(f"[ALGO] Resumed {len(self.entered_markets)} active market entries from open positions")
 
@@ -849,7 +858,18 @@ class CopyTrader:
                 else:
                     print(f"[ALGO] Re-entry OK (conviction — price {price:.3f} > entry {initial_entry:.3f}): {title} | {outcome}")
 
-            # --- GUARD 2: Block opposite side ---
+            # --- GUARD 2: Cap re-entries per market window ---
+            # Prevent piling into the same condition_id beyond max_entries_per_market.
+            # This reduces EXTRA_COPY duplicates where the target's multiple buys
+            # on the same window cause us to copy each one.
+            if condition_id and market_key in self.market_entry_count:
+                count = self.market_entry_count[market_key]
+                if count >= self.max_entries_per_market:
+                    print(f"[ALGO] Skip (max {self.max_entries_per_market} entries reached for this market): {title} | {outcome}")
+                    self.trades_skipped += 1
+                    continue
+
+            # --- GUARD 3: Block opposite side ---
             # Don't bet both Up and Down on the same market. Betting both
             # sides cancels out any edge and just pays the vig.
             if condition_id and has_opposite_position(self.entered_markets, condition_id, outcome_index):
@@ -952,6 +972,9 @@ class CopyTrader:
                 # original, not against an already-elevated price.
                 if condition_id and market_key not in self.entered_markets:
                     self.entered_markets[market_key] = price
+                # Increment per-market entry count (for GUARD 2 cap)
+                if condition_id:
+                    self.market_entry_count[market_key] = self.market_entry_count.get(market_key, 0) + 1
                 token_id = bet.get("asset", "")
                 position = {
                     "id": trade_record["id"],
@@ -1278,6 +1301,86 @@ class CopyTrader:
         thinned.sort(key=lambda e: e.get("timestamp", ""))
         return thinned
 
+    def _compute_coin_roi(self, open_positions: list, resolved_positions: list) -> dict:
+        """Compute per-coin W/L/PnL/ROI from position data.
+
+        Returns dict keyed by coin symbol, e.g.:
+        {"btc": {"wins": 10, "losses": 3, "pnl": 5.2, "deployed": 26.0,
+                 "roi": 20.0, "open": 2, "streak": 3, "streak_type": "W"}, ...}
+        """
+        coin_data: dict = {}
+        all_coins = set(self.coin_bet_amounts.keys())
+
+        # Process resolved positions
+        for pos in resolved_positions:
+            slug = pos.get("slug", "")
+            market = pos.get("market", "")
+            coin = detect_coin(slug, market) or "other"
+            all_coins.add(coin)
+
+            if coin not in coin_data:
+                coin_data[coin] = {"wins": 0, "losses": 0, "pnl": 0.0, "deployed": 0.0, "open": 0, "results": []}
+
+            amount = pos.get("amount", 0)
+            pnl = pos.get("pnl", 0) or 0
+            result = pos.get("result", "")
+
+            coin_data[coin]["deployed"] += amount
+            coin_data[coin]["pnl"] += pnl
+            if result == "WIN":
+                coin_data[coin]["wins"] += 1
+                coin_data[coin]["results"].append("W")
+            elif result == "LOSS":
+                coin_data[coin]["losses"] += 1
+                coin_data[coin]["results"].append("L")
+
+        # Process open positions (count + deployed, no pnl yet)
+        for pos in open_positions:
+            slug = pos.get("slug", "")
+            market = pos.get("market", "")
+            coin = detect_coin(slug, market) or "other"
+            all_coins.add(coin)
+
+            if coin not in coin_data:
+                coin_data[coin] = {"wins": 0, "losses": 0, "pnl": 0.0, "deployed": 0.0, "open": 0, "results": []}
+
+            coin_data[coin]["open"] += 1
+            coin_data[coin]["deployed"] += pos.get("amount", 0)
+
+        # Compute ROI and current streak for each coin
+        result = {}
+        for coin in all_coins:
+            d = coin_data.get(coin, {"wins": 0, "losses": 0, "pnl": 0.0, "deployed": 0.0, "open": 0, "results": []})
+            total = d["wins"] + d["losses"]
+            win_rate = (d["wins"] / total * 100) if total > 0 else 0
+            roi = (d["pnl"] / d["deployed"] * 100) if d["deployed"] > 0 else 0
+
+            # Current streak (from most recent results)
+            streak = 0
+            streak_type = ""
+            for r in reversed(d["results"]):
+                if not streak_type:
+                    streak_type = r
+                    streak = 1
+                elif r == streak_type:
+                    streak += 1
+                else:
+                    break
+
+            result[coin] = {
+                "wins": d["wins"],
+                "losses": d["losses"],
+                "win_rate": self._safe_float(win_rate),
+                "pnl": self._safe_float(d["pnl"]),
+                "deployed": self._safe_float(d["deployed"]),
+                "roi": self._safe_float(roi),
+                "open": d["open"],
+                "streak": streak,
+                "streak_type": streak_type,
+            }
+
+        return result
+
     def get_stats(self) -> dict:
         """Get current statistics for dashboard.
 
@@ -1305,15 +1408,19 @@ class CopyTrader:
 
         # Snapshot lists to avoid RuntimeError from concurrent mutation
         open_positions = list(self.positions.get("open", []))
+        resolved_positions = list(self.positions.get("resolved", []))
         open_staked = sum(p.get("amount", 0) for p in open_positions)
         equity = self._safe_float(balance + open_staked)
+
+        # Per-coin ROI stats from resolved + open positions
+        coin_roi = self._compute_coin_roi(open_positions, resolved_positions)
 
         return {
             "trades_copied": self.trades_copied,
             "trades_skipped": self.trades_skipped,
             "total_spent": self._safe_float(self.total_spent),
             "open_positions": len(open_positions),
-            "resolved_positions": len(self.positions.get("resolved", [])),
+            "resolved_positions": len(resolved_positions),
             "wins": wins,
             "losses": losses,
             "win_rate": self._safe_float(win_rate),
@@ -1324,6 +1431,7 @@ class CopyTrader:
             "balance_history": balance_history,
             "bet_amount": self._safe_float(self.bet_amount),
             "coin_bet_amounts": {k: self._safe_float(v) for k, v in self.coin_bet_amounts.items()},
+            "coin_roi": coin_roi,
         }
 
     def print_stats(self):

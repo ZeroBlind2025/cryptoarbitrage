@@ -367,7 +367,7 @@
         // Algo Settings Component - Per-coin lot size controls
         const AlgoSettings = ({ copyTrader, fetchData, setError }) => {
             const [isOpen, setIsOpen] = useState(false);
-            const COINS = ['btc', 'eth', 'sol'];
+            const COINS = ['btc', 'eth', 'sol', 'xrp'];
             const [coinAmounts, setCoinAmounts] = useState({});
             const [saving, setSaving] = useState(false);
             const [saveMsg, setSaveMsg] = useState('');
@@ -445,7 +445,7 @@
                                     Per-Coin Lot Size ($)
                                     <span className="text-slate-500 ml-1">- applies to new trades only</span>
                                 </label>
-                                <div className="grid grid-cols-3 gap-2">
+                                <div className="grid grid-cols-4 gap-2">
                                     {COINS.map(coin => (
                                         <div key={coin}>
                                             <label className="text-xs text-slate-500 block mb-1 uppercase font-medium">{coin}</label>
@@ -506,6 +506,84 @@
                             )}
                         </div>
                     )}
+                </div>
+            );
+        };
+
+        // Per-Coin ROI Component - Real-time coin performance tracker
+        const CoinROI = ({ coinRoi, copyTrader }) => {
+            if (!coinRoi || Object.keys(coinRoi).length === 0) return null;
+
+            // Sort: coins with trades first (by |pnl| desc), then coins with no data
+            const sortedCoins = Object.entries(coinRoi).sort((a, b) => {
+                const aTotal = a[1].wins + a[1].losses;
+                const bTotal = b[1].wins + b[1].losses;
+                if (aTotal === 0 && bTotal > 0) return 1;
+                if (bTotal === 0 && aTotal > 0) return -1;
+                return Math.abs(b[1].pnl) - Math.abs(a[1].pnl);
+            });
+
+            const getStreakDisplay = (s) => {
+                if (!s.streak || !s.streak_type) return null;
+                const isWin = s.streak_type === 'W';
+                return (
+                    <span className={`text-xs font-mono ${isWin ? 'text-green-400' : 'text-red-400'}`}>
+                        {s.streak}{s.streak_type}
+                    </span>
+                );
+            };
+
+            const getRoiColor = (roi) => {
+                if (roi > 5) return 'text-green-400';
+                if (roi > 0) return 'text-green-400/70';
+                if (roi > -5) return 'text-red-400/70';
+                return 'text-red-400';
+            };
+
+            const getHeatBg = (roi) => {
+                if (roi > 5) return 'bg-green-500/10 border-green-500/20';
+                if (roi > 0) return 'bg-green-500/5 border-green-500/10';
+                if (roi > -5) return 'bg-red-500/5 border-red-500/10';
+                return 'bg-red-500/10 border-red-500/20';
+            };
+
+            return (
+                <div className="mt-4 border-t border-slate-700 pt-4">
+                    <p className="text-xs text-slate-400 font-medium mb-3 uppercase tracking-wide">Coin Performance</p>
+                    <div className="space-y-2">
+                        {sortedCoins.map(([coin, s]) => {
+                            const total = s.wins + s.losses;
+                            if (total === 0 && s.open === 0) return null;
+                            return (
+                                <div key={coin} className={`rounded-lg border px-3 py-2 ${getHeatBg(s.roi)}`}>
+                                    <div className="flex items-center justify-between mb-1">
+                                        <div className="flex items-center gap-2">
+                                            <span className="text-xs font-bold uppercase text-white">{coin}</span>
+                                            {getStreakDisplay(s)}
+                                            {s.open > 0 && (
+                                                <span className="text-xs text-yellow-400/70">{s.open} open</span>
+                                            )}
+                                        </div>
+                                        <span className={`text-sm font-mono font-bold ${getRoiColor(s.roi)}`}>
+                                            {s.roi >= 0 ? '+' : ''}{s.roi.toFixed(1)}% ROI
+                                        </span>
+                                    </div>
+                                    <div className="flex items-center justify-between text-xs">
+                                        <span className="text-slate-400">
+                                            {s.wins}W/{s.losses}L
+                                            {total > 0 && <span className="text-slate-500 ml-1">({s.win_rate.toFixed(0)}%)</span>}
+                                        </span>
+                                        <span className={`font-mono ${s.pnl >= 0 ? 'text-green-400/80' : 'text-red-400/80'}`}>
+                                            {s.pnl >= 0 ? '+' : ''}${s.pnl.toFixed(2)}
+                                        </span>
+                                        <span className="text-slate-500 font-mono">
+                                            ${s.deployed.toFixed(0)} deployed
+                                        </span>
+                                    </div>
+                                </div>
+                            );
+                        })}
+                    </div>
                 </div>
             );
         };
@@ -836,6 +914,9 @@
 
                                 {/* Balance Chart */}
                                 <BalanceChart history={copyTrader.balance_history || []} />
+
+                                {/* Per-Coin ROI */}
+                                <CoinROI coinRoi={copyTrader.coin_roi} copyTrader={copyTrader} />
 
                                 {copyTrader.running ? (
                                     <div className="space-y-2 text-sm mt-4">

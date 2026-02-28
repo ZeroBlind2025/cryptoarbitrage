@@ -220,7 +220,7 @@ def discover_markets() -> list[dict]:
     SPORTS_TAG_ID = 100639
 
     # 15-minute market cryptos
-    CRYPTO_SYMBOLS = ["btc", "eth", "sol"]
+    CRYPTO_SYMBOLS = ["btc", "eth", "sol", "xrp"]
 
     markets = []
     crypto_found = 0
@@ -1889,7 +1889,7 @@ def _get_copy_trader_data() -> dict:
         "total_spent": 0, "open_positions": 0, "resolved_positions": 0,
         "wins": 0, "losses": 0, "win_rate": 0, "total_pnl": 0,
         "balance": 500.0, "equity": 500.0, "balance_history": [], "bet_amount": 2.0,
-        "coin_bet_amounts": {"btc": 2.0, "eth": 2.0, "sol": 2.0},
+        "coin_bet_amounts": {"btc": 2.0, "eth": 2.0, "sol": 2.0, "xrp": 2.0},
     }
     base = {
         "running": copy_trader_thread and copy_trader_thread.is_alive(),
