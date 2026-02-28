@@ -364,32 +364,46 @@
             );
         };
 
-        // Algo Settings Component - Trade Amount control
+        // Algo Settings Component - Per-coin lot size controls
         const AlgoSettings = ({ copyTrader, fetchData, setError }) => {
             const [isOpen, setIsOpen] = useState(false);
-            const [betAmount, setBetAmount] = useState('');
+            const COINS = ['btc', 'eth', 'sol'];
+            const [coinAmounts, setCoinAmounts] = useState({});
             const [saving, setSaving] = useState(false);
             const [saveMsg, setSaveMsg] = useState('');
 
             // Sync inputs with live data when panel opens
             useEffect(() => {
                 if (isOpen) {
-                    setBetAmount(String(copyTrader.bet_amount || 2));
+                    const current = copyTrader.coin_bet_amounts || {};
+                    const fallback = copyTrader.bet_amount || 2;
+                    const amounts = {};
+                    COINS.forEach(c => { amounts[c] = String(current[c] || fallback); });
+                    setCoinAmounts(amounts);
                     setSaveMsg('');
                 }
             }, [isOpen]);
+
+            const setCoinAmt = (coin, val) => {
+                setCoinAmounts(prev => ({ ...prev, [coin]: val }));
+            };
 
             const handleSave = async () => {
                 setSaving(true);
                 setSaveMsg('');
                 try {
-                    const body = {};
-                    const amt = parseFloat(betAmount);
-                    if (!isNaN(amt) && amt > 0 && amt !== copyTrader.bet_amount) {
-                        body.bet_amount = amt;
-                    }
+                    const current = copyTrader.coin_bet_amounts || {};
+                    const coin_bet_amounts = {};
+                    let hasChanges = false;
+                    COINS.forEach(coin => {
+                        const amt = parseFloat(coinAmounts[coin]);
+                        if (!isNaN(amt) && amt > 0 && amt !== (current[coin] || copyTrader.bet_amount)) {
+                            coin_bet_amounts[coin] = amt;
+                            hasChanges = true;
+                        }
+                    });
 
-                    if (Object.keys(body).length === 0) {
+                    if (!hasChanges) {
                         setSaveMsg('No changes to save.');
                         setSaving(false);
                         return;
@@ -398,7 +412,7 @@
                     const resp = await fetch('/api/copy-trader/settings', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify(body),
+                        body: JSON.stringify({ coin_bet_amounts }),
                     });
                     const result = await resp.json();
                     if (result.success) {
@@ -419,28 +433,55 @@
                         onClick={() => setIsOpen(!isOpen)}
                         className="flex items-center justify-between w-full text-sm text-slate-400 hover:text-slate-300"
                     >
-                        <span className="font-medium">Settings</span>
+                        <span className="font-medium">Lot Sizes</span>
                         <span className="text-xs">{isOpen ? '\u25B2' : '\u25BC'}</span>
                     </button>
 
                     {isOpen && (
                         <div className="mt-3 space-y-3">
-                            {/* Trade Amount */}
+                            {/* Per-coin lot size inputs */}
                             <div>
-                                <label className="text-xs text-slate-400 block mb-1">
-                                    Trade Amount ($)
+                                <label className="text-xs text-slate-400 block mb-2">
+                                    Per-Coin Lot Size ($)
                                     <span className="text-slate-500 ml-1">- applies to new trades only</span>
                                 </label>
-                                <input
-                                    type="number"
-                                    min="0.5"
-                                    step="0.5"
-                                    value={betAmount}
-                                    onChange={(e) => setBetAmount(e.target.value)}
-                                    className="w-full bg-slate-700/50 border border-slate-600 rounded-lg px-3 py-2 text-sm text-white font-mono focus:outline-none focus:border-cyan-500"
-                                    placeholder="2.00"
-                                />
+                                <div className="grid grid-cols-3 gap-2">
+                                    {COINS.map(coin => (
+                                        <div key={coin}>
+                                            <label className="text-xs text-slate-500 block mb-1 uppercase font-medium">{coin}</label>
+                                            <input
+                                                type="number"
+                                                min="0.5"
+                                                step="0.5"
+                                                value={coinAmounts[coin] || ''}
+                                                onChange={(e) => setCoinAmt(coin, e.target.value)}
+                                                className="w-full bg-slate-700/50 border border-slate-600 rounded-lg px-2 py-1.5 text-sm text-white font-mono focus:outline-none focus:border-cyan-500 text-center"
+                                                placeholder="2.00"
+                                            />
+                                        </div>
+                                    ))}
+                                </div>
                             </div>
+
+                            {/* Quick presets: apply to all coins */}
+                            {copyTrader.running && (
+                                <div className="flex gap-2">
+                                    <span className="text-xs text-slate-500 self-center">All:</span>
+                                    {[1, 2, 5, 10].map(amt => (
+                                        <button
+                                            key={amt}
+                                            onClick={() => {
+                                                const newAmounts = {};
+                                                COINS.forEach(c => { newAmounts[c] = String(amt); });
+                                                setCoinAmounts(newAmounts);
+                                            }}
+                                            className="px-2 py-1 text-xs rounded border transition-all bg-slate-700/50 text-slate-400 border-slate-600 hover:border-slate-500"
+                                        >
+                                            ${amt}
+                                        </button>
+                                    ))}
+                                </div>
+                            )}
 
                             {/* Save button */}
                             <button
@@ -454,7 +495,7 @@
                                             : 'bg-cyan-500/20 text-cyan-400 border border-cyan-500/30 hover:bg-cyan-500/30'
                                 }`}
                             >
-                                {!copyTrader.running ? 'Start Algo to change settings' : saving ? 'Saving...' : 'Save Settings'}
+                                {!copyTrader.running ? 'Start Algo to change settings' : saving ? 'Saving...' : 'Save Lot Sizes'}
                             </button>
 
                             {/* Feedback message */}
@@ -462,26 +503,6 @@
                                 <p className={`text-xs ${saveMsg.startsWith('Saved') ? 'text-green-400' : 'text-yellow-400'}`}>
                                     {saveMsg}
                                 </p>
-                            )}
-
-                            {/* Quick presets */}
-                            {copyTrader.running && (
-                                <div className="flex gap-2">
-                                    <span className="text-xs text-slate-500 self-center">Quick:</span>
-                                    {[2, 5, 10, 25].map(amt => (
-                                        <button
-                                            key={amt}
-                                            onClick={() => setBetAmount(String(amt))}
-                                            className={`px-2 py-1 text-xs rounded border transition-all ${
-                                                parseFloat(betAmount) === amt
-                                                    ? 'bg-cyan-500/20 text-cyan-400 border-cyan-500/30'
-                                                    : 'bg-slate-700/50 text-slate-400 border-slate-600 hover:border-slate-500'
-                                            }`}
-                                        >
-                                            ${amt}
-                                        </button>
-                                    ))}
-                                </div>
                             )}
                         </div>
                     )}
@@ -795,10 +816,20 @@
                                             <p className="text-xl font-bold font-mono text-cyan-400">
                                                 ${(copyTrader.balance || 500).toFixed(2)}
                                             </p>
-                                            <p className="text-xs text-slate-400 mt-2">Trade Size</p>
-                                            <p className="text-lg font-bold font-mono text-slate-300">
-                                                ${(copyTrader.bet_amount || 2).toFixed(2)}
-                                            </p>
+                                            <p className="text-xs text-slate-400 mt-2">Lot Sizes</p>
+                                            {copyTrader.coin_bet_amounts ? (
+                                                <div className="flex gap-2 mt-1">
+                                                    {Object.entries(copyTrader.coin_bet_amounts).sort().map(([coin, amt]) => (
+                                                        <span key={coin} className="text-xs font-mono text-slate-300">
+                                                            <span className="text-slate-500">{coin.toUpperCase()}</span> ${Number(amt).toFixed(0)}
+                                                        </span>
+                                                    ))}
+                                                </div>
+                                            ) : (
+                                                <p className="text-lg font-bold font-mono text-slate-300">
+                                                    ${(copyTrader.bet_amount || 2).toFixed(2)}
+                                                </p>
+                                            )}
                                         </div>
                                     </div>
                                 </div>
