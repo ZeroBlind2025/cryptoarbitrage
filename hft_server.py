@@ -220,7 +220,7 @@ def discover_markets() -> list[dict]:
     SPORTS_TAG_ID = 100639
 
     # 15-minute market cryptos
-    CRYPTO_SYMBOLS = ["btc", "eth", "sol", "xrp"]
+    CRYPTO_SYMBOLS = ["btc", "eth", "sol"]
 
     markets = []
     crypto_found = 0
@@ -1338,6 +1338,7 @@ def api_copy_trader_start():
     live_mode = data.get('live', False)
     crypto_only = data.get('crypto_only', True)
     bet_amount = data.get('bet_amount')
+    coin_bet_amounts = data.get('coin_bet_amounts')  # e.g. {"btc": 1.0, "eth": 2.0, "sol": 1.0}
 
     # Require confirmation for live mode
     if live_mode and not data.get('confirm_live'):
@@ -1354,6 +1355,7 @@ def api_copy_trader_start():
             crypto_only=crypto_only,
             on_trade=on_copy_trade,
             bet_amount=bet_amount,
+            coin_bet_amounts=coin_bet_amounts,
         )
         copy_trader.start()
     except Exception as e:
@@ -1451,16 +1453,19 @@ def api_copy_trader_resume():
 @app.route('/api/copy-trader/settings', methods=['GET'])
 def api_copy_trader_settings_get():
     """Get current copy trader settings"""
-    from copy_trader import BET_AMOUNT as DEFAULT_BET_AMOUNT, ALGO_STARTING_BALANCE
+    from copy_trader import BET_AMOUNT as DEFAULT_BET_AMOUNT, ALGO_STARTING_BALANCE, COIN_BET_AMOUNTS as DEFAULT_COIN_BETS
 
     current_bet_amount = copy_trader.bet_amount if copy_trader else DEFAULT_BET_AMOUNT
+    current_coin_bets = copy_trader.coin_bet_amounts if copy_trader else dict(DEFAULT_COIN_BETS)
     current_balance = (copy_trader.positions.get("stats", {}).get("balance", ALGO_STARTING_BALANCE)
                        if copy_trader else ALGO_STARTING_BALANCE)
 
     return jsonify({
         "bet_amount": current_bet_amount,
+        "coin_bet_amounts": current_coin_bets,
         "balance": current_balance,
         "default_bet_amount": DEFAULT_BET_AMOUNT,
+        "default_coin_bet_amounts": DEFAULT_COIN_BETS,
         "default_starting_balance": ALGO_STARTING_BALANCE,
         "is_paused": copy_trader_paused.is_set(),
         "is_running": copy_trader_thread is not None and copy_trader_thread.is_alive(),
@@ -1478,7 +1483,7 @@ def api_copy_trader_settings_update():
     data = request.get_json() or {}
     changes = []
 
-    # Update bet amount
+    # Update default bet amount
     if 'bet_amount' in data:
         new_amount = float(data['bet_amount'])
         if new_amount <= 0:
@@ -1488,18 +1493,33 @@ def api_copy_trader_settings_update():
         changes.append(f"Bet amount: ${old_amount:.2f} -> ${new_amount:.2f}")
         print(f"[ALGO] Bet amount changed: ${old_amount:.2f} -> ${new_amount:.2f}", flush=True)
 
+    # Update per-coin lot sizes (e.g. {"btc": 1.0, "eth": 2.0, "sol": 1.0})
+    if 'coin_bet_amounts' in data:
+        new_coin_bets = data['coin_bet_amounts']
+        if not isinstance(new_coin_bets, dict):
+            return jsonify({"error": "coin_bet_amounts must be an object like {\"btc\": 1.0, \"eth\": 2.0}"}), 400
+        for coin, amt in new_coin_bets.items():
+            amt = float(amt)
+            if amt <= 0:
+                return jsonify({"error": f"Lot size for {coin} must be positive"}), 400
+            old_amt = copy_trader.coin_bet_amounts.get(coin, copy_trader.bet_amount)
+            copy_trader.coin_bet_amounts[coin] = amt
+            changes.append(f"{coin.upper()} lot: ${old_amt:.2f} -> ${amt:.2f}")
+            print(f"[ALGO] {coin.upper()} lot size changed: ${old_amt:.2f} -> ${amt:.2f}", flush=True)
+
     # Opening balance is now set via ALGO_STARTING_BALANCE env var on Railway
     if 'starting_balance' in data:
         return jsonify({"error": "Opening balance is set via ALGO_STARTING_BALANCE env var on Railway"}), 400
 
     if not changes:
-        return jsonify({"error": "No settings provided. Send bet_amount."}), 400
+        return jsonify({"error": "No settings provided. Send bet_amount or coin_bet_amounts."}), 400
 
     return jsonify({
         "success": True,
         "changes": changes,
         "current": {
             "bet_amount": copy_trader.bet_amount,
+            "coin_bet_amounts": copy_trader.coin_bet_amounts,
             "balance": copy_trader.positions["stats"]["balance"],
         }
     })
@@ -1533,6 +1553,7 @@ def api_copy_trader_status():
             "trades_skipped": copy_trader.trades_skipped,
             "total_spent": copy_trader.total_spent,
             "bet_amount": copy_trader.bet_amount,
+            "coin_bet_amounts": copy_trader.coin_bet_amounts,
         })
 
     return jsonify(status)
@@ -1868,6 +1889,7 @@ def _get_copy_trader_data() -> dict:
         "total_spent": 0, "open_positions": 0, "resolved_positions": 0,
         "wins": 0, "losses": 0, "win_rate": 0, "total_pnl": 0,
         "balance": 500.0, "equity": 500.0, "balance_history": [], "bet_amount": 2.0,
+        "coin_bet_amounts": {"btc": 2.0, "eth": 2.0, "sol": 2.0},
     }
     base = {
         "running": copy_trader_thread and copy_trader_thread.is_alive(),

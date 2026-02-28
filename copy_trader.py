@@ -65,8 +65,28 @@ POLL_INTERVAL = int(os.getenv("COPY_POLL_INTERVAL", "10"))  # seconds between ch
 ALGO_STARTING_BALANCE = float(os.getenv("ALGO_STARTING_BALANCE", "2300.0"))  # Starting balance for Poly Algo
 PRICE_BUFFER_BPS = int(os.getenv("COPY_PRICE_BUFFER_BPS", "50"))  # Max overbid vs target's price (50 bps = 0.5%)
 
+# Per-coin lot sizes ($ per copied bet, per coin)
+# Override via env: COIN_BET_BTC=1.0  COIN_BET_ETH=2.0  COIN_BET_SOL=1.0
+COIN_BET_AMOUNTS = {
+    "btc": float(os.getenv("COIN_BET_BTC", str(BET_AMOUNT))),
+    "eth": float(os.getenv("COIN_BET_ETH", str(BET_AMOUNT))),
+    "sol": float(os.getenv("COIN_BET_SOL", str(BET_AMOUNT))),
+}
+
 # Crypto market filter - only copy trades on these markets
-CRYPTO_SLUGS = ["btc-", "eth-", "sol-", "xrp-", "-updown-"]
+CRYPTO_SLUGS = ["btc-", "eth-", "sol-", "-updown-"]
+
+
+def detect_coin(slug: str, title: str) -> str:
+    """Detect which coin a trade is for from slug/title. Returns 'btc', 'eth', 'sol', or ''."""
+    s = (slug + " " + title).lower()
+    if "btc-" in s or "bitcoin" in s:
+        return "btc"
+    if "eth-" in s or "ethereum" in s:
+        return "eth"
+    if "sol-" in s or "solana" in s:
+        return "sol"
+    return ""
 
 # API endpoints
 DATA_API = "https://data-api.polymarket.com"
@@ -444,7 +464,7 @@ def is_crypto_market(bet: dict) -> bool:
 
     # Also check for specific crypto keywords and timeframes (15, 30, 60 min)
     crypto_keywords = [
-        "bitcoin", "ethereum", "solana", "xrp",
+        "bitcoin", "ethereum", "solana",
         "15m", "15-min", "15 min",
         "30m", "30-min", "30 min",
         "60m", "60-min", "60 min", "1h", "1-hour", "1 hour"
@@ -562,7 +582,7 @@ def place_bet(client: "ClobClient", token_id: str, amount: float, max_price: flo
 class CopyTrader:
     """Copy trading engine"""
 
-    def __init__(self, dry_run: bool = True, crypto_only: bool = True, on_trade: Optional[callable] = None, on_resolution: Optional[callable] = None, bet_amount: Optional[float] = None):
+    def __init__(self, dry_run: bool = True, crypto_only: bool = True, on_trade: Optional[callable] = None, on_resolution: Optional[callable] = None, bet_amount: Optional[float] = None, coin_bet_amounts: Optional[dict] = None):
         self.dry_run = dry_run
         self.crypto_only = crypto_only
         self.client: Optional["ClobClient"] = None
@@ -575,6 +595,9 @@ class CopyTrader:
 
         # Configurable trade amount (can be changed at runtime via dashboard)
         self.bet_amount = bet_amount if bet_amount is not None else BET_AMOUNT
+
+        # Per-coin lot sizes (e.g. {"btc": 1.0, "eth": 2.0, "sol": 1.0})
+        self.coin_bet_amounts = dict(coin_bet_amounts) if coin_bet_amounts else dict(COIN_BET_AMOUNTS)
 
         # Stats
         self.trades_copied = 0
@@ -596,14 +619,22 @@ class CopyTrader:
         self.ws_token_refresh_interval = 300  # Refresh subscribed tokens every 5 min
         self.last_ws_token_refresh = 0
 
+    def get_bet_amount(self, slug: str = "", title: str = "") -> float:
+        """Get bet amount for a specific coin, falling back to default."""
+        coin = detect_coin(slug, title)
+        if coin and coin in self.coin_bet_amounts:
+            return self.coin_bet_amounts[coin]
+        return self.bet_amount
+
     def start(self):
         """Initialize the algo trader"""
         balance = self.positions.get("stats", {}).get("balance", ALGO_STARTING_BALANCE)
+        lot_sizes = ", ".join(f"{c.upper()}=${a}" for c, a in sorted(self.coin_bet_amounts.items()))
         print("\n" + "=" * 60)
         print(f"  POLY ALGO")
         print(f"  Following: {self.target_name}")
         print(f"  Target: {TARGET_ADDRESS[:20]}...")
-        print(f"  Bet amount: ${self.bet_amount}")
+        print(f"  Lot sizes: {lot_sizes} (default: ${self.bet_amount})")
         print(f"  Balance: ${balance:.2f}")
         print(f"  Mode: {'DRY RUN' if self.dry_run else 'LIVE'}")
         print(f"  Filter: {'Crypto only' if self.crypto_only else 'All markets'}")
@@ -836,11 +867,15 @@ class CopyTrader:
                     continue
                 self.copied_sizes.add(size_key)
 
+            # Resolve per-coin lot size
+            trade_coin = detect_coin(slug, title)
+            trade_amount = self.coin_bet_amounts.get(trade_coin, self.bet_amount) if trade_coin else self.bet_amount
+
             # Copy the trade!
             print(f"\n[ALGO] NEW TRADE DETECTED!")
             print(f"       Market: {title}")
             print(f"       Target bought: {size:.1f} {outcome} @ {price*100:.1f}¢")
-            print(f"       Copying: ${self.bet_amount:.2f} of {outcome}")
+            print(f"       Copying: ${trade_amount:.2f} of {outcome} ({trade_coin.upper() or '?'} lot)")
 
             # Build trade record for dashboard
             trade_record = {
@@ -850,7 +885,8 @@ class CopyTrader:
                 "slug": slug,
                 "outcome": outcome,
                 "side": "BUY",
-                "amount": self.bet_amount,
+                "amount": trade_amount,
+                "coin": trade_coin,
                 "price": price,
                 "target_trader": self.target_name,
                 "target_size": size,
@@ -887,7 +923,7 @@ class CopyTrader:
                         print(f"       Limit: {max_price:.4f} (target entry + {PRICE_BUFFER_BPS}bps, no WS)")
                     else:
                         max_price = 0
-                    fill = place_bet(self.client, token_id, self.bet_amount, max_price=max_price)
+                    fill = place_bet(self.client, token_id, trade_amount, max_price=max_price)
                     if fill.get("success"):
                         # Use our actual fill price instead of target's entry price
                         if fill.get("fill_price"):
@@ -898,7 +934,7 @@ class CopyTrader:
                             print(f"       EXECUTED! (fill price unavailable, using target's entry)")
                         trade_record["status"] = "filled"
                         copied += 1
-                        self.total_spent += self.bet_amount
+                        self.total_spent += trade_amount
                     else:
                         print(f"       FAILED!")
                         trade_record["status"] = "failed"
@@ -927,8 +963,8 @@ class CopyTrader:
                     "market": title,
                     "slug": slug,
                     "entry_price": price,
-                    "amount": self.bet_amount,
-                    "potential_payout": self.bet_amount / price if price > 0 else 0,
+                    "amount": trade_amount,
+                    "potential_payout": trade_amount / price if price > 0 else 0,
                     "dry_run": self.dry_run,
                 }
                 self.positions["open"].append(position)
@@ -936,7 +972,7 @@ class CopyTrader:
                 # Deduct balance (non-fatal — must never break trading)
                 try:
                     stats = self.positions["stats"]
-                    stats["balance"] = stats.get("balance", ALGO_STARTING_BALANCE) - self.bet_amount
+                    stats["balance"] = stats.get("balance", ALGO_STARTING_BALANCE) - trade_amount
                     open_staked = sum(p.get("amount", 0) for p in self.positions.get("open", []))
                     stats.setdefault("balance_history", []).append({
                         "timestamp": trade_record["timestamp"],
@@ -1287,6 +1323,7 @@ class CopyTrader:
             "equity": equity,
             "balance_history": balance_history,
             "bet_amount": self._safe_float(self.bet_amount),
+            "coin_bet_amounts": {k: self._safe_float(v) for k, v in self.coin_bet_amounts.items()},
         }
 
     def print_stats(self):
