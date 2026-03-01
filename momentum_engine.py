@@ -915,6 +915,25 @@ class MomentumEngine:
         momentum_open = [p for p in open_positions if p.get("source") == "momentum"]
         momentum_resolved = [p for p in self.positions.get("resolved", []) if p.get("source") == "momentum"]
 
+        # Compute momentum-specific P&L from resolved positions
+        m_wins = 0
+        m_losses = 0
+        m_total_pnl = 0.0
+        for p in momentum_resolved:
+            pnl = p.get("pnl", 0)
+            won = p.get("won")
+            if won is True:
+                m_wins += 1
+            elif won is False:
+                m_losses += 1
+            m_total_pnl += float(pnl) if pnl else 0.0
+
+        m_total = m_wins + m_losses
+        m_win_rate = (m_wins / m_total * 100) if m_total > 0 else 0.0
+
+        # Momentum-only staked amount
+        m_open_staked = sum(float(p.get("amount", 0)) for p in momentum_open)
+
         return {
             "trades_entered": self.trades_entered,
             "trades_skipped": self.trades_skipped,
@@ -922,6 +941,11 @@ class MomentumEngine:
             "scans_completed": self.scans_completed,
             "open_positions": len(momentum_open),
             "resolved_positions": len(momentum_resolved),
+            "wins": m_wins,
+            "losses": m_losses,
+            "total_pnl": m_total_pnl,
+            "win_rate": m_win_rate,
+            "open_staked": m_open_staked,
             "min_entry_price": self.min_entry_price,
             "max_entry_price": self.max_entry_price,
             "max_entries_per_market": self.max_entries_per_market,

@@ -1255,6 +1255,33 @@
 
                                 {momentum.running && (
                                     <div className="space-y-2 text-sm">
+                                        {/* P&L Hero */}
+                                        {(momentum.resolved_positions > 0 || momentum.total_pnl) && (
+                                            <div className="mb-2 p-3 rounded-lg bg-gradient-to-r from-orange-900/30 to-amber-900/30 border border-orange-500/20">
+                                                <div className="flex items-center justify-between">
+                                                    <div>
+                                                        <p className="text-xs text-slate-400 mb-0.5">Momentum P&L</p>
+                                                        <p className={`text-xl font-bold font-mono ${(momentum.total_pnl || 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                                                            {(momentum.total_pnl || 0) >= 0 ? '+' : ''}${(momentum.total_pnl || 0).toFixed(2)}
+                                                        </p>
+                                                    </div>
+                                                    <div className="text-right">
+                                                        <p className="text-xs text-slate-400 mb-0.5">Win Rate</p>
+                                                        <p className="text-lg font-bold font-mono text-orange-400">
+                                                            {momentum.wins || 0}W / {momentum.losses || 0}L
+                                                        </p>
+                                                        <p className="text-xs font-mono text-slate-400">
+                                                            {(momentum.win_rate || 0).toFixed(1)}%
+                                                        </p>
+                                                    </div>
+                                                </div>
+                                                {momentum.open_staked > 0 && (
+                                                    <p className="text-xs text-slate-500 mt-1">
+                                                        ${(momentum.open_staked || 0).toFixed(2)} staked in {momentum.open_positions || 0} open positions
+                                                    </p>
+                                                )}
+                                            </div>
+                                        )}
                                         <div className="flex justify-between">
                                             <span className="text-slate-400">Scans</span>
                                             <span className="text-white font-mono">{momentum.scans_completed || 0}</span>
