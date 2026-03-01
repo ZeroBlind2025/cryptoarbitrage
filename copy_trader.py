@@ -604,6 +604,24 @@ class CopyTrader:
         # Per-coin lot sizes (e.g. {"btc": 1.0, "eth": 2.0, "sol": 1.0})
         self.coin_bet_amounts = dict(coin_bet_amounts) if coin_bet_amounts else dict(COIN_BET_AMOUNTS)
 
+        # Per-coin pause: set of coin symbols currently paused (e.g. {"sol", "xrp"})
+        self.paused_coins: set = set()
+
+        # Dynamic lot sizing: auto-adjust lot sizes based on per-coin ROI
+        # When enabled, lot sizes are recalculated every resolution cycle
+        self.dynamic_lot_sizing_enabled = False
+        self.dynamic_lot_tiers = [
+            # (roi_threshold, lot_size) — evaluated top-down, first match wins
+            (15.0, 10.0),
+            (10.0, 7.0),
+            (5.0, 5.0),
+            (0.0, 2.0),    # base: 0% to 5%
+            (-5.0, 2.0),   # slightly negative: keep base
+            (-10.0, 1.0),  # losing: reduce exposure
+            (-15.0, 0.5),  # tanking: minimal exposure
+        ]
+        self.dynamic_lot_base = 2.0  # Default lot size for coins with no data
+
         # Stats
         self.trades_copied = 0
         self.trades_skipped = 0
@@ -630,6 +648,59 @@ class CopyTrader:
         if coin and coin in self.coin_bet_amounts:
             return self.coin_bet_amounts[coin]
         return self.bet_amount
+
+    def compute_dynamic_lot(self, coin: str, roi: float) -> float:
+        """Compute lot size for a coin based on its ROI using tiered thresholds.
+
+        Tiers (evaluated top-down for positive ROI, bottom-up for negative):
+          ROI >= 15% → $10    |   ROI <= -15% → $0.50
+          ROI >= 10% → $7     |   ROI <= -10% → $1.00
+          ROI >= 5%  → $5     |   ROI <= -5%  → $2.00
+          ROI 0-5%   → $2     |   ROI 0 to -5% → $2.00
+        """
+        if roi >= 0:
+            # Positive ROI: check thresholds top-down (highest first)
+            for threshold, lot in self.dynamic_lot_tiers:
+                if threshold >= 0 and roi >= threshold:
+                    return lot
+            return self.dynamic_lot_base
+        else:
+            # Negative ROI: check thresholds bottom-up (most negative first)
+            for threshold, lot in reversed(self.dynamic_lot_tiers):
+                if threshold < 0 and roi <= threshold:
+                    return lot
+            return self.dynamic_lot_base
+
+    def apply_dynamic_lot_sizing(self):
+        """Recalculate per-coin lot sizes based on current ROI.
+
+        Called periodically (after resolutions) when dynamic_lot_sizing_enabled is True.
+        Updates self.coin_bet_amounts in-place so the next trade uses the new sizes.
+        """
+        if not self.dynamic_lot_sizing_enabled:
+            return
+
+        open_positions = list(self.positions.get("open", []))
+        resolved_positions = list(self.positions.get("resolved", []))
+        coin_roi = self._compute_coin_roi(open_positions, resolved_positions)
+
+        changes = []
+        for coin in list(self.coin_bet_amounts.keys()):
+            stats = coin_roi.get(coin)
+            if not stats or (stats["wins"] + stats["losses"]) == 0:
+                # No resolved trades yet — use base lot
+                new_lot = self.dynamic_lot_base
+            else:
+                roi = stats.get("roi", 0)
+                new_lot = self.compute_dynamic_lot(coin, roi)
+
+            old_lot = self.coin_bet_amounts.get(coin, self.dynamic_lot_base)
+            if abs(new_lot - old_lot) >= 0.01:
+                self.coin_bet_amounts[coin] = new_lot
+                changes.append(f"{coin.upper()}: ${old_lot:.2f}→${new_lot:.2f} (ROI {stats.get('roi', 0):.1f}%)" if stats else f"{coin.upper()}: ${old_lot:.2f}→${new_lot:.2f}")
+
+        if changes:
+            print(f"[ALGO] Dynamic lot resize: {', '.join(changes)}", flush=True)
 
     def start(self):
         """Initialize the algo trader"""
@@ -822,6 +893,13 @@ class CopyTrader:
             # Filter for crypto markets only
             if self.crypto_only and not is_crypto_market(bet):
                 print(f"[ALGO] Skip (not crypto): {title}")
+                self.trades_skipped += 1
+                continue
+
+            # Per-coin pause check: skip if this coin is individually paused
+            trade_coin_check = detect_coin(slug, title)
+            if trade_coin_check and trade_coin_check in self.paused_coins:
+                print(f"[ALGO] Skip (coin paused: {trade_coin_check.upper()}): {title}")
                 self.trades_skipped += 1
                 continue
 
@@ -1217,6 +1295,9 @@ class CopyTrader:
             stats = self.positions["stats"]
             print(f"[ALGO] {resolved_this_check} position(s) resolved. Record: {stats['wins']}W/{stats['losses']}L, PnL: ${stats['total_pnl']:+.2f}")
 
+            # After resolutions, recalculate dynamic lot sizes if enabled
+            self.apply_dynamic_lot_sizing()
+
     @staticmethod
     def _safe_float(v, default=0.0):
         """Ensure a float is JSON-safe (no NaN/Inf)"""
@@ -1432,6 +1513,9 @@ class CopyTrader:
             "bet_amount": self._safe_float(self.bet_amount),
             "coin_bet_amounts": {k: self._safe_float(v) for k, v in self.coin_bet_amounts.items()},
             "coin_roi": coin_roi,
+            "paused_coins": list(self.paused_coins),
+            "dynamic_lot_sizing_enabled": self.dynamic_lot_sizing_enabled,
+            "dynamic_lot_tiers": [{"roi": t, "lot": l} for t, l in self.dynamic_lot_tiers],
         }
 
     def print_stats(self):
