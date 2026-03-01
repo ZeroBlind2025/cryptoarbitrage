@@ -1600,10 +1600,13 @@ def api_copy_trader_settings_update():
             return jsonify({"error": "Bet amount must be positive"}), 400
         old_amount = copy_trader.bet_amount
         copy_trader.bet_amount = new_amount
+        if momentum_engine:
+            momentum_engine.bet_amount = new_amount
         changes.append(f"Bet amount: ${old_amount:.2f} -> ${new_amount:.2f}")
-        print(f"[ALGO] Bet amount changed: ${old_amount:.2f} -> ${new_amount:.2f}", flush=True)
+        print(f"[ALGO] Bet amount changed: ${old_amount:.2f} -> ${new_amount:.2f} (copy+momentum)", flush=True)
 
     # Update per-coin lot sizes (e.g. {"btc": 1.0, "eth": 2.0, "sol": 1.0})
+    # Applies to BOTH copy trader and momentum engine
     if 'coin_bet_amounts' in data:
         new_coin_bets = data['coin_bet_amounts']
         if not isinstance(new_coin_bets, dict):
@@ -1614,8 +1617,10 @@ def api_copy_trader_settings_update():
                 return jsonify({"error": f"Lot size for {coin} must be positive"}), 400
             old_amt = copy_trader.coin_bet_amounts.get(coin, copy_trader.bet_amount)
             copy_trader.coin_bet_amounts[coin] = amt
+            if momentum_engine:
+                momentum_engine.coin_bet_amounts[coin] = amt
             changes.append(f"{coin.upper()} lot: ${old_amt:.2f} -> ${amt:.2f}")
-            print(f"[ALGO] {coin.upper()} lot size changed: ${old_amt:.2f} -> ${amt:.2f}", flush=True)
+            print(f"[ALGO] {coin.upper()} lot size changed: ${old_amt:.2f} -> ${amt:.2f} (copy+momentum)", flush=True)
 
     # Opening balance is now set via ALGO_STARTING_BALANCE env var on Railway
     if 'starting_balance' in data:
