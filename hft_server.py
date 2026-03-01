@@ -1450,6 +1450,93 @@ def api_copy_trader_resume():
     })
 
 
+@app.route('/api/copy-trader/pause-coin', methods=['POST'])
+def api_copy_trader_pause_coin():
+    """Pause a specific coin - stops new trades for that coin only"""
+    if not copy_trader:
+        return jsonify({"error": "Poly Algo not running"}), 400
+
+    data = request.get_json() or {}
+    coin = (data.get('coin') or '').lower().strip()
+    if not coin:
+        return jsonify({"error": "Missing 'coin' parameter (btc, eth, sol, xrp)"}), 400
+
+    valid_coins = set(copy_trader.coin_bet_amounts.keys())
+    if coin not in valid_coins:
+        return jsonify({"error": f"Unknown coin '{coin}'. Valid: {sorted(valid_coins)}"}), 400
+
+    if coin in copy_trader.paused_coins:
+        return jsonify({"error": f"{coin.upper()} is already paused"}), 400
+
+    copy_trader.paused_coins.add(coin)
+    print(f"[ALGO] COIN PAUSED: {coin.upper()} — no new trades for this coin", flush=True)
+
+    return jsonify({
+        "success": True,
+        "message": f"{coin.upper()} paused. No new trades will be placed for {coin.upper()}.",
+        "paused_coins": sorted(copy_trader.paused_coins),
+    })
+
+
+@app.route('/api/copy-trader/resume-coin', methods=['POST'])
+def api_copy_trader_resume_coin():
+    """Resume a specific coin - start trading that coin again"""
+    if not copy_trader:
+        return jsonify({"error": "Poly Algo not running"}), 400
+
+    data = request.get_json() or {}
+    coin = (data.get('coin') or '').lower().strip()
+    if not coin:
+        return jsonify({"error": "Missing 'coin' parameter (btc, eth, sol, xrp)"}), 400
+
+    if coin not in copy_trader.paused_coins:
+        return jsonify({"error": f"{coin.upper()} is not paused"}), 400
+
+    copy_trader.paused_coins.discard(coin)
+    print(f"[ALGO] COIN RESUMED: {coin.upper()} — trading active again", flush=True)
+
+    return jsonify({
+        "success": True,
+        "message": f"{coin.upper()} resumed. Now trading {coin.upper()} again.",
+        "paused_coins": sorted(copy_trader.paused_coins),
+    })
+
+
+@app.route('/api/copy-trader/dynamic-lots', methods=['POST'])
+def api_copy_trader_dynamic_lots():
+    """Enable/disable dynamic lot sizing based on per-coin ROI"""
+    if not copy_trader:
+        return jsonify({"error": "Poly Algo not running"}), 400
+
+    data = request.get_json() or {}
+    enabled = data.get('enabled')
+    if enabled is None:
+        return jsonify({"error": "Missing 'enabled' parameter (true/false)"}), 400
+
+    copy_trader.dynamic_lot_sizing_enabled = bool(enabled)
+
+    # Optionally update tiers
+    if 'tiers' in data:
+        tiers = data['tiers']
+        if isinstance(tiers, list) and all(isinstance(t, dict) and 'roi' in t and 'lot' in t for t in tiers):
+            copy_trader.dynamic_lot_tiers = [(float(t['roi']), float(t['lot'])) for t in tiers]
+
+    # If just enabled, apply immediately so lot sizes update right away
+    if copy_trader.dynamic_lot_sizing_enabled:
+        copy_trader.apply_dynamic_lot_sizing()
+
+    status = "enabled" if copy_trader.dynamic_lot_sizing_enabled else "disabled"
+    print(f"[ALGO] Dynamic lot sizing {status}", flush=True)
+
+    return jsonify({
+        "success": True,
+        "message": f"Dynamic lot sizing {status}.",
+        "dynamic_lot_sizing_enabled": copy_trader.dynamic_lot_sizing_enabled,
+        "coin_bet_amounts": copy_trader.coin_bet_amounts,
+        "tiers": [{"roi": t, "lot": l} for t, l in copy_trader.dynamic_lot_tiers],
+    })
+
+
 @app.route('/api/copy-trader/settings', methods=['GET'])
 def api_copy_trader_settings_get():
     """Get current copy trader settings"""
@@ -1469,6 +1556,9 @@ def api_copy_trader_settings_get():
         "default_starting_balance": ALGO_STARTING_BALANCE,
         "is_paused": copy_trader_paused.is_set(),
         "is_running": copy_trader_thread is not None and copy_trader_thread.is_alive(),
+        "paused_coins": sorted(copy_trader.paused_coins) if copy_trader else [],
+        "dynamic_lot_sizing_enabled": copy_trader.dynamic_lot_sizing_enabled if copy_trader else False,
+        "dynamic_lot_tiers": [{"roi": t, "lot": l} for t, l in copy_trader.dynamic_lot_tiers] if copy_trader else [],
     })
 
 
@@ -1554,6 +1644,8 @@ def api_copy_trader_status():
             "total_spent": copy_trader.total_spent,
             "bet_amount": copy_trader.bet_amount,
             "coin_bet_amounts": copy_trader.coin_bet_amounts,
+            "paused_coins": sorted(copy_trader.paused_coins),
+            "dynamic_lot_sizing_enabled": copy_trader.dynamic_lot_sizing_enabled,
         })
 
     return jsonify(status)
@@ -1890,6 +1982,8 @@ def _get_copy_trader_data() -> dict:
         "wins": 0, "losses": 0, "win_rate": 0, "total_pnl": 0,
         "balance": 500.0, "equity": 500.0, "balance_history": [], "bet_amount": 2.0,
         "coin_bet_amounts": {"btc": 2.0, "eth": 2.0, "sol": 2.0, "xrp": 2.0},
+        "paused_coins": [], "dynamic_lot_sizing_enabled": False,
+        "dynamic_lot_tiers": [],
     }
     base = {
         "running": copy_trader_thread and copy_trader_thread.is_alive(),
