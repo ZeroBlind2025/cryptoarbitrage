@@ -98,6 +98,14 @@ MAX_ENTRIES_PER_MARKET = int(os.getenv("MOMENTUM_MAX_ENTRIES", "2"))
 # =============================================================================
 
 CRYPTO_COINS = ["btc", "eth", "sol", "xrp"]
+
+# Full names used in Polymarket slugs (e.g. "bitcoin-updown-15m-1740844800")
+COIN_SLUG_NAMES = {
+    "btc": "bitcoin",
+    "eth": "ethereum",
+    "sol": "solana",
+    "xrp": "xrp",
+}
 INTERVALS = ["5m", "15m", "30m", "60m"]
 
 # Interval detection patterns for question text
@@ -315,8 +323,10 @@ def discover_active_markets() -> list[dict]:
 
     # ================================================================
     # Strategy 2: Timestamp-based slug search
-    # Polymarket uses slugs like "btc-updown-15m-1740844800" with
-    # Unix timestamps. Generate current/upcoming windows and search.
+    # Polymarket uses full coin names in slugs, e.g.:
+    #   "bitcoin-updown-15m-1740844800"
+    #   "ethereum-updown-5m-1740844500"
+    # Generate current/upcoming windows and search.
     # ================================================================
     now_ts = int(time.time())
 
@@ -327,7 +337,8 @@ def discover_active_markets() -> list[dict]:
         ("1h", 3600),
     ]
 
-    for symbol in CRYPTO_COINS:
+    for coin_abbr in CRYPTO_COINS:
+        coin_name = COIN_SLUG_NAMES.get(coin_abbr, coin_abbr)
         for tag, window_secs in interval_configs:
             base_ts = (now_ts // window_secs) * window_secs
             timestamps = [
@@ -337,7 +348,7 @@ def discover_active_markets() -> list[dict]:
             ]
 
             for ts in timestamps:
-                slug_pattern = f"{symbol}-updown-{tag}-{ts}"
+                slug_pattern = f"{coin_name}-updown-{tag}-{ts}"
                 try:
                     resp = requests.get(
                         f"{GAMMA_API}/markets",
@@ -362,6 +373,7 @@ def discover_active_markets() -> list[dict]:
     slug_search_terms = [
         "updown-5m", "updown-15m", "updown-1h",
         "up-or-down",
+        "bitcoin-updown", "ethereum-updown", "solana-updown", "xrp-updown",
     ]
     for search_term in slug_search_terms:
         try:
