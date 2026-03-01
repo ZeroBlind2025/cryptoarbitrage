@@ -2332,6 +2332,7 @@ def api_data():
             "demo": recent_demo,
             "live": recent_live,
             "copy": list(copy_trades)[-20:],
+            "momentum": list(momentum_trades)[-20:],
         },
         "copy_trader": _get_copy_trader_data(),
         "momentum": _get_momentum_data(),
