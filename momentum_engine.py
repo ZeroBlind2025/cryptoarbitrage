@@ -287,6 +287,8 @@ def discover_active_markets() -> list[dict]:
     # Timestamps are floor-aligned to interval boundaries.
     # e.g. btc-updown-5m-1772397000 (every 300s)
     # ================================================================
+    now_ts = int(time.time())
+
     event_slug_configs = [
         ("5m", 300), ("15m", 900), ("30m", 1800), ("1h", 3600),
     ]
@@ -372,7 +374,6 @@ def discover_active_markets() -> list[dict]:
     #   "ethereum-updown-5m-1740844500"
     # Generate current/upcoming windows and search.
     # ================================================================
-    now_ts = int(time.time())
 
     # Interval configs: (slug_tag, seconds_per_window)
     interval_configs = [
