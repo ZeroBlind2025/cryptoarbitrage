@@ -112,11 +112,31 @@ stop_copy_trader = threading.Event()
 copy_trader_paused = threading.Event()  # When set, skip new trades but keep resolution running
 copy_trades: deque = deque(maxlen=100)  # Copy trader trade history
 
+# Momentum engine
+try:
+    from momentum_engine import MomentumEngine, POLL_INTERVAL as MOMENTUM_POLL_INTERVAL
+    HAS_MOMENTUM_ENGINE = True
+except Exception as e:
+    print(f"[SERVER] Failed to import momentum_engine: {e}")
+    HAS_MOMENTUM_ENGINE = False
+    MOMENTUM_POLL_INTERVAL = 10
+
+momentum_engine: Optional["MomentumEngine"] = None
+momentum_thread: Optional[threading.Thread] = None
+stop_momentum = threading.Event()
+momentum_trades: deque = deque(maxlen=100)
+
 
 def on_copy_trade(trade_record: dict):
     """Callback when copy trader executes a trade"""
     copy_trades.append(trade_record)
     print(f"[ALGO] Trade recorded: {trade_record.get('market', '?')[:30]} - {trade_record.get('status', '?')}", flush=True)
+
+
+def on_momentum_trade(trade_record: dict):
+    """Callback when momentum engine executes a trade"""
+    momentum_trades.append(trade_record)
+    print(f"[MOMENTUM] Trade recorded: {trade_record.get('market', '?')[:30]} - {trade_record.get('status', '?')}", flush=True)
 
 
 # Sports data (no longer using WebSocket)
@@ -1668,6 +1688,9 @@ def api_trades():
     if mode in ['all', 'copy']:
         trades.extend(list(copy_trades)[-limit:])
 
+    if mode in ['all', 'momentum']:
+        trades.extend(list(momentum_trades)[-limit:])
+
     # Sort by timestamp
     trades.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
 
@@ -1890,6 +1913,487 @@ def api_copy_compare():
     )
 
 
+# =============================================================================
+# MOMENTUM ENGINE ENDPOINTS
+# =============================================================================
+
+def momentum_loop():
+    """Background loop for momentum engine"""
+    global momentum_engine
+    if not momentum_engine:
+        print("[MOMENTUM] Loop abort: engine is None", flush=True)
+        return
+
+    poll_s = MOMENTUM_POLL_INTERVAL
+    print(f"[MOMENTUM] Background scanning started (every {poll_s}s)...", flush=True)
+    loop_count = 0
+
+    while not stop_momentum.is_set():
+        try:
+            loop_count += 1
+
+            entered = momentum_engine.scan_and_trade()
+            if entered > 0:
+                print(f"[MOMENTUM] Entered {entered} trade(s)", flush=True)
+
+            # Always check resolutions
+            momentum_engine.check_resolutions()
+
+            # Heartbeat every ~5 min
+            heartbeat_every = max(1, 300 // poll_s)
+            if loop_count % heartbeat_every == 0:
+                stats = momentum_engine.get_stats()
+                print(f"[MOMENTUM] Heartbeat #{loop_count}: "
+                      f"{stats['open_positions']} open | "
+                      f"{stats['trades_entered']} entered | "
+                      f"{stats['scans_completed']} scans", flush=True)
+        except Exception as e:
+            print(f"[MOMENTUM] Error in loop: {e}", flush=True)
+            import traceback; traceback.print_exc()
+
+        stop_momentum.wait(timeout=poll_s)
+
+    print("[MOMENTUM] Background scanning stopped", flush=True)
+
+
+@app.route('/api/momentum/start', methods=['POST'])
+def api_momentum_start():
+    """Start momentum engine. Auto-pauses copy trader polling."""
+    global momentum_engine, momentum_thread, stop_momentum, copy_trader_paused
+
+    if not HAS_MOMENTUM_ENGINE:
+        return jsonify({"error": "Momentum engine module not available"}), 400
+
+    if momentum_thread and momentum_thread.is_alive():
+        return jsonify({"error": "Momentum engine already running"}), 400
+
+    data = request.get_json() or {}
+    live_mode = data.get('live', False)
+    bet_amount = data.get('bet_amount')
+    coin_bet_amounts = data.get('coin_bet_amounts')
+    min_entry = data.get('min_entry_price')
+
+    if live_mode and not data.get('confirm_live'):
+        return jsonify({
+            "error": "Live mode requires confirmation",
+            "message": "Set confirm_live=true to enable live momentum trading"
+        }), 403
+
+    # Share coin bet amounts from copy trader if available
+    if not coin_bet_amounts and copy_trader:
+        coin_bet_amounts = dict(copy_trader.coin_bet_amounts)
+    if not bet_amount and copy_trader:
+        bet_amount = copy_trader.bet_amount
+
+    try:
+        momentum_engine = MomentumEngine(
+            dry_run=not live_mode,
+            on_trade=on_momentum_trade,
+            bet_amount=bet_amount,
+            coin_bet_amounts=coin_bet_amounts,
+        )
+        if min_entry is not None:
+            momentum_engine.min_entry_price = float(min_entry)
+        momentum_engine.start()
+    except Exception as e:
+        print(f"[SERVER] Failed to start momentum engine: {e}")
+        import traceback; traceback.print_exc()
+        momentum_engine = None
+        return jsonify({"error": f"Failed to start: {e}"}), 500
+
+    # Auto-pause copy trader when momentum is active
+    copy_trader_was_active = False
+    if copy_trader_thread and copy_trader_thread.is_alive() and not copy_trader_paused.is_set():
+        copy_trader_paused.set()
+        copy_trader_was_active = True
+        print("[MOMENTUM] Auto-paused copy trader polling (resolutions still running)", flush=True)
+
+    stop_momentum.clear()
+    momentum_thread = threading.Thread(target=momentum_loop, daemon=True)
+    momentum_thread.start()
+
+    mode_str = "LIVE" if live_mode else "DRY RUN"
+    return jsonify({
+        "success": True,
+        "message": f"Momentum engine started in {mode_str} mode",
+        "min_entry_price": momentum_engine.min_entry_price,
+        "copy_trader_paused": copy_trader_was_active,
+    })
+
+
+@app.route('/api/momentum/stop', methods=['POST'])
+def api_momentum_stop():
+    """Stop momentum engine. Auto-resumes copy trader if it was paused."""
+    global momentum_engine, momentum_thread, stop_momentum, copy_trader_paused
+
+    if not momentum_thread or not momentum_thread.is_alive():
+        return jsonify({"error": "Momentum engine not running"}), 400
+
+    stop_momentum.set()
+    momentum_thread.join(timeout=5)
+
+    stats = momentum_engine.get_stats() if momentum_engine else {}
+
+    if momentum_engine:
+        momentum_engine.stop()
+    momentum_engine = None
+
+    # Auto-resume copy trader
+    copy_trader_resumed = False
+    if copy_trader_thread and copy_trader_thread.is_alive() and copy_trader_paused.is_set():
+        copy_trader_paused.clear()
+        copy_trader_resumed = True
+        print("[MOMENTUM] Auto-resumed copy trader polling", flush=True)
+
+    return jsonify({
+        "success": True,
+        "message": "Momentum engine stopped",
+        "stats": stats,
+        "copy_trader_resumed": copy_trader_resumed,
+    })
+
+
+@app.route('/api/momentum/status')
+def api_momentum_status():
+    """Get momentum engine status"""
+    if not HAS_MOMENTUM_ENGINE:
+        return jsonify({"available": False, "running": False, "error": "Module not available"})
+
+    running = momentum_thread and momentum_thread.is_alive()
+    status = {"available": True, "running": running}
+
+    if momentum_engine:
+        status.update(momentum_engine.get_stats())
+
+    return jsonify(status)
+
+
+@app.route('/api/momentum/settings', methods=['POST'])
+def api_momentum_settings():
+    """Update momentum engine settings at runtime"""
+    if not momentum_engine:
+        return jsonify({"error": "Momentum engine not running"}), 400
+
+    data = request.get_json() or {}
+    changes = []
+
+    if 'min_entry_price' in data:
+        old = momentum_engine.min_entry_price
+        momentum_engine.min_entry_price = float(data['min_entry_price'])
+        changes.append(f"min_entry: {old*100:.0f}¢ -> {momentum_engine.min_entry_price*100:.0f}¢")
+
+    if 'max_entry_price' in data:
+        old = momentum_engine.max_entry_price
+        momentum_engine.max_entry_price = float(data['max_entry_price'])
+        changes.append(f"max_entry: {old*100:.0f}¢ -> {momentum_engine.max_entry_price*100:.0f}¢")
+
+    if 'max_entries_per_market' in data:
+        old = momentum_engine.max_entries_per_market
+        momentum_engine.max_entries_per_market = int(data['max_entries_per_market'])
+        changes.append(f"max_entries: {old} -> {momentum_engine.max_entries_per_market}")
+
+    if 'bet_amount' in data:
+        old = momentum_engine.bet_amount
+        momentum_engine.bet_amount = float(data['bet_amount'])
+        changes.append(f"bet_amount: ${old:.2f} -> ${momentum_engine.bet_amount:.2f}")
+
+    if 'coin_bet_amounts' in data:
+        for coin, amt in data['coin_bet_amounts'].items():
+            old = momentum_engine.coin_bet_amounts.get(coin, momentum_engine.bet_amount)
+            momentum_engine.coin_bet_amounts[coin] = float(amt)
+            changes.append(f"{coin.upper()} lot: ${old:.2f} -> ${float(amt):.2f}")
+
+    if not changes:
+        return jsonify({"error": "No settings provided"}), 400
+
+    return jsonify({"success": True, "changes": changes, "current": momentum_engine.get_stats()})
+
+
+@app.route('/api/momentum/pause-coin', methods=['POST'])
+def api_momentum_pause_coin():
+    """Pause a coin in the momentum engine"""
+    if not momentum_engine:
+        return jsonify({"error": "Momentum engine not running"}), 400
+
+    data = request.get_json() or {}
+    coin = (data.get('coin') or '').lower().strip()
+    if not coin:
+        return jsonify({"error": "Missing 'coin' parameter"}), 400
+
+    if coin in momentum_engine.paused_coins:
+        return jsonify({"error": f"{coin.upper()} already paused"}), 400
+
+    momentum_engine.paused_coins.add(coin)
+    return jsonify({"success": True, "message": f"{coin.upper()} paused", "paused_coins": sorted(momentum_engine.paused_coins)})
+
+
+@app.route('/api/momentum/resume-coin', methods=['POST'])
+def api_momentum_resume_coin():
+    """Resume a coin in the momentum engine"""
+    if not momentum_engine:
+        return jsonify({"error": "Momentum engine not running"}), 400
+
+    data = request.get_json() or {}
+    coin = (data.get('coin') or '').lower().strip()
+    if not coin:
+        return jsonify({"error": "Missing 'coin' parameter"}), 400
+
+    if coin not in momentum_engine.paused_coins:
+        return jsonify({"error": f"{coin.upper()} not paused"}), 400
+
+    momentum_engine.paused_coins.discard(coin)
+    return jsonify({"success": True, "message": f"{coin.upper()} resumed", "paused_coins": sorted(momentum_engine.paused_coins)})
+
+
+@app.route('/api/momentum/trades')
+def api_momentum_trades():
+    """Get momentum engine trade history"""
+    limit = int(request.args.get('limit', 50))
+    trades = list(momentum_trades)[-limit:]
+    trades.reverse()
+    return jsonify(trades)
+
+
+# =============================================================================
+# MOMENTUM ENGINE ENDPOINTS
+# =============================================================================
+
+def momentum_loop():
+    """Background loop for momentum engine"""
+    global momentum_engine
+    if not momentum_engine:
+        print("[MOMENTUM] Loop abort: engine is None", flush=True)
+        return
+
+    poll_s = MOMENTUM_POLL_INTERVAL
+    print(f"[MOMENTUM] Background loop started (every {poll_s}s)...", flush=True)
+    loop_count = 0
+
+    while not stop_momentum.is_set():
+        try:
+            loop_count += 1
+            entered = momentum_engine.scan_and_trade()
+            if entered > 0:
+                print(f"[MOMENTUM] Entered {entered} trade(s)", flush=True)
+
+            momentum_engine.check_resolutions()
+
+            # Heartbeat every ~5 min
+            heartbeat_every = max(1, 300 // poll_s)
+            if loop_count % heartbeat_every == 0:
+                stats = momentum_engine.get_stats()
+                print(f"[MOMENTUM] Heartbeat #{loop_count}: "
+                      f"{stats['open_positions']} open | "
+                      f"{stats['trades_entered']} entered | "
+                      f"{stats['scans_completed']} scans", flush=True)
+        except Exception as e:
+            print(f"[MOMENTUM] Error in loop: {e}", flush=True)
+            import traceback; traceback.print_exc()
+
+        stop_momentum.wait(timeout=poll_s)
+
+    print("[MOMENTUM] Background loop stopped", flush=True)
+
+
+@app.route('/api/momentum/start', methods=['POST'])
+def api_momentum_start():
+    """Start momentum engine — automatically pauses copy trader polling"""
+    global momentum_engine, momentum_thread, stop_momentum, copy_trader_paused
+
+    if not HAS_MOMENTUM_ENGINE:
+        return jsonify({"error": "Momentum engine module not available"}), 400
+
+    if momentum_thread and momentum_thread.is_alive():
+        return jsonify({"error": "Momentum engine already running"}), 400
+
+    data = request.get_json() or {}
+    live_mode = data.get('live', False)
+    bet_amount = data.get('bet_amount')
+    coin_bet_amounts = data.get('coin_bet_amounts')
+    min_entry_price = data.get('min_entry_price')
+
+    if live_mode and not data.get('confirm_live'):
+        return jsonify({
+            "error": "Live mode requires confirmation",
+            "message": "Set confirm_live=true to enable live momentum trading"
+        }), 403
+
+    try:
+        momentum_engine = MomentumEngine(
+            dry_run=not live_mode,
+            on_trade=on_momentum_trade,
+            bet_amount=bet_amount,
+            coin_bet_amounts=coin_bet_amounts,
+        )
+        if min_entry_price is not None:
+            momentum_engine.min_entry_price = float(min_entry_price)
+        momentum_engine.start()
+    except Exception as e:
+        print(f"[SERVER] Failed to start momentum engine: {e}")
+        import traceback; traceback.print_exc()
+        momentum_engine = None
+        return jsonify({"error": f"Failed to start: {e}"}), 500
+
+    # Auto-pause copy trader polling when momentum is active
+    copy_trader_was_active = False
+    if copy_trader_thread and copy_trader_thread.is_alive() and not copy_trader_paused.is_set():
+        copy_trader_paused.set()
+        copy_trader_was_active = True
+        print("[MOMENTUM] Auto-paused copy trader polling (resolutions still running)", flush=True)
+
+    stop_momentum.clear()
+    momentum_thread = threading.Thread(target=momentum_loop, daemon=True)
+    momentum_thread.start()
+
+    mode_str = "LIVE" if live_mode else "DRY RUN"
+    return jsonify({
+        "success": True,
+        "message": f"Momentum engine started in {mode_str} mode",
+        "copy_trader_paused": copy_trader_was_active,
+        "min_entry_price": momentum_engine.min_entry_price,
+    })
+
+
+@app.route('/api/momentum/stop', methods=['POST'])
+def api_momentum_stop():
+    """Stop momentum engine — optionally resumes copy trader"""
+    global momentum_engine, momentum_thread, stop_momentum, copy_trader_paused
+
+    if not momentum_thread or not momentum_thread.is_alive():
+        return jsonify({"error": "Momentum engine not running"}), 400
+
+    stop_momentum.set()
+    momentum_thread.join(timeout=5)
+
+    stats = momentum_engine.get_stats() if momentum_engine else {}
+
+    if momentum_engine:
+        momentum_engine.stop()
+    momentum_engine = None
+
+    # Auto-resume copy trader if it was paused by momentum
+    data = request.get_json() or {}
+    resume_copy = data.get('resume_copy_trader', True)
+    copy_trader_resumed = False
+    if resume_copy and copy_trader_thread and copy_trader_thread.is_alive() and copy_trader_paused.is_set():
+        copy_trader_paused.clear()
+        copy_trader_resumed = True
+        print("[MOMENTUM] Auto-resumed copy trader polling", flush=True)
+
+    return jsonify({
+        "success": True,
+        "message": "Momentum engine stopped",
+        "stats": stats,
+        "copy_trader_resumed": copy_trader_resumed,
+    })
+
+
+@app.route('/api/momentum/status')
+def api_momentum_status():
+    """Get momentum engine status"""
+    if not HAS_MOMENTUM_ENGINE:
+        return jsonify({"available": False, "running": False, "error": "Module not available"})
+
+    running = momentum_thread and momentum_thread.is_alive()
+
+    status = {
+        "available": True,
+        "running": running,
+    }
+
+    if momentum_engine:
+        status.update(momentum_engine.get_stats())
+
+    return jsonify(status)
+
+
+@app.route('/api/momentum/settings', methods=['POST'])
+def api_momentum_settings():
+    """Update momentum engine settings at runtime"""
+    if not momentum_engine:
+        return jsonify({"error": "Momentum engine not running"}), 400
+
+    data = request.get_json() or {}
+    changes = []
+
+    if 'min_entry_price' in data:
+        old = momentum_engine.min_entry_price
+        momentum_engine.min_entry_price = float(data['min_entry_price'])
+        changes.append(f"min_entry: {old*100:.0f}¢ → {momentum_engine.min_entry_price*100:.0f}¢")
+
+    if 'max_entry_price' in data:
+        old = momentum_engine.max_entry_price
+        momentum_engine.max_entry_price = float(data['max_entry_price'])
+        changes.append(f"max_entry: {old*100:.0f}¢ → {momentum_engine.max_entry_price*100:.0f}¢")
+
+    if 'max_entries_per_market' in data:
+        old = momentum_engine.max_entries_per_market
+        momentum_engine.max_entries_per_market = int(data['max_entries_per_market'])
+        changes.append(f"max_entries: {old} → {momentum_engine.max_entries_per_market}")
+
+    if 'bet_amount' in data:
+        old = momentum_engine.bet_amount
+        momentum_engine.bet_amount = float(data['bet_amount'])
+        changes.append(f"bet: ${old:.2f} → ${momentum_engine.bet_amount:.2f}")
+
+    if 'coin_bet_amounts' in data:
+        for coin, amt in data['coin_bet_amounts'].items():
+            old = momentum_engine.coin_bet_amounts.get(coin, momentum_engine.bet_amount)
+            momentum_engine.coin_bet_amounts[coin] = float(amt)
+            changes.append(f"{coin.upper()}: ${old:.2f} → ${float(amt):.2f}")
+
+    if not changes:
+        return jsonify({"error": "No settings provided"}), 400
+
+    print(f"[MOMENTUM] Settings updated: {', '.join(changes)}", flush=True)
+    return jsonify({"success": True, "changes": changes, "current": momentum_engine.get_stats()})
+
+
+@app.route('/api/momentum/pause-coin', methods=['POST'])
+def api_momentum_pause_coin():
+    """Pause a specific coin in momentum engine"""
+    if not momentum_engine:
+        return jsonify({"error": "Momentum engine not running"}), 400
+
+    data = request.get_json() or {}
+    coin = (data.get('coin') or '').lower().strip()
+    if not coin:
+        return jsonify({"error": "Missing 'coin' parameter"}), 400
+
+    if coin in momentum_engine.paused_coins:
+        return jsonify({"error": f"{coin.upper()} already paused"}), 400
+
+    momentum_engine.paused_coins.add(coin)
+    return jsonify({"success": True, "paused_coins": sorted(momentum_engine.paused_coins)})
+
+
+@app.route('/api/momentum/resume-coin', methods=['POST'])
+def api_momentum_resume_coin():
+    """Resume a specific coin in momentum engine"""
+    if not momentum_engine:
+        return jsonify({"error": "Momentum engine not running"}), 400
+
+    data = request.get_json() or {}
+    coin = (data.get('coin') or '').lower().strip()
+    if not coin:
+        return jsonify({"error": "Missing 'coin' parameter"}), 400
+
+    if coin not in momentum_engine.paused_coins:
+        return jsonify({"error": f"{coin.upper()} not paused"}), 400
+
+    momentum_engine.paused_coins.discard(coin)
+    return jsonify({"success": True, "paused_coins": sorted(momentum_engine.paused_coins)})
+
+
+@app.route('/api/momentum/trades')
+def api_momentum_trades():
+    """Get momentum engine trade history"""
+    limit = int(request.args.get('limit', 50))
+    trades = list(momentum_trades)[-limit:]
+    trades.reverse()
+    return jsonify(trades)
+
+
 @app.route('/api/trades/demo')
 def api_trades_demo():
     """Get demo trades"""
@@ -2000,6 +2504,33 @@ def _get_copy_trader_data() -> dict:
     return base
 
 
+def _get_momentum_data() -> dict:
+    """Get momentum engine data for /api/data, with error isolation"""
+    _defaults = {
+        "running": False,
+        "trades_entered": 0, "trades_skipped": 0,
+        "total_spent": 0, "scans_completed": 0,
+        "open_positions": 0, "resolved_positions": 0,
+        "min_entry_price": 0.65, "max_entry_price": 0.95,
+        "bet_amount": 2.0,
+        "coin_bet_amounts": {"btc": 2.0, "eth": 2.0, "sol": 2.0, "xrp": 2.0},
+        "paused_coins": [], "dry_run": True,
+        "active_entries": {},
+    }
+    base = {
+        "running": momentum_thread and momentum_thread.is_alive(),
+    }
+    try:
+        if momentum_engine:
+            base.update(momentum_engine.get_stats())
+        else:
+            base.update(_defaults)
+    except Exception as e:
+        print(f"[MOMENTUM] get_stats error (using defaults): {e}", flush=True)
+        base.update(_defaults)
+    return base
+
+
 @app.route('/api/data')
 def api_data():
     """Get all dashboard data in one call"""
@@ -2043,6 +2574,7 @@ def api_data():
             "copy": list(copy_trades)[-20:],
         },
         "copy_trader": _get_copy_trader_data(),
+        "momentum": _get_momentum_data(),
         "pnl": {
             "demo": {
                 "filled": len(demo_filled),
