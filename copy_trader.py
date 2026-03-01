@@ -675,8 +675,8 @@ class CopyTrader:
         if not self.dynamic_lot_sizing_enabled:
             return
 
-        open_positions = list(self.positions.get("open", []))
-        resolved_positions = list(self.positions.get("resolved", []))
+        open_positions = [p for p in self.positions.get("open", []) if p.get("source") != "momentum"]
+        resolved_positions = [p for p in self.positions.get("resolved", []) if p.get("source") != "momentum"]
         coin_roi = self._compute_coin_roi(open_positions, resolved_positions)
 
         changes = []
@@ -1489,8 +1489,9 @@ class CopyTrader:
             self._bh_cache = (raw_len, balance_history)
 
         # Snapshot lists to avoid RuntimeError from concurrent mutation
-        open_positions = list(self.positions.get("open", []))
-        resolved_positions = list(self.positions.get("resolved", []))
+        # Filter to only copy_trader positions (exclude momentum-sourced)
+        open_positions = [p for p in self.positions.get("open", []) if p.get("source") != "momentum"]
+        resolved_positions = [p for p in self.positions.get("resolved", []) if p.get("source") != "momentum"]
         open_staked = sum(p.get("amount", 0) for p in open_positions)
         equity = self._safe_float(balance + open_staked)
 
