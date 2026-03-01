@@ -166,14 +166,15 @@ def discover_active_markets() -> list[dict]:
         condition_id = raw.get("conditionId") or raw.get("condition_id") or ""
         coin = detect_coin(slug, raw.get("question", ""))
 
-        # Detect interval from slug
-        interval = "unknown"
+        # Detect interval from slug — MUST match a known interval
+        # to avoid non-price markets like "Will MegaETH airdrop?"
+        interval = ""
         for tag in ["5m", "15m", "30m", "60m", "1h"]:
             if f"-{tag}-" in slug or slug.endswith(f"-{tag}"):
                 interval = tag
                 break
 
-        if not coin:
+        if not coin or not interval:
             continue
 
         markets.append({
