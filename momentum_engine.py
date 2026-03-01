@@ -108,15 +108,29 @@ _INTERVAL_MINUTES = {5: "5m", 15: "15m", 30: "30m", 60: "60m"}
 def _detect_interval(slug: str, question: str) -> str:
     """Detect interval from slug or question text.
 
-    Checks slug for tags like '-15m-' and also parses question time ranges
-    like '9:00AM-9:15AM' or hourly format like 'March 1, 12PM ET'.
+    Checks slug for tags like '-15m-', '-5m-', 'updown-15m' and also parses
+    question time ranges like '9:00AM-9:15AM' or hourly format like
+    'March 1, 12PM ET'.
     """
     import re
 
-    # Check slug for interval tags (e.g. -15m-, -5m-)
+    slug_lower = slug.lower()
+
+    # Check slug for interval tags (e.g. -15m-, -5m-, updown-15m-{ts})
     for tag in INTERVALS:
-        if f"-{tag}-" in slug or slug.endswith(f"-{tag}"):
+        if f"-{tag}-" in slug_lower or slug_lower.endswith(f"-{tag}"):
             return tag
+
+    # Also check for "updown-{interval}" pattern (e.g. btc-updown-15m-1740844800)
+    updown_match = re.search(r'updown-(\d+m)\b', slug_lower)
+    if updown_match:
+        tag = updown_match.group(1)
+        if tag in INTERVALS:
+            return tag
+
+    # Check for "1h" or "1hr" in slug (hourly markets)
+    if re.search(r'-1h[r]?[-\d]', slug_lower) or slug_lower.endswith("-1h") or slug_lower.endswith("-1hr"):
+        return "60m"
 
     # Parse question time range: "HH:MMAM-HH:MMAM" or "H:MMAM-H:MMAM"
     time_range = re.search(
@@ -151,13 +165,17 @@ def _parse_market(raw: dict) -> Optional[dict]:
     """Parse a single Gamma API market into our internal format.
 
     Returns None if the market doesn't match crypto updown criteria.
-    Requires "Up or Down" in the question text to confirm it's a price market.
+    Accepts markets with "Up or Down" in question text OR "updown" in slug
+    (Polymarket uses both naming conventions).
     """
     slug = (raw.get("slug") or "").lower()
     question = raw.get("question", "")
 
-    # MUST be an "Up or Down" market
-    if "up or down" not in question.lower():
+    # MUST be an "Up or Down" market (check question text AND slug)
+    is_updown = ("up or down" in question.lower()
+                 or "updown" in slug
+                 or "up-or-down" in slug)
+    if not is_updown:
         return None
 
     # Parse token IDs
@@ -215,13 +233,22 @@ def _parse_market(raw: dict) -> Optional[dict]:
     }
 
 
-def discover_active_markets() -> list[dict]:
-    """Find all active crypto updown markets across all intervals.
+def _is_crypto_updown_event(title: str, slug: str) -> bool:
+    """Check if an event is a crypto up-or-down event by title/slug."""
+    combined = (title + " " + slug).lower()
+    crypto_terms = ["bitcoin", "btc", "ethereum", "eth", "solana", "sol", "xrp", "ripple"]
+    has_crypto = any(t in combined for t in crypto_terms)
+    has_updown = "up or down" in combined or "updown" in combined or "up-or-down" in combined
+    return has_crypto and has_updown
 
-    Uses the Gamma API to search for markets whose question contains
-    "Up or Down" plus a crypto coin name (Bitcoin, Ethereum, etc.).
-    This matches the actual Polymarket naming convention shown on
-    the platform, e.g. "Bitcoin Up or Down - March 1, 12PM ET".
+
+def discover_active_markets() -> list[dict]:
+    """Find all active crypto updown markets across all intervals (5m, 15m, 1hr).
+
+    Uses three strategies in order:
+      1. /events endpoint — primary discovery via events with nested markets
+      2. Timestamp-based slug search — for specific interval windows
+      3. Broad /markets fallback — catch anything missed
 
     Returns a list of market dicts with:
       - slug, question, condition_id
@@ -234,25 +261,117 @@ def discover_active_markets() -> list[dict]:
     markets = []
     seen_conditions = set()
 
-    # Full coin names for searching (Polymarket uses these in titles/slugs)
-    coin_search_terms = {
-        "bitcoin": "btc",
-        "ethereum": "eth",
-        "solana": "sol",
-        "xrp": "xrp",
-    }
+    def _add_market(raw: dict):
+        """Parse and add a market if valid and not seen."""
+        cid = raw.get("conditionId") or raw.get("condition_id") or ""
+        if cid in seen_conditions:
+            return False
+        m = _parse_market(raw)
+        if m:
+            markets.append(m)
+            seen_conditions.add(cid)
+            return True
+        return False
 
-    # Strategy 1: Targeted search per coin
-    # Search for each coin's "up or down" markets individually
-    for search_term in coin_search_terms:
+    # ================================================================
+    # Strategy 1: /events endpoint (primary)
+    # Events contain nested markets — this is the most reliable way
+    # to find crypto updown markets on Polymarket.
+    # ================================================================
+    try:
+        resp = requests.get(
+            f"{GAMMA_API}/events",
+            params={
+                "active": "true",
+                "closed": "false",
+                "limit": 100,
+            },
+            timeout=15,
+        )
+        if resp.status_code == 200:
+            events = resp.json()
+            events_checked = 0
+            for event in events:
+                event_title = event.get("title", "")
+                event_slug = event.get("slug", "")
+
+                # Quick filter: is this a crypto updown event?
+                if not _is_crypto_updown_event(event_title, event_slug):
+                    continue
+
+                events_checked += 1
+                event_markets = event.get("markets", [])
+                for mkt in event_markets:
+                    _add_market(mkt)
+
+            if events_checked > 0:
+                print(f"[MOMENTUM] Events: checked {events_checked} crypto events "
+                      f"from {len(events)} total", flush=True)
+        else:
+            print(f"[MOMENTUM] Events endpoint returned {resp.status_code}", flush=True)
+
+    except Exception as e:
+        print(f"[MOMENTUM] Events search error: {e}", flush=True)
+
+    # ================================================================
+    # Strategy 2: Timestamp-based slug search
+    # Polymarket uses slugs like "btc-updown-15m-1740844800" with
+    # Unix timestamps. Generate current/upcoming windows and search.
+    # ================================================================
+    now_ts = int(time.time())
+
+    # Interval configs: (slug_tag, seconds_per_window)
+    interval_configs = [
+        ("5m", 300),
+        ("15m", 900),
+        ("1h", 3600),
+    ]
+
+    for symbol in CRYPTO_COINS:
+        for tag, window_secs in interval_configs:
+            base_ts = (now_ts // window_secs) * window_secs
+            timestamps = [
+                base_ts - window_secs,  # Previous window (might still be active)
+                base_ts,                # Current window
+                base_ts + window_secs,  # Next window
+            ]
+
+            for ts in timestamps:
+                slug_pattern = f"{symbol}-updown-{tag}-{ts}"
+                try:
+                    resp = requests.get(
+                        f"{GAMMA_API}/markets",
+                        params={
+                            "slug": slug_pattern,
+                            "active": "true",
+                            "closed": "false",
+                        },
+                        timeout=10,
+                    )
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        if isinstance(data, list):
+                            for raw in data:
+                                _add_market(raw)
+                except Exception:
+                    pass
+
+            time.sleep(0.02)
+
+    # Also search with slug_contains for partial matches
+    slug_search_terms = [
+        "updown-5m", "updown-15m", "updown-1h",
+        "up-or-down",
+    ]
+    for search_term in slug_search_terms:
         try:
             resp = requests.get(
                 f"{GAMMA_API}/markets",
                 params={
+                    "slug_contains": search_term,
                     "active": "true",
                     "closed": "false",
                     "limit": 50,
-                    "slug": f"{search_term}-up-or-down",
                 },
                 timeout=10,
             )
@@ -260,19 +379,15 @@ def discover_active_markets() -> list[dict]:
                 data = resp.json()
                 if isinstance(data, list):
                     for raw in data:
-                        cid = raw.get("conditionId") or raw.get("condition_id") or ""
-                        if cid in seen_conditions:
-                            continue
-                        m = _parse_market(raw)
-                        if m:
-                            markets.append(m)
-                            seen_conditions.add(cid)
+                        _add_market(raw)
         except Exception:
             pass
-        time.sleep(0.03)
+        time.sleep(0.02)
 
-    # Strategy 2: Broad fallback — fetch recent active markets
-    # and filter by question text containing "Up or Down"
+    # ================================================================
+    # Strategy 3: Broad /markets fallback
+    # Fetch recent active markets and filter by "Up or Down" keyword.
+    # ================================================================
     try:
         response = requests.get(
             f"{GAMMA_API}/markets",
@@ -283,17 +398,11 @@ def discover_active_markets() -> list[dict]:
         all_markets = response.json()
 
         for raw in all_markets:
-            cid = raw.get("conditionId") or raw.get("condition_id") or ""
-            if cid in seen_conditions:
-                continue
-            # Quick pre-check on question text before full parse
             question = (raw.get("question") or "").lower()
-            if "up or down" not in question:
+            slug = (raw.get("slug") or "").lower()
+            if "up or down" not in question and "updown" not in slug:
                 continue
-            m = _parse_market(raw)
-            if m:
-                markets.append(m)
-                seen_conditions.add(cid)
+            _add_market(raw)
 
     except Exception as e:
         print(f"[MOMENTUM] Broad search error: {e}", flush=True)
