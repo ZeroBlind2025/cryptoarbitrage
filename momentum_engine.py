@@ -97,8 +97,82 @@ MAX_ENTRIES_PER_MARKET = int(os.getenv("MOMENTUM_MAX_ENTRIES", "2"))
 # MARKET DISCOVERY
 # =============================================================================
 
+CRYPTO_COINS = ["btc", "eth", "sol", "xrp"]
+INTERVALS = ["5m", "15m", "30m", "60m"]
+
+
+def _parse_market(raw: dict) -> Optional[dict]:
+    """Parse a single Gamma API market into our internal format.
+
+    Returns None if the market doesn't match crypto updown criteria.
+    """
+    slug = (raw.get("slug") or "").lower()
+
+    # Parse token IDs
+    clob_ids_raw = raw.get("clobTokenIds", "[]")
+    if isinstance(clob_ids_raw, str):
+        try:
+            clob_ids = json.loads(clob_ids_raw)
+        except (json.JSONDecodeError, ValueError):
+            return None
+    else:
+        clob_ids = clob_ids_raw or []
+
+    # Parse prices
+    prices_raw = raw.get("outcomePrices", "[]")
+    if isinstance(prices_raw, str):
+        try:
+            prices = [float(p) for p in json.loads(prices_raw)]
+        except (json.JSONDecodeError, ValueError):
+            return None
+    else:
+        try:
+            prices = [float(p) for p in (prices_raw or [])]
+        except (ValueError, TypeError):
+            return None
+
+    # Parse outcomes
+    outcomes = raw.get("outcomes", [])
+    if isinstance(outcomes, str):
+        try:
+            outcomes = json.loads(outcomes)
+        except (json.JSONDecodeError, ValueError):
+            outcomes = ["Up", "Down"]
+
+    if len(clob_ids) != 2 or len(prices) != 2 or len(outcomes) != 2:
+        return None
+
+    condition_id = raw.get("conditionId") or raw.get("condition_id") or ""
+    coin = detect_coin(slug, raw.get("question", ""))
+
+    # Detect interval from slug — MUST match a known interval
+    interval = ""
+    for tag in INTERVALS:
+        if f"-{tag}-" in slug or slug.endswith(f"-{tag}"):
+            interval = tag
+            break
+
+    if not coin or not interval:
+        return None
+
+    return {
+        "slug": raw.get("slug", ""),
+        "question": raw.get("question", ""),
+        "condition_id": condition_id,
+        "outcomes": outcomes,
+        "token_ids": [str(clob_ids[0]), str(clob_ids[1])],
+        "prices": prices,
+        "coin": coin,
+        "interval": interval,
+    }
+
+
 def discover_active_markets() -> list[dict]:
     """Find all active crypto updown markets across all intervals.
+
+    Uses targeted slug searches (e.g. btc-updown-15m-{timestamp}) to find
+    the exact crypto price-prediction interval markets, instead of relying
+    on a broad search that can match non-price markets.
 
     Returns a list of market dicts with:
       - slug, question, condition_id
@@ -106,8 +180,59 @@ def discover_active_markets() -> list[dict]:
       - token_ids: [up_token_id, down_token_id]
       - prices: [up_price, down_price]
       - coin: "btc", "eth", "sol", "xrp"
-      - interval: "5m", "15m", "30m", "60m" (detected from slug)
+      - interval: "5m", "15m", "30m", "60m"
     """
+    from datetime import datetime as dt
+
+    now_ts = int(time.time())
+    markets = []
+    seen_slugs = set()
+
+    # --- Strategy 1: Targeted slug search ---
+    # Polymarket crypto updown slugs follow: {coin}-updown-{interval}-{timestamp}
+    # Search for each coin + interval + nearby timestamp windows
+    interval_seconds = {"5m": 300, "15m": 900, "30m": 1800, "60m": 3600}
+
+    for coin in CRYPTO_COINS:
+        for interval, secs in interval_seconds.items():
+            base_ts = (now_ts // secs) * secs  # Round to current window
+            timestamps = [
+                base_ts,           # Current window
+                base_ts + secs,    # Next window
+                base_ts + secs * 2,  # +2 windows ahead
+                base_ts - secs,    # Previous (might still be active)
+            ]
+
+            for ts in timestamps:
+                slug_pattern = f"{coin}-updown-{interval}-{ts}"
+                try:
+                    resp = requests.get(
+                        f"{GAMMA_API}/markets",
+                        params={
+                            "slug": slug_pattern,
+                            "active": "true",
+                            "closed": "false",
+                        },
+                        timeout=10,
+                    )
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        if isinstance(data, list):
+                            for raw in data:
+                                s = (raw.get("slug") or "").lower()
+                                if s in seen_slugs:
+                                    continue
+                                m = _parse_market(raw)
+                                if m:
+                                    markets.append(m)
+                                    seen_slugs.add(s)
+                except Exception:
+                    pass
+
+                time.sleep(0.03)  # Small delay to avoid rate limiting
+
+    # --- Strategy 2: Broad fallback ---
+    # Also do a general search to catch any markets the targeted search missed
     try:
         response = requests.get(
             f"{GAMMA_API}/markets",
@@ -116,77 +241,30 @@ def discover_active_markets() -> list[dict]:
         )
         response.raise_for_status()
         all_markets = response.json()
+
+        for raw in all_markets:
+            slug = (raw.get("slug") or "").lower()
+            if slug in seen_slugs:
+                continue
+            # Quick check: must have "updown" in slug to be an interval market
+            if "updown" not in slug:
+                continue
+            m = _parse_market(raw)
+            if m:
+                markets.append(m)
+                seen_slugs.add(slug)
+
     except Exception as e:
-        print(f"[MOMENTUM] Error fetching markets: {e}", flush=True)
-        return []
+        print(f"[MOMENTUM] Broad search error: {e}", flush=True)
 
-    markets = []
-    for raw in all_markets:
-        slug = (raw.get("slug") or "").lower()
-        question = (raw.get("question") or "").lower()
-
-        # Only crypto updown markets
-        if not any(p in slug or p in question for p in CRYPTO_SLUGS):
-            continue
-
-        # Parse token IDs
-        clob_ids_raw = raw.get("clobTokenIds", "[]")
-        if isinstance(clob_ids_raw, str):
-            try:
-                clob_ids = json.loads(clob_ids_raw)
-            except (json.JSONDecodeError, ValueError):
-                continue
-        else:
-            clob_ids = clob_ids_raw or []
-
-        # Parse prices
-        prices_raw = raw.get("outcomePrices", "[]")
-        if isinstance(prices_raw, str):
-            try:
-                prices = [float(p) for p in json.loads(prices_raw)]
-            except (json.JSONDecodeError, ValueError):
-                continue
-        else:
-            try:
-                prices = [float(p) for p in (prices_raw or [])]
-            except (ValueError, TypeError):
-                continue
-
-        # Parse outcomes
-        outcomes = raw.get("outcomes", [])
-        if isinstance(outcomes, str):
-            try:
-                outcomes = json.loads(outcomes)
-            except (json.JSONDecodeError, ValueError):
-                outcomes = ["Up", "Down"]
-
-        if len(clob_ids) != 2 or len(prices) != 2 or len(outcomes) != 2:
-            continue
-
-        condition_id = raw.get("conditionId") or raw.get("condition_id") or ""
-        coin = detect_coin(slug, raw.get("question", ""))
-
-        # Detect interval from slug — MUST match a known interval
-        # to avoid non-price markets like "Will MegaETH airdrop?"
-        interval = ""
-        for tag in ["5m", "15m", "30m", "60m", "1h"]:
-            if f"-{tag}-" in slug or slug.endswith(f"-{tag}"):
-                interval = tag
-                break
-
-        if not coin or not interval:
-            continue
-
-        markets.append({
-            "slug": raw.get("slug", ""),
-            "question": raw.get("question", ""),
-            "condition_id": condition_id,
-            "outcomes": outcomes,
-            "token_ids": [str(clob_ids[0]), str(clob_ids[1])],
-            "prices": prices,
-            "coin": coin,
-            "interval": interval,
-        })
+    if markets:
+        coins_found = set(m["coin"] for m in markets)
+        intervals_found = set(m["interval"] for m in markets)
+        print(f"[MOMENTUM] Discovered {len(markets)} markets: "
+              f"coins={sorted(coins_found)}, intervals={sorted(intervals_found)}",
+              flush=True)
+    else:
+        print("[MOMENTUM] No active updown markets found", flush=True)
 
     return markets
 
