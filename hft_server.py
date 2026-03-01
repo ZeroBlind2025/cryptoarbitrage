@@ -1504,7 +1504,7 @@ def api_copy_trader_resume_coin():
 
 @app.route('/api/copy-trader/dynamic-lots', methods=['POST'])
 def api_copy_trader_dynamic_lots():
-    """Enable/disable dynamic lot sizing based on per-coin ROI"""
+    """Enable/disable dynamic lot sizing based on per-coin win rate"""
     if not copy_trader:
         return jsonify({"error": "Poly Algo not running"}), 400
 
@@ -1518,8 +1518,8 @@ def api_copy_trader_dynamic_lots():
     # Optionally update tiers
     if 'tiers' in data:
         tiers = data['tiers']
-        if isinstance(tiers, list) and all(isinstance(t, dict) and 'roi' in t and 'lot' in t for t in tiers):
-            copy_trader.dynamic_lot_tiers = [(float(t['roi']), float(t['lot'])) for t in tiers]
+        if isinstance(tiers, list) and all(isinstance(t, dict) and 'win_rate' in t and 'lot' in t for t in tiers):
+            copy_trader.dynamic_lot_tiers = [(float(t['win_rate']), float(t['lot'])) for t in tiers]
 
     # If just enabled, apply immediately so lot sizes update right away
     if copy_trader.dynamic_lot_sizing_enabled:
@@ -1533,7 +1533,7 @@ def api_copy_trader_dynamic_lots():
         "message": f"Dynamic lot sizing {status}.",
         "dynamic_lot_sizing_enabled": copy_trader.dynamic_lot_sizing_enabled,
         "coin_bet_amounts": copy_trader.coin_bet_amounts,
-        "tiers": [{"roi": t, "lot": l} for t, l in copy_trader.dynamic_lot_tiers],
+        "tiers": [{"win_rate": t, "lot": l} for t, l in copy_trader.dynamic_lot_tiers],
     })
 
 
@@ -1558,7 +1558,7 @@ def api_copy_trader_settings_get():
         "is_running": copy_trader_thread is not None and copy_trader_thread.is_alive(),
         "paused_coins": sorted(copy_trader.paused_coins) if copy_trader else [],
         "dynamic_lot_sizing_enabled": copy_trader.dynamic_lot_sizing_enabled if copy_trader else False,
-        "dynamic_lot_tiers": [{"roi": t, "lot": l} for t, l in copy_trader.dynamic_lot_tiers] if copy_trader else [],
+        "dynamic_lot_tiers": [{"win_rate": t, "lot": l} for t, l in copy_trader.dynamic_lot_tiers] if copy_trader else [],
     })
 
 
