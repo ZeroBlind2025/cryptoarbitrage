@@ -117,6 +117,7 @@ class MarketDiscovery:
         print("\n[DISCOVERY] Starting multi-strategy market discovery...\n")
 
         strategies = [
+            ("Event slug lookup (computed timestamps)", self._try_event_slugs),
             ("CLOB REST /markets (paginated)", self._try_clob_rest),
             ("Gamma /events", self._try_gamma_events),
             ("Gamma slug search", self._try_gamma_slugs),
@@ -144,6 +145,87 @@ class MarketDiscovery:
         print(f"\n[DISCOVERY] Complete: {len(result)} markets, "
               f"{len(self.all_token_ids)} token IDs")
         return result
+
+    # ------------------------------------------------------------------
+    # Strategy 0: Event slug lookup with computed timestamps
+    # Polymarket URLs follow: /event/{coin}-updown-{interval}-{unix_ts}
+    # The timestamp is floor-aligned to the interval boundary.
+    # e.g. btc-updown-5m-1772397000, eth-updown-15m-1772396400
+    # We generate current + nearby windows and query Gamma /events.
+    # ------------------------------------------------------------------
+    def _try_event_slugs(self):
+        now_ts = int(time.time())
+
+        # Interval configs: (slug_tag, seconds_per_window)
+        interval_configs = [
+            ("5m", 300),
+            ("15m", 900),
+            ("30m", 1800),
+            ("1h", 3600),
+        ]
+
+        # Coin abbreviations as used in URL slugs
+        coin_slugs = ["btc", "eth", "sol", "xrp"]
+
+        slugs_to_try = []
+        for coin in coin_slugs:
+            for tag, window_secs in interval_configs:
+                # Only the CURRENT window — the one we're inside right now
+                base_ts = (now_ts // window_secs) * window_secs
+                slugs_to_try.append(f"{coin}-updown-{tag}-{base_ts}")
+
+        print(f"    Generated {len(slugs_to_try)} event slugs to check")
+
+        found = 0
+        checked = 0
+        for slug in slugs_to_try:
+            # Try Gamma /events?slug= (event-level lookup)
+            try:
+                resp = self.session.get(
+                    f"{GAMMA_API}/events",
+                    params={"slug": slug},
+                    timeout=10,
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    events = data if isinstance(data, list) else [data] if isinstance(data, dict) else []
+                    for event in events:
+                        if not isinstance(event, dict):
+                            continue
+                        # Events contain nested markets
+                        for mkt in event.get("markets", []):
+                            if self._try_add_gamma_market(mkt, source="event_slug"):
+                                found += 1
+                        # Sometimes the event itself has market fields
+                        if "conditionId" in event:
+                            if self._try_add_gamma_market(event, source="event_slug"):
+                                found += 1
+                checked += 1
+            except requests.RequestException:
+                pass
+
+            # Also try Gamma /markets?slug= (market-level lookup)
+            try:
+                resp = self.session.get(
+                    f"{GAMMA_API}/markets",
+                    params={"slug": slug},
+                    timeout=10,
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if isinstance(data, list):
+                        for raw in data:
+                            if self._try_add_gamma_market(raw, source="event_slug"):
+                                found += 1
+                    elif isinstance(data, dict) and "conditionId" in data:
+                        if self._try_add_gamma_market(data, source="event_slug"):
+                            found += 1
+            except requests.RequestException:
+                pass
+
+            time.sleep(0.02)
+
+        print(f"    Checked {checked} event slugs, found {found} markets")
 
     # ------------------------------------------------------------------
     # Strategy 1: CLOB REST API with cursor pagination
@@ -383,11 +465,11 @@ class MarketDiscovery:
             except requests.RequestException:
                 break
 
-    def _try_add_gamma_market(self, raw: dict, source: str):
-        """Parse a Gamma API market and add if crypto updown."""
+    def _try_add_gamma_market(self, raw: dict, source: str) -> bool:
+        """Parse a Gamma API market and add if crypto updown. Returns True if added."""
         condition_id = raw.get("conditionId", "")
         if not condition_id or condition_id in self.markets:
-            return
+            return False
 
         question = raw.get("question", "")
         slug = raw.get("slug", "")
@@ -396,7 +478,7 @@ class MarketDiscovery:
         is_crypto = any(kw in combined for kw in CRYPTO_KEYWORDS)
         is_updown = any(kw in combined for kw in UPDOWN_KEYWORDS)
         if not (is_crypto and is_updown):
-            return
+            return False
 
         # Parse token IDs
         clob_ids_raw = raw.get("clobTokenIds", [])
@@ -434,7 +516,7 @@ class MarketDiscovery:
             outcomes = outcomes_raw if isinstance(outcomes_raw, list) else []
 
         if not clob_ids:
-            return
+            return False
 
         coin = self._detect_coin(combined)
         interval = self._detect_interval(slug, question)
@@ -463,6 +545,7 @@ class MarketDiscovery:
             end_date=raw.get("endDate", ""),
             volume=volume,
         )
+        return True
 
     # ------------------------------------------------------------------
     # Strategy 5: CSV bootstrap

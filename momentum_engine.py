@@ -282,9 +282,53 @@ def discover_active_markets() -> list[dict]:
         return False
 
     # ================================================================
-    # Strategy 1: /events endpoint (primary)
-    # Events contain nested markets — this is the most reliable way
-    # to find crypto updown markets on Polymarket.
+    # Strategy 0: Event slug lookup with computed timestamps
+    # Polymarket URLs: /event/{coin}-updown-{interval}-{unix_ts}
+    # Timestamps are floor-aligned to interval boundaries.
+    # e.g. btc-updown-5m-1772397000 (every 300s)
+    # ================================================================
+    event_slug_configs = [
+        ("5m", 300), ("15m", 900), ("30m", 1800), ("1h", 3600),
+    ]
+    event_slug_coins = ["btc", "eth", "sol", "xrp"]
+    event_slug_found = 0
+
+    for coin_abbr in event_slug_coins:
+        for tag, window_secs in event_slug_configs:
+            # Only the CURRENT window — the one matching the real-time clock
+            base_ts = (now_ts // window_secs) * window_secs
+            for ts in [base_ts]:
+                event_slug = f"{coin_abbr}-updown-{tag}-{ts}"
+                try:
+                    resp = requests.get(
+                        f"{GAMMA_API}/events",
+                        params={"slug": event_slug},
+                        timeout=10,
+                    )
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        events_list = data if isinstance(data, list) else [data] if isinstance(data, dict) else []
+                        for event in events_list:
+                            if not isinstance(event, dict):
+                                continue
+                            for mkt in event.get("markets", []):
+                                if _add_market(mkt):
+                                    event_slug_found += 1
+                            # Event itself might have market fields
+                            if "conditionId" in event:
+                                if _add_market(event):
+                                    event_slug_found += 1
+                except Exception:
+                    pass
+                time.sleep(0.02)
+
+    if event_slug_found > 0:
+        print(f"[MOMENTUM] Event slugs: found {event_slug_found} markets "
+              f"via computed timestamps", flush=True)
+
+    # ================================================================
+    # Strategy 1: /events endpoint (broad listing)
+    # Events contain nested markets — catches any we missed above.
     # ================================================================
     try:
         resp = requests.get(
@@ -340,12 +384,9 @@ def discover_active_markets() -> list[dict]:
     for coin_abbr in CRYPTO_COINS:
         coin_name = COIN_SLUG_NAMES.get(coin_abbr, coin_abbr)
         for tag, window_secs in interval_configs:
+            # Only the CURRENT window — matches real-time clock
             base_ts = (now_ts // window_secs) * window_secs
-            timestamps = [
-                base_ts - window_secs,  # Previous window (might still be active)
-                base_ts,                # Current window
-                base_ts + window_secs,  # Next window
-            ]
+            timestamps = [base_ts]
 
             for ts in timestamps:
                 slug_pattern = f"{coin_name}-updown-{tag}-{ts}"
