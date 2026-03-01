@@ -1489,11 +1489,13 @@ class CopyTrader:
             self._bh_cache = (raw_len, balance_history)
 
         # Snapshot lists to avoid RuntimeError from concurrent mutation
-        # Filter to only copy_trader positions (exclude momentum-sourced)
-        open_positions = [p for p in self.positions.get("open", []) if p.get("source") != "momentum"]
+        all_open = list(self.positions.get("open", []))
+        # Per-engine counts (copy-only for the detailed section)
+        open_positions = [p for p in all_open if p.get("source") != "momentum"]
         resolved_positions = [p for p in self.positions.get("resolved", []) if p.get("source") != "momentum"]
-        open_staked = sum(p.get("amount", 0) for p in open_positions)
-        equity = self._safe_float(balance + open_staked)
+        # Equity uses ALL open positions (copy + momentum) so the hero reflects total exposure
+        all_open_staked = sum(p.get("amount", 0) for p in all_open)
+        equity = self._safe_float(balance + all_open_staked)
 
         # Per-coin ROI stats from resolved + open positions
         coin_roi = self._compute_coin_roi(open_positions, resolved_positions)

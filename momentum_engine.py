@@ -491,6 +491,7 @@ class MomentumEngine:
         on_resolution: Optional[callable] = None,
         bet_amount: Optional[float] = None,
         coin_bet_amounts: Optional[dict] = None,
+        shared_positions: Optional[dict] = None,
     ):
         self.dry_run = dry_run
         self.on_trade = on_trade
@@ -514,8 +515,9 @@ class MomentumEngine:
         self.entered_markets: dict = {}
         self.market_entry_count: dict = {}
 
-        # Position tracking (shares file with copy trader)
-        self.positions = load_positions()
+        # Position tracking — share the same dict as copy trader when available
+        # so both engines' trades appear in the combined P&L / balance chart
+        self.positions = shared_positions if shared_positions is not None else load_positions()
 
         # Stats
         self.trades_entered = 0

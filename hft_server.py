@@ -1991,11 +1991,15 @@ def api_momentum_start():
         bet_amount = copy_trader.bet_amount
 
     try:
+        # Share positions dict with copy trader so both engines' trades
+        # appear in the combined P&L, balance chart, and equity display
+        shared_pos = copy_trader.positions if copy_trader else None
         momentum_engine = MomentumEngine(
             dry_run=not live_mode,
             on_trade=on_momentum_trade,
             bet_amount=bet_amount,
             coin_bet_amounts=coin_bet_amounts,
+            shared_positions=shared_pos,
         )
         if min_entry is not None:
             momentum_engine.min_entry_price = float(min_entry)
