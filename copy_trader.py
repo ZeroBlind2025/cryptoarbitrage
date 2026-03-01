@@ -607,18 +607,16 @@ class CopyTrader:
         # Per-coin pause: set of coin symbols currently paused (e.g. {"sol", "xrp"})
         self.paused_coins: set = set()
 
-        # Dynamic lot sizing: auto-adjust lot sizes based on per-coin ROI
+        # Dynamic lot sizing: auto-adjust lot sizes based on per-coin win rate
         # When enabled, lot sizes are recalculated every resolution cycle
         self.dynamic_lot_sizing_enabled = False
         self.dynamic_lot_tiers = [
-            # (roi_threshold, lot_size) — evaluated top-down, first match wins
-            (15.0, 10.0),
-            (10.0, 7.0),
-            (5.0, 5.0),
-            (0.0, 2.0),    # base: 0% to 5%
-            (-5.0, 2.0),   # slightly negative: keep base
-            (-10.0, 1.0),  # losing: reduce exposure
-            (-15.0, 0.5),  # tanking: minimal exposure
+            # (win_rate_threshold, lot_size) — evaluated bottom-up, first match wins
+            (60.0, 1.0),   # ≤ 60% win rate → $1
+            (70.0, 2.0),   # ≤ 70% win rate → $2
+            (75.0, 5.0),   # ≤ 75% win rate → $5
+            (80.0, 10.0),  # ≤ 80% win rate → $10
+            (90.0, 20.0),  # ≥ 90% win rate → $20
         ]
         self.dynamic_lot_base = 2.0  # Default lot size for coins with no data
 
@@ -649,30 +647,27 @@ class CopyTrader:
             return self.coin_bet_amounts[coin]
         return self.bet_amount
 
-    def compute_dynamic_lot(self, coin: str, roi: float) -> float:
-        """Compute lot size for a coin based on its ROI using tiered thresholds.
+    def compute_dynamic_lot(self, coin: str, win_rate: float) -> float:
+        """Compute lot size for a coin based on its win rate using tiered thresholds.
 
-        Tiers (evaluated top-down for positive ROI, bottom-up for negative):
-          ROI >= 15% → $10    |   ROI <= -15% → $0.50
-          ROI >= 10% → $7     |   ROI <= -10% → $1.00
-          ROI >= 5%  → $5     |   ROI <= -5%  → $2.00
-          ROI 0-5%   → $2     |   ROI 0 to -5% → $2.00
+        Tiers (evaluated bottom-up):
+          ≤ 60% → $1   |   ≤ 70% → $2   |   ≤ 75% → $5
+          ≤ 80% → $10  |   ≥ 90% → $20
+          80-90% → $10 (default)
         """
-        if roi >= 0:
-            # Positive ROI: check thresholds top-down (highest first)
-            for threshold, lot in self.dynamic_lot_tiers:
-                if threshold >= 0 and roi >= threshold:
+        # Check from lowest tier up
+        for threshold, lot in self.dynamic_lot_tiers:
+            if threshold == self.dynamic_lot_tiers[-1][0]:
+                # Last tier is the "≥ 90%" tier
+                if win_rate >= threshold:
                     return lot
-            return self.dynamic_lot_base
-        else:
-            # Negative ROI: check thresholds bottom-up (most negative first)
-            for threshold, lot in reversed(self.dynamic_lot_tiers):
-                if threshold < 0 and roi <= threshold:
-                    return lot
-            return self.dynamic_lot_base
+            elif win_rate <= threshold:
+                return lot
+        # 80-90% range: use $10
+        return 10.0
 
     def apply_dynamic_lot_sizing(self):
-        """Recalculate per-coin lot sizes based on current ROI.
+        """Recalculate per-coin lot sizes based on current win rate.
 
         Called periodically (after resolutions) when dynamic_lot_sizing_enabled is True.
         Updates self.coin_bet_amounts in-place so the next trade uses the new sizes.
@@ -691,13 +686,19 @@ class CopyTrader:
                 # No resolved trades yet — use base lot
                 new_lot = self.dynamic_lot_base
             else:
-                roi = stats.get("roi", 0)
-                new_lot = self.compute_dynamic_lot(coin, roi)
+                total = stats["wins"] + stats["losses"]
+                win_rate = (stats["wins"] / total) * 100.0 if total > 0 else 0
+                new_lot = self.compute_dynamic_lot(coin, win_rate)
 
             old_lot = self.coin_bet_amounts.get(coin, self.dynamic_lot_base)
             if abs(new_lot - old_lot) >= 0.01:
                 self.coin_bet_amounts[coin] = new_lot
-                changes.append(f"{coin.upper()}: ${old_lot:.2f}→${new_lot:.2f} (ROI {stats.get('roi', 0):.1f}%)" if stats else f"{coin.upper()}: ${old_lot:.2f}→${new_lot:.2f}")
+                if stats:
+                    total = stats["wins"] + stats["losses"]
+                    wr = (stats["wins"] / total) * 100.0 if total > 0 else 0
+                    changes.append(f"{coin.upper()}: ${old_lot:.2f}→${new_lot:.2f} (WR {wr:.0f}%)")
+                else:
+                    changes.append(f"{coin.upper()}: ${old_lot:.2f}→${new_lot:.2f}")
 
         if changes:
             print(f"[ALGO] Dynamic lot resize: {', '.join(changes)}", flush=True)
@@ -1515,7 +1516,7 @@ class CopyTrader:
             "coin_roi": coin_roi,
             "paused_coins": list(self.paused_coins),
             "dynamic_lot_sizing_enabled": self.dynamic_lot_sizing_enabled,
-            "dynamic_lot_tiers": [{"roi": t, "lot": l} for t, l in self.dynamic_lot_tiers],
+            "dynamic_lot_tiers": [{"win_rate": t, "lot": l} for t, l in self.dynamic_lot_tiers],
         }
 
     def print_stats(self):
