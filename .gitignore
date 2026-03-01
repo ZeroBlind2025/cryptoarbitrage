@@ -19,6 +19,10 @@ logs/
 *.log
 *.jsonl
 
+# Discovery temp output
+ws_discovery_dump.json
+ws_discovery_results.json
+
 # IDE
 .vscode/
 .idea/
