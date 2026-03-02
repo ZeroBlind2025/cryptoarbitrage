@@ -1251,7 +1251,7 @@
                                 </div>
 
                                 <p className="text-xs text-slate-500 mb-3">
-                                    Independent price-momentum trader. Enters when price ≥ {((momentum.min_entry_price || 0.65) * 100).toFixed(0)}¢, re-enters only on upward movement. {momentum.running && copyTrader.paused ? '(Copy trader auto-paused)' : ''}
+                                    Independent price-momentum trader. Enters between {((momentum.min_entry_price || 0.65) * 100).toFixed(0)}¢ – {((momentum.max_entry_price || 0.989) * 100).toFixed(1)}¢, re-enters only on upward movement. {momentum.running && copyTrader.paused ? '(Copy trader auto-paused)' : ''}
                                 </p>
 
                                 {momentum.running && (
