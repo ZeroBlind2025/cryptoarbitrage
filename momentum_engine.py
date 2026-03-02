@@ -909,6 +909,69 @@ class MomentumEngine:
                   f"Record: {stats['wins']}W/{stats['losses']}L, "
                   f"PnL: ${stats['total_pnl']:+.2f}", flush=True)
 
+    def _compute_coin_roi(self, open_positions: list, resolved_positions: list) -> dict:
+        """Compute per-coin W/L/PnL/ROI from momentum position data."""
+        coin_data: dict = {}
+        all_coins = set(self.coin_bet_amounts.keys())
+
+        for pos in resolved_positions:
+            slug = pos.get("slug", "")
+            market = pos.get("market", "")
+            coin = detect_coin(slug, market) or "other"
+            all_coins.add(coin)
+            if coin not in coin_data:
+                coin_data[coin] = {"wins": 0, "losses": 0, "pnl": 0.0, "deployed": 0.0, "open": 0, "results": []}
+            amount = pos.get("amount", 0)
+            pnl = pos.get("pnl", 0) or 0
+            result = pos.get("result", "")
+            coin_data[coin]["deployed"] += amount
+            coin_data[coin]["pnl"] += pnl
+            if result == "WIN":
+                coin_data[coin]["wins"] += 1
+                coin_data[coin]["results"].append("W")
+            elif result == "LOSS":
+                coin_data[coin]["losses"] += 1
+                coin_data[coin]["results"].append("L")
+
+        for pos in open_positions:
+            slug = pos.get("slug", "")
+            market = pos.get("market", "")
+            coin = detect_coin(slug, market) or "other"
+            all_coins.add(coin)
+            if coin not in coin_data:
+                coin_data[coin] = {"wins": 0, "losses": 0, "pnl": 0.0, "deployed": 0.0, "open": 0, "results": []}
+            coin_data[coin]["open"] += 1
+            coin_data[coin]["deployed"] += pos.get("amount", 0)
+
+        result = {}
+        for coin in all_coins:
+            d = coin_data.get(coin, {"wins": 0, "losses": 0, "pnl": 0.0, "deployed": 0.0, "open": 0, "results": []})
+            total = d["wins"] + d["losses"]
+            win_rate = (d["wins"] / total * 100) if total > 0 else 0
+            roi = (d["pnl"] / d["deployed"] * 100) if d["deployed"] > 0 else 0
+
+            streak = 0
+            streak_type = ""
+            for r in reversed(d["results"]):
+                if not streak_type:
+                    streak_type = r
+                    streak = 1
+                elif r == streak_type:
+                    streak += 1
+                else:
+                    break
+
+            result[coin] = {
+                "wins": d["wins"], "losses": d["losses"],
+                "win_rate": round(win_rate, 1),
+                "pnl": round(d["pnl"], 2),
+                "deployed": round(d["deployed"], 2),
+                "roi": round(roi, 1),
+                "open": d["open"],
+                "streak": streak, "streak_type": streak_type,
+            }
+        return result
+
     def get_stats(self) -> dict:
         """Get current stats for dashboard."""
         stats = self.positions.get("stats", {})
@@ -936,6 +999,9 @@ class MomentumEngine:
         # Momentum-only staked amount
         m_open_staked = sum(float(p.get("amount", 0)) for p in momentum_open)
 
+        # Per-coin performance breakdown
+        coin_roi = self._compute_coin_roi(momentum_open, momentum_resolved)
+
         return {
             "trades_entered": self.trades_entered,
             "trades_skipped": self.trades_skipped,
@@ -948,6 +1014,7 @@ class MomentumEngine:
             "total_pnl": m_total_pnl,
             "win_rate": m_win_rate,
             "open_staked": m_open_staked,
+            "coin_roi": coin_roi,
             "min_entry_price": self.min_entry_price,
             "max_entry_price": self.max_entry_price,
             "max_entries_per_market": self.max_entries_per_market,
