@@ -71,7 +71,6 @@ from copy_trader import (
     place_bet,
     load_positions,
     save_positions,
-    has_opposite_position,
     get_active_crypto_tokens,
 )
 
@@ -510,8 +509,9 @@ class MomentumEngine:
         self.max_entry_price = MAX_ENTRY_PRICE
         self.max_entries_per_market = MAX_ENTRIES_PER_MARKET
 
-        # Track entered markets: (condition_id, outcome_index) → last_buy_price
-        # KEY DIFFERENCE from copy trader: this stores LAST buy price, not first
+        # Track entered markets: (condition_id, token_id) → last_buy_price
+        # KEY: uses token_id (stable identifier) not outcome_index (array position
+        # that can flip between API calls).
         self.entered_markets: dict = {}
         self.market_entry_count: dict = {}
 
@@ -562,10 +562,10 @@ class MomentumEngine:
             if pos.get("source") != "momentum":
                 continue
             cid = pos.get("condition_id", "")
-            oi = pos.get("outcome_index", 0)
+            tid = pos.get("token_id", "")
             ep = pos.get("entry_price", 0)
-            if cid:
-                mk = (cid, oi)
+            if cid and tid:
+                mk = (cid, tid)
                 # Use entry_price as last_buy — on restart we lose the chain,
                 # so this is the safest conservative default
                 self.entered_markets[mk] = ep
@@ -646,6 +646,7 @@ class MomentumEngine:
             for oi in range(2):
                 outcome = market["outcomes"][oi]
                 token_id = market["token_ids"][oi]
+                other_token_id = market["token_ids"][1 - oi]
                 gamma_price = market["prices"][oi]
 
                 # Get best available price
@@ -656,10 +657,13 @@ class MomentumEngine:
                 if price < self.min_entry_price or price > self.max_entry_price:
                     continue
 
-                market_key = (condition_id, oi)
+                # Key by (condition_id, token_id) — stable across API ordering changes
+                market_key = (condition_id, token_id)
 
                 # --- GUARD: No opposite side ---
-                if has_opposite_position(self.entered_markets, condition_id, oi):
+                # Check if we already hold the OTHER token on this condition_id
+                opposite_key = (condition_id, other_token_id)
+                if opposite_key in self.entered_markets:
                     self.trades_skipped += 1
                     continue
 
@@ -826,18 +830,34 @@ class MomentumEngine:
             winning_outcome = result.get("winning_outcome")
             winning_index = result.get("winning_index")
 
-            if "our_token_won" in result:
-                won = result.get("our_token_won")
-            else:
-                if winning_outcome and our_outcome:
-                    our_norm = our_outcome.lower().strip()
-                    win_norm = winning_outcome.lower().strip()
-                    if our_norm == win_norm or our_norm.startswith(win_norm) or win_norm.startswith(our_norm):
-                        won = True
-                    else:
-                        won = False
-                elif winning_index is not None and our_index is not None:
-                    won = (winning_index == our_index)
+            # --- Determine win/loss using multiple signals ---
+            # Priority 1: Direct token_id comparison from CLOB API
+            if "our_token_won" in result and result["our_token_won"] is not None:
+                won = result["our_token_won"]
+
+            # Priority 2: Outcome name comparison
+            if won is None and winning_outcome and our_outcome:
+                our_norm = our_outcome.lower().strip()
+                win_norm = winning_outcome.lower().strip()
+                if our_norm == win_norm or our_norm.startswith(win_norm) or win_norm.startswith(our_norm):
+                    won = True
+                else:
+                    won = False
+
+            # Priority 3: Outcome index comparison
+            if won is None and winning_index is not None and our_index is not None:
+                won = (winning_index == our_index)
+
+            # Safety net: if CLOB token comparison said LOSS but outcome name
+            # says WIN (e.g. token_id formatting mismatch), trust the name match.
+            # A genuine loss can't have matching outcome names.
+            if won is False and winning_outcome and our_outcome:
+                our_norm = our_outcome.lower().strip()
+                win_norm = winning_outcome.lower().strip()
+                if our_norm == win_norm or our_norm.startswith(win_norm) or win_norm.startswith(our_norm):
+                    print(f"[MOMENTUM] OVERRIDE: token_id said LOSS but outcome name matches "
+                          f"(ours={our_outcome}, winner={winning_outcome}). Correcting to WIN.", flush=True)
+                    won = True
 
             if won is True:
                 if entry_price > 0:
@@ -1023,7 +1043,7 @@ class MomentumEngine:
             "paused_coins": list(self.paused_coins),
             "dry_run": self.dry_run,
             "active_entries": {
-                f"{cid[:12]}..._oi{oi}": f"{price*100:.1f}¢"
-                for (cid, oi), price in self.entered_markets.items()
+                f"{cid[:12]}..._t{tid[-8:]}": f"{price*100:.1f}¢"
+                for (cid, tid), price in self.entered_markets.items()
             },
         }
