@@ -575,7 +575,8 @@
         };
 
         // Per-Coin ROI Component - Real-time coin performance tracker with pause buttons
-        const CoinROI = ({ coinRoi, copyTrader, fetchData }) => {
+        // apiPrefix: '/api/copy-trader' (default) or '/api/momentum'
+        const CoinROI = ({ coinRoi, copyTrader, fetchData, apiPrefix = '/api/copy-trader' }) => {
             if (!coinRoi || Object.keys(coinRoi).length === 0) return null;
 
             const pausedCoins = new Set(copyTrader.paused_coins || []);
@@ -592,8 +593,8 @@
             const toggleCoinPause = async (coin) => {
                 const isPaused = pausedCoins.has(coin);
                 const endpoint = isPaused
-                    ? '/api/copy-trader/resume-coin'
-                    : '/api/copy-trader/pause-coin';
+                    ? `${apiPrefix}/resume-coin`
+                    : `${apiPrefix}/pause-coin`;
                 try {
                     await fetch(endpoint, {
                         method: 'POST',
@@ -1319,6 +1320,9 @@
                                                 ))}
                                             </div>
                                         )}
+
+                                        {/* Per-Coin Performance for Momentum */}
+                                        <CoinROI coinRoi={momentum.coin_roi} copyTrader={momentum} fetchData={fetchData} apiPrefix="/api/momentum" />
                                     </div>
                                 )}
 
