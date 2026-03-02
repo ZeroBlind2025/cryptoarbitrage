@@ -1714,10 +1714,12 @@ def api_copy_trades():
 @app.route('/api/copy-trader/positions')
 def api_copy_positions():
     """Get raw position data for debugging"""
-    if not copy_trader:
-        return jsonify({"error": "Copy trader not running"})
-
-    positions = copy_trader.positions
+    if copy_trader:
+        positions = copy_trader.positions
+    elif momentum_engine:
+        positions = momentum_engine.positions
+    else:
+        return jsonify({"error": "No engine running"})
     return jsonify({
         "open_count": len(positions.get("open", [])),
         "resolved_count": len(positions.get("resolved", [])),
@@ -1776,12 +1778,15 @@ def api_copy_download():
     import csv
     from io import StringIO
 
-    # Load positions from file if copy_trader not running
+    # Load positions from whichever engine is alive (they share the dict),
+    # or fall back to the file on disk
     positions_data = None
     if copy_trader:
         positions_data = copy_trader.positions
+    elif momentum_engine:
+        positions_data = momentum_engine.positions
     else:
-        # Try to load from file directly
+        # Both stopped — try to load from file directly
         try:
             positions_file = Path("copy_positions.json")
             if positions_file.exists():
@@ -1800,7 +1805,7 @@ def api_copy_download():
     # Create CSV
     output = StringIO()
     fieldnames = [
-        "timestamp", "resolved_at", "market", "direction", "outcome",
+        "timestamp", "resolved_at", "source", "market", "direction", "outcome",
         "amount", "entry_price", "result", "won", "pnl",
         "winning_outcome", "condition_id", "token_id"
     ]
@@ -1835,6 +1840,7 @@ def api_copy_download():
         row = {
             "timestamp": pos.get("timestamp", ""),
             "resolved_at": pos.get("resolved_at", ""),
+            "source": pos.get("source", "copy_trader"),
             "market": pos.get("market", ""),
             "direction": direction,
             "outcome": outcome,
@@ -1875,6 +1881,8 @@ def api_copy_compare():
     positions_data = None
     if copy_trader:
         positions_data = copy_trader.positions
+    elif momentum_engine:
+        positions_data = momentum_engine.positions
     else:
         try:
             positions_data = load_positions()
