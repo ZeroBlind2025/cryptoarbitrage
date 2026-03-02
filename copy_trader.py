@@ -184,10 +184,14 @@ def check_clob_market_resolution(condition_id: str, token_id: str = "") -> Optio
             # Market is closed but no winner flag set yet
             return None
 
-        # Determine if OUR token won
-        winning_token_id = str(winning_token.get("token_id", ""))
-        our_token_won = (str(token_id) == winning_token_id) if token_id else None
+        # Determine if OUR token won — compare with normalization
+        winning_token_id = str(winning_token.get("token_id", "")).strip()
+        our_tid = str(token_id).strip() if token_id else ""
+        our_token_won = (our_tid == winning_token_id) if our_tid else None
 
+        # Log enough detail to diagnose mismatches
+        if our_tid and not our_token_won:
+            print(f"[ALGO] CLOB token mismatch: ours={our_tid[:30]}... vs winner={winning_token_id[:30]}...")
         print(f"[ALGO] CLOB resolution: winner={winning_token.get('outcome')} "
               f"(token={winning_token_id[:20]}...), our_token_won={our_token_won}")
 
@@ -1188,14 +1192,16 @@ class CopyTrader:
                 winning_outcome = result.get("winning_outcome")
                 winning_index = result.get("winning_index")
 
-                # Check if we got a direct win/loss result from token price check
+                # --- Determine win/loss using multiple signals ---
                 won = None
-                if "our_token_won" in result:
-                    # Direct result from token price - most reliable
-                    won = result.get("our_token_won")
+
+                # Priority 1: Direct token_id comparison from CLOB API
+                if "our_token_won" in result and result["our_token_won"] is not None:
+                    won = result["our_token_won"]
                     print(f"[ALGO] Token resolution: {position['market'][:30]} | won={won}")
-                else:
-                    # Fallback to outcome name comparison
+
+                # Priority 2: Outcome name comparison
+                if won is None:
                     winning_outcome = result.get("winning_outcome")
                     winning_index = result.get("winning_index")
 
@@ -1211,6 +1217,18 @@ class CopyTrader:
                             won = False
                     elif winning_index is not None and our_index is not None:
                         won = (winning_index == our_index)
+
+                # Safety net: if CLOB token comparison said LOSS but outcome
+                # name says WIN, trust the name match (token_id formatting issue)
+                if won is False and winning_outcome and our_outcome:
+                    our_normalized = our_outcome.lower().strip()
+                    winning_normalized = winning_outcome.lower().strip()
+                    if (our_normalized == winning_normalized
+                            or our_normalized.startswith(winning_normalized)
+                            or winning_normalized.startswith(our_normalized)):
+                        print(f"[ALGO] OVERRIDE: token_id said LOSS but outcome name matches "
+                              f"(ours={our_outcome}, winner={winning_outcome}). Correcting to WIN.")
+                        won = True
 
                 if won is True:
                     # Validate entry_price before calculating
