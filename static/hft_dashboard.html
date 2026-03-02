@@ -1251,7 +1251,7 @@
                                 </div>
 
                                 <p className="text-xs text-slate-500 mb-3">
-                                    Independent price-momentum trader. Enters when price ≥ {((momentum.min_entry_price || 0.65) * 100).toFixed(0)}¢, re-enters only on upward movement. {momentum.running && copyTrader.paused ? '(Copy trader auto-paused)' : ''}
+                                    Independent price-momentum trader. Enters between {((momentum.min_entry_price || 0.65) * 100).toFixed(0)}¢ – {((momentum.max_entry_price || 0.989) * 100).toFixed(1)}¢, re-enters only on upward movement. {momentum.running && copyTrader.paused ? '(Copy trader auto-paused)' : ''}
                                 </p>
 
                                 {momentum.running && (
@@ -1311,8 +1311,8 @@
                                         </div>
                                         {momentum.active_entries && Object.keys(momentum.active_entries).length > 0 && (
                                             <div className="pt-2 border-t border-slate-700">
-                                                <p className="text-xs text-slate-500 mb-1">Active Entries (last buy price)</p>
-                                                {Object.entries(momentum.active_entries).map(([key, price]) => (
+                                                <p className="text-xs text-slate-500 mb-1">Active Entries ({Object.keys(momentum.active_entries).length} total, showing last 25)</p>
+                                                {Object.entries(momentum.active_entries).slice(-25).map(([key, price]) => (
                                                     <div key={key} className="flex justify-between text-xs">
                                                         <span className="text-slate-400 font-mono truncate max-w-[150px]">{key}</span>
                                                         <span className="text-orange-400 font-mono">{price}</span>

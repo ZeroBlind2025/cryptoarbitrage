@@ -2288,7 +2288,7 @@ def _get_momentum_data() -> dict:
         "trades_entered": 0, "trades_skipped": 0,
         "total_spent": 0, "scans_completed": 0,
         "open_positions": 0, "resolved_positions": 0,
-        "min_entry_price": 0.65, "max_entry_price": 0.95,
+        "min_entry_price": 0.65, "max_entry_price": 0.989,
         "bet_amount": 2.0,
         "coin_bet_amounts": {"btc": 2.0, "eth": 2.0, "sol": 2.0, "xrp": 2.0},
         "paused_coins": [], "dry_run": True,

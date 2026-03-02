@@ -82,8 +82,9 @@ from copy_trader import (
 # Minimum price to enter a market (65 cents = 0.65)
 MIN_ENTRY_PRICE = float(os.getenv("MOMENTUM_MIN_ENTRY_PRICE", "0.65"))
 
-# Maximum price to enter (same as copy trader)
-MAX_ENTRY_PRICE = float(os.getenv("MOMENTUM_MAX_ENTRY_PRICE", "0.95"))
+# Maximum price to enter — 98.9¢ cap filters out 99¢+ "last second" entries
+# that linger at market close and likely wouldn't fill in live trading
+MAX_ENTRY_PRICE = float(os.getenv("MOMENTUM_MAX_ENTRY_PRICE", "0.989"))
 
 # How often to poll prices (seconds)
 POLL_INTERVAL = int(os.getenv("MOMENTUM_POLL_INTERVAL", "10"))
