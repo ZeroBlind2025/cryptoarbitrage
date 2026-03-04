@@ -378,7 +378,7 @@
             useEffect(() => {
                 if (isOpen) {
                     const current = copyTrader.coin_bet_amounts || {};
-                    const fallback = copyTrader.bet_amount || 2;
+                    const fallback = copyTrader.bet_amount || 5;
                     const amounts = {};
                     COINS.forEach(c => { amounts[c] = String(current[c] || fallback); });
                     setCoinAmounts(amounts);
@@ -517,7 +517,7 @@
                                                     value={coinAmounts[coin] || ''}
                                                     onChange={(e) => setCoinAmt(coin, e.target.value)}
                                                     className="w-full bg-slate-700/50 border border-slate-600 rounded-lg px-2 py-1.5 text-sm text-white font-mono focus:outline-none focus:border-cyan-500 text-center"
-                                                    placeholder="2.00"
+                                                    placeholder="5.00"
                                                 />
                                             </div>
                                         ))}
@@ -529,7 +529,7 @@
                             {copyTrader.running && !isDynamic && (
                                 <div className="flex gap-2">
                                     <span className="text-xs text-slate-500 self-center">All:</span>
-                                    {[1, 2, 5, 10].map(amt => (
+                                    {[5, 10, 20, 30, 40, 50].map(amt => (
                                         <button
                                             key={amt}
                                             onClick={() => {
