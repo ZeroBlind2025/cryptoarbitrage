@@ -312,33 +312,40 @@ def discover_active_markets() -> list[dict]:
     event_slug_found = 0
 
     for coin_abbr in event_slug_coins:
+        coin_full = COIN_SLUG_NAMES.get(coin_abbr, coin_abbr)
         for tag, window_secs in event_slug_configs:
             # Current + previous window (handles edge-case timing near boundaries)
             base_ts = (now_ts // window_secs) * window_secs
             for ts in [base_ts, base_ts - window_secs]:
-                event_slug = f"{coin_abbr}-updown-{tag}-{ts}"
-                try:
-                    resp = requests.get(
-                        f"{GAMMA_API}/events",
-                        params={"slug": event_slug},
-                        timeout=10,
-                    )
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        events_list = data if isinstance(data, list) else [data] if isinstance(data, dict) else []
-                        for event in events_list:
-                            if not isinstance(event, dict):
-                                continue
-                            for mkt in event.get("markets", []):
-                                if _add_market(mkt):
-                                    event_slug_found += 1
-                            # Event itself might have market fields
-                            if "conditionId" in event:
-                                if _add_market(event):
-                                    event_slug_found += 1
-                except Exception:
-                    pass
-                time.sleep(0.02)
+                # Try both abbreviated AND full coin name slugs
+                # e.g. "eth-updown-15m-{ts}" AND "ethereum-updown-15m-{ts}"
+                slug_variants = [f"{coin_abbr}-updown-{tag}-{ts}"]
+                if coin_full != coin_abbr:
+                    slug_variants.append(f"{coin_full}-updown-{tag}-{ts}")
+
+                for event_slug in slug_variants:
+                    try:
+                        resp = requests.get(
+                            f"{GAMMA_API}/events",
+                            params={"slug": event_slug},
+                            timeout=10,
+                        )
+                        if resp.status_code == 200:
+                            data = resp.json()
+                            events_list = data if isinstance(data, list) else [data] if isinstance(data, dict) else []
+                            for event in events_list:
+                                if not isinstance(event, dict):
+                                    continue
+                                for mkt in event.get("markets", []):
+                                    if _add_market(mkt):
+                                        event_slug_found += 1
+                                # Event itself might have market fields
+                                if "conditionId" in event:
+                                    if _add_market(event):
+                                        event_slug_found += 1
+                    except Exception:
+                        pass
+                    time.sleep(0.02)
 
     if event_slug_found > 0:
         print(f"[MOMENTUM] Event slugs: found {event_slug_found} markets "
