@@ -313,9 +313,9 @@ def discover_active_markets() -> list[dict]:
 
     for coin_abbr in event_slug_coins:
         for tag, window_secs in event_slug_configs:
-            # Only the CURRENT window — the one matching the real-time clock
+            # Current + previous window (handles edge-case timing near boundaries)
             base_ts = (now_ts // window_secs) * window_secs
-            for ts in [base_ts]:
+            for ts in [base_ts, base_ts - window_secs]:
                 event_slug = f"{coin_abbr}-updown-{tag}-{ts}"
                 try:
                     resp = requests.get(
@@ -395,43 +395,53 @@ def discover_active_markets() -> list[dict]:
     interval_configs = [
         ("5m", 300),
         ("15m", 900),
+        ("30m", 1800),
         ("1h", 3600),
     ]
 
     for coin_abbr in CRYPTO_COINS:
         coin_name = COIN_SLUG_NAMES.get(coin_abbr, coin_abbr)
         for tag, window_secs in interval_configs:
-            # Only the CURRENT window — matches real-time clock
+            # Current window + previous window (covers edge-case timing)
             base_ts = (now_ts // window_secs) * window_secs
-            timestamps = [base_ts]
+            timestamps = [base_ts, base_ts - window_secs]
 
             for ts in timestamps:
-                slug_pattern = f"{coin_name}-updown-{tag}-{ts}"
-                try:
-                    resp = requests.get(
-                        f"{GAMMA_API}/markets",
-                        params={
-                            "slug": slug_pattern,
-                            "active": "true",
-                            "closed": "false",
-                        },
-                        timeout=10,
-                    )
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        if isinstance(data, list):
-                            for raw in data:
-                                _add_market(raw)
-                except Exception:
-                    pass
+                # Try BOTH abbreviated and full coin names
+                # Polymarket uses both: "eth-updown-15m-{ts}" AND
+                # "ethereum-updown-15m-{ts}" depending on market type
+                slug_variants = [f"{coin_name}-updown-{tag}-{ts}"]
+                if coin_abbr != coin_name:
+                    slug_variants.append(f"{coin_abbr}-updown-{tag}-{ts}")
+
+                for slug_pattern in slug_variants:
+                    try:
+                        resp = requests.get(
+                            f"{GAMMA_API}/markets",
+                            params={
+                                "slug": slug_pattern,
+                                "active": "true",
+                                "closed": "false",
+                            },
+                            timeout=10,
+                        )
+                        if resp.status_code == 200:
+                            data = resp.json()
+                            if isinstance(data, list):
+                                for raw in data:
+                                    _add_market(raw)
+                    except Exception:
+                        pass
 
             time.sleep(0.02)
 
     # Also search with slug_contains for partial matches
+    # Include both full and abbreviated coin names + all intervals
     slug_search_terms = [
-        "updown-5m", "updown-15m", "updown-1h",
+        "updown-5m", "updown-15m", "updown-30m", "updown-1h",
         "up-or-down",
         "bitcoin-updown", "ethereum-updown", "solana-updown", "xrp-updown",
+        "btc-updown", "eth-updown", "sol-updown",
     ]
     for search_term in slug_search_terms:
         try:
