@@ -86,6 +86,22 @@ MIN_ENTRY_PRICE = float(os.getenv("MOMENTUM_MIN_ENTRY_PRICE", "0.65"))
 # that linger at market close and likely wouldn't fill in live trading
 MAX_ENTRY_PRICE = float(os.getenv("MOMENTUM_MAX_ENTRY_PRICE", "0.989"))
 
+# ---------------------------------------------------------------------------
+# Per-interval entry price brackets (data-driven from bracket analysis)
+# Each interval maps to a list of (min, max) tuples.  A price must fall in
+# at least ONE bracket to qualify.  Intervals not listed here use the global
+# MIN_ENTRY_PRICE / MAX_ENTRY_PRICE range.
+#
+# 5m  sweet spot: 0.85-0.95 (94-96% WR, best ROI in dataset)
+# 15m sweet spots: 0.70-0.80 (80% WR, 8.8% ROI) + 0.90-0.99
+# 0.80-0.85 is a dead zone across both windows — excluded.
+# ---------------------------------------------------------------------------
+INTERVAL_PRICE_BRACKETS: dict[str, list[tuple[float, float]]] = {
+    "5m":  [(0.85, 0.95)],
+    "15m": [(0.70, 0.80), (0.90, 0.99)],
+    # 30m, 60m: no interval-specific filter — use global min/max
+}
+
 # How often to poll prices (seconds)
 POLL_INTERVAL = int(os.getenv("MOMENTUM_POLL_INTERVAL", "10"))
 
@@ -509,6 +525,7 @@ class MomentumEngine:
         self.min_entry_price = MIN_ENTRY_PRICE
         self.max_entry_price = MAX_ENTRY_PRICE
         self.max_entries_per_market = MAX_ENTRIES_PER_MARKET
+        self.interval_price_brackets = dict(INTERVAL_PRICE_BRACKETS)
 
         # Track entered markets: (condition_id, token_id) → last_buy_price
         # KEY: uses token_id (stable identifier) not outcome_index (array position
@@ -542,7 +559,15 @@ class MomentumEngine:
         lot_sizes = ", ".join(f"{c.upper()}=${a}" for c, a in sorted(self.coin_bet_amounts.items()))
         print("\n" + "=" * 60)
         print("  MOMENTUM ENGINE")
-        print(f"  Entry threshold: >= {self.min_entry_price*100:.0f} cents")
+        print(f"  Global entry range: {self.min_entry_price*100:.0f}-{self.max_entry_price*100:.0f}¢")
+        if self.interval_price_brackets:
+            print("  Per-interval brackets:")
+            for ivl, brackets in sorted(self.interval_price_brackets.items()):
+                ranges = " | ".join(f"{lo*100:.0f}-{hi*100:.0f}¢" for lo, hi in brackets)
+                print(f"    {ivl}: {ranges}")
+            other = [i for i in ["5m", "15m", "30m", "60m"] if i not in self.interval_price_brackets]
+            if other:
+                print(f"    {', '.join(other)}: global range ({self.min_entry_price*100:.0f}-{self.max_entry_price*100:.0f}¢)")
         print(f"  Re-entry: upward only (current > last buy)")
         print(f"  Lot sizes: {lot_sizes} (default: ${self.bet_amount})")
         print(f"  Balance: ${balance:.2f}")
@@ -655,8 +680,16 @@ class MomentumEngine:
                 price = live_price if live_price else gamma_price
 
                 # --- FILTER: Price must be in range ---
-                if price < self.min_entry_price or price > self.max_entry_price:
-                    continue
+                # Use per-interval brackets if defined, else global min/max
+                interval = market.get("interval", "")
+                if interval in self.interval_price_brackets:
+                    brackets = self.interval_price_brackets[interval]
+                    in_bracket = any(lo <= price < hi for lo, hi in brackets)
+                    if not in_bracket:
+                        continue
+                else:
+                    if price < self.min_entry_price or price > self.max_entry_price:
+                        continue
 
                 # Key by (condition_id, token_id) — stable across API ordering changes
                 market_key = (condition_id, token_id)
@@ -1039,6 +1072,10 @@ class MomentumEngine:
             "min_entry_price": self.min_entry_price,
             "max_entry_price": self.max_entry_price,
             "max_entries_per_market": self.max_entries_per_market,
+            "interval_price_brackets": {
+                k: [{"min": lo, "max": hi} for lo, hi in v]
+                for k, v in self.interval_price_brackets.items()
+            },
             "bet_amount": self.bet_amount,
             "coin_bet_amounts": {k: v for k, v in self.coin_bet_amounts.items()},
             "paused_coins": list(self.paused_coins),
