@@ -60,7 +60,7 @@ PRIVATE_KEY = os.getenv("POLYGON_PRIVATE_KEY", "")
 SIGNATURE_TYPE = int(os.getenv("POLYMARKET_SIGNATURE_TYPE", "0"))  # 0=EOA, 1=Email/Magic, 2=Browser
 
 # Trading settings
-BET_AMOUNT = float(os.getenv("COPY_BET_AMOUNT", "2.0"))  # $ per copied bet
+BET_AMOUNT = float(os.getenv("COPY_BET_AMOUNT", "5.0"))  # $ per copied bet
 POLL_INTERVAL = int(os.getenv("COPY_POLL_INTERVAL", "10"))  # seconds between checks
 ALGO_STARTING_BALANCE = float(os.getenv("ALGO_STARTING_BALANCE", "2300.0"))  # Starting balance for Poly Algo
 PRICE_BUFFER_BPS = int(os.getenv("COPY_PRICE_BUFFER_BPS", "50"))  # Max overbid vs target's price (50 bps = 0.5%)
