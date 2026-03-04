@@ -108,6 +108,10 @@ POLL_INTERVAL = int(os.getenv("MOMENTUM_POLL_INTERVAL", "10"))
 # Max entries per market (same as copy trader default)
 MAX_ENTRIES_PER_MARKET = int(os.getenv("MOMENTUM_MAX_ENTRIES", "2"))
 
+# Minimum minutes before market close to allow entry.
+# Prevents placing trades after (or right at) the close time.
+MIN_MINUTES_BEFORE_CLOSE = float(os.getenv("MOMENTUM_MIN_MINUTES_BEFORE_CLOSE", "1.0"))
+
 
 # =============================================================================
 # MARKET DISCOVERY
@@ -245,6 +249,23 @@ def _parse_market(raw: dict) -> Optional[dict]:
     if not coin or not interval:
         return None
 
+    # Parse market close time so we can avoid entering after close
+    end_date_str = raw.get("endDate") or raw.get("end_date_iso")
+    minutes_until_close = None
+    if end_date_str:
+        try:
+            if "T" in str(end_date_str):
+                end_date = datetime.fromisoformat(
+                    end_date_str.replace("Z", "+00:00")
+                )
+            else:
+                end_date = datetime.strptime(end_date_str, "%Y-%m-%d")
+                end_date = end_date.replace(tzinfo=timezone.utc)
+            now = datetime.now(timezone.utc)
+            minutes_until_close = (end_date - now).total_seconds() / 60
+        except (ValueError, TypeError):
+            pass
+
     return {
         "slug": raw.get("slug", ""),
         "question": question,
@@ -254,6 +275,7 @@ def _parse_market(raw: dict) -> Optional[dict]:
         "prices": prices,
         "coin": coin,
         "interval": interval,
+        "minutes_until_close": minutes_until_close,
     }
 
 
@@ -822,6 +844,12 @@ class MomentumEngine:
 
             # Per-coin pause
             if coin in self.paused_coins:
+                continue
+
+            # --- GUARD: Market must still be open ---
+            minutes_left = market.get("minutes_until_close")
+            if minutes_left is not None and minutes_left < MIN_MINUTES_BEFORE_CLOSE:
+                # Market is closed or about to close — skip
                 continue
 
             # Check each side (outcome 0 and 1)
