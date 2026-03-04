@@ -37,7 +37,7 @@ import json
 import time
 import requests
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from pathlib import Path
 
@@ -99,7 +99,7 @@ MAX_ENTRY_PRICE = float(os.getenv("MOMENTUM_MAX_ENTRY_PRICE", "0.989"))
 INTERVAL_PRICE_BRACKETS: dict[str, list[tuple[float, float]]] = {
     "5m":  [(0.85, 0.95)],
     "15m": [(0.70, 0.80), (0.90, 0.99)],
-    # 30m, 60m: no interval-specific filter — use global min/max
+    # 60m: no interval-specific filter — use global min/max
 }
 
 # How often to poll prices (seconds)
@@ -122,11 +122,11 @@ COIN_SLUG_NAMES = {
     "sol": "solana",
     "xrp": "xrp",
 }
-INTERVALS = ["5m", "15m", "30m", "60m"]
+INTERVALS = ["5m", "15m", "60m"]
 
 # Interval detection patterns for question text
 # e.g. "9:00AM-9:15AM" = 15m, "9:00AM-9:05AM" = 5m, "12PM" (hourly) = 60m
-_INTERVAL_MINUTES = {5: "5m", 15: "15m", 30: "30m", 60: "60m"}
+_INTERVAL_MINUTES = {5: "5m", 15: "15m", 60: "60m"}
 
 
 def _detect_interval(slug: str, question: str) -> str:
@@ -280,7 +280,7 @@ def discover_active_markets() -> list[dict]:
       - token_ids: [up_token_id, down_token_id]
       - prices: [up_price, down_price]
       - coin: "btc", "eth", "sol", "xrp"
-      - interval: "5m", "15m", "30m", "60m"
+      - interval: "5m", "15m", "60m"
     """
     markets = []
     seen_conditions = set()
@@ -299,26 +299,29 @@ def discover_active_markets() -> list[dict]:
 
     # ================================================================
     # Strategy 0: Event slug lookup with computed timestamps
-    # Polymarket URLs: /event/{coin}-updown-{interval}-{unix_ts}
-    # Timestamps are floor-aligned to interval boundaries.
-    # e.g. btc-updown-5m-1772397000 (every 300s)
+    #
+    # 5m/15m use unix-timestamp slugs:
+    #   /event/{coin}-updown-{5m|15m}-{unix_ts}
+    #   e.g. btc-updown-5m-1772397000
+    #
+    # Hourly uses human-readable ET date/time:
+    #   /event/{coin}-up-or-down-{month}-{day}-{hour}{am/pm}-et
+    #   e.g. bitcoin-up-or-down-march-3-9pm-et
     # ================================================================
     now_ts = int(time.time())
 
-    event_slug_configs = [
-        ("5m", 300), ("15m", 900), ("30m", 1800), ("1h", 3600),
+    # --- 5m / 15m: unix-timestamp based ---
+    ts_slug_configs = [
+        ("5m", 300), ("15m", 900),
     ]
     event_slug_coins = ["btc", "eth", "sol", "xrp"]
     event_slug_found = 0
 
     for coin_abbr in event_slug_coins:
         coin_full = COIN_SLUG_NAMES.get(coin_abbr, coin_abbr)
-        for tag, window_secs in event_slug_configs:
-            # Current + previous window (handles edge-case timing near boundaries)
+        for tag, window_secs in ts_slug_configs:
             base_ts = (now_ts // window_secs) * window_secs
             for ts in [base_ts, base_ts - window_secs]:
-                # Try both abbreviated AND full coin name slugs
-                # e.g. "eth-updown-15m-{ts}" AND "ethereum-updown-15m-{ts}"
                 slug_variants = [f"{coin_abbr}-updown-{tag}-{ts}"]
                 if coin_full != coin_abbr:
                     slug_variants.append(f"{coin_full}-updown-{tag}-{ts}")
@@ -339,7 +342,6 @@ def discover_active_markets() -> list[dict]:
                                 for mkt in event.get("markets", []):
                                     if _add_market(mkt):
                                         event_slug_found += 1
-                                # Event itself might have market fields
                                 if "conditionId" in event:
                                     if _add_market(event):
                                         event_slug_found += 1
@@ -347,9 +349,79 @@ def discover_active_markets() -> list[dict]:
                         pass
                     time.sleep(0.02)
 
+    # --- Hourly: human-readable ET date/time slug ---
+    # Format: {coin}-up-or-down-{month}-{day}-{hour}{am/pm}-et
+    # e.g. bitcoin-up-or-down-march-3-9pm-et
+    try:
+        from zoneinfo import ZoneInfo
+    except ImportError:
+        from backports.zoneinfo import ZoneInfo
+
+    et_tz = ZoneInfo("America/New_York")
+    now_et = datetime.now(et_tz)
+
+    _MONTH_NAMES = {
+        1: "january", 2: "february", 3: "march", 4: "april",
+        5: "may", 6: "june", 7: "july", 8: "august",
+        9: "september", 10: "october", 11: "november", 12: "december",
+    }
+
+    # Hourly coin names used in slugs (full names, not abbreviations)
+    hourly_coin_names = {
+        "btc": "bitcoin", "eth": "ethereum", "sol": "solana", "xrp": "xrp",
+    }
+
+    # Check current hour and previous hour
+    for hour_offset in [0, -1]:
+        target_et = now_et + timedelta(hours=hour_offset)
+        month_name = _MONTH_NAMES[target_et.month]
+        day = target_et.day
+        hour_24 = target_et.hour
+        if hour_24 == 0:
+            hour_str = "12am"
+        elif hour_24 < 12:
+            hour_str = f"{hour_24}am"
+        elif hour_24 == 12:
+            hour_str = "12pm"
+        else:
+            hour_str = f"{hour_24 - 12}pm"
+
+        for coin_abbr in event_slug_coins:
+            coin_name = hourly_coin_names.get(coin_abbr, coin_abbr)
+            # Try both slug formats seen on Polymarket
+            hourly_slugs = [
+                f"{coin_name}-up-or-down-{month_name}-{day}-{hour_str}-et",
+                f"{coin_abbr}-up-or-down-{month_name}-{day}-{hour_str}-et",
+            ]
+            if coin_abbr == coin_name:
+                hourly_slugs = hourly_slugs[:1]  # avoid duplicate for xrp
+
+            for event_slug in hourly_slugs:
+                try:
+                    resp = requests.get(
+                        f"{GAMMA_API}/events",
+                        params={"slug": event_slug},
+                        timeout=10,
+                    )
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        events_list = data if isinstance(data, list) else [data] if isinstance(data, dict) else []
+                        for event in events_list:
+                            if not isinstance(event, dict):
+                                continue
+                            for mkt in event.get("markets", []):
+                                if _add_market(mkt):
+                                    event_slug_found += 1
+                            if "conditionId" in event:
+                                if _add_market(event):
+                                    event_slug_found += 1
+                except Exception:
+                    pass
+                time.sleep(0.02)
+
     if event_slug_found > 0:
         print(f"[MOMENTUM] Event slugs: found {event_slug_found} markets "
-              f"via computed timestamps", flush=True)
+              f"via computed slugs", flush=True)
 
     # ================================================================
     # Strategy 1: /events endpoint (broad listing)
@@ -391,19 +463,17 @@ def discover_active_markets() -> list[dict]:
         print(f"[MOMENTUM] Events search error: {e}", flush=True)
 
     # ================================================================
-    # Strategy 2: Timestamp-based slug search
-    # Polymarket uses full coin names in slugs, e.g.:
+    # Strategy 2: Timestamp-based slug search (5m/15m only)
+    # Polymarket uses unix-ts slugs for short intervals:
     #   "bitcoin-updown-15m-1740844800"
     #   "ethereum-updown-5m-1740844500"
-    # Generate current/upcoming windows and search.
+    # Hourly uses human-readable format (handled in Strategy 0).
     # ================================================================
 
     # Interval configs: (slug_tag, seconds_per_window)
     interval_configs = [
         ("5m", 300),
         ("15m", 900),
-        ("30m", 1800),
-        ("1h", 3600),
     ]
 
     for coin_abbr in CRYPTO_COINS:
@@ -445,10 +515,11 @@ def discover_active_markets() -> list[dict]:
     # Also search with slug_contains for partial matches
     # Include both full and abbreviated coin names + all intervals
     slug_search_terms = [
-        "updown-5m", "updown-15m", "updown-30m", "updown-1h",
+        "updown-5m", "updown-15m",
         "up-or-down",
         "bitcoin-updown", "ethereum-updown", "solana-updown", "xrp-updown",
         "btc-updown", "eth-updown", "sol-updown",
+        "bitcoin-up-or-down", "ethereum-up-or-down", "solana-up-or-down", "xrp-up-or-down",
     ]
     for search_term in slug_search_terms:
         try:
@@ -582,7 +653,7 @@ class MomentumEngine:
             for ivl, brackets in sorted(self.interval_price_brackets.items()):
                 ranges = " | ".join(f"{lo*100:.0f}-{hi*100:.0f}¢" for lo, hi in brackets)
                 print(f"    {ivl}: {ranges}")
-            other = [i for i in ["5m", "15m", "30m", "60m"] if i not in self.interval_price_brackets]
+            other = [i for i in ["5m", "15m", "60m"] if i not in self.interval_price_brackets]
             if other:
                 print(f"    {', '.join(other)}: global range ({self.min_entry_price*100:.0f}-{self.max_entry_price*100:.0f}¢)")
         print(f"  Re-entry: upward only (current > last buy)")
