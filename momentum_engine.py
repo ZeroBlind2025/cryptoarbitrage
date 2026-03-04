@@ -574,7 +574,75 @@ def discover_active_markets() -> list[dict]:
     else:
         print("[MOMENTUM] No active updown markets found", flush=True)
 
+    # --- Log discovered markets to CSV (dedup by condition_id) ---
+    _log_discovered_markets(markets)
+
     return markets
+
+
+# Path for the discovery log CSV
+DISCOVERY_LOG = Path(__file__).parent / "market_discovery_log.csv"
+
+# In-memory set of condition_ids already written (avoids re-reading CSV each scan)
+_logged_condition_ids: set = set()
+
+
+def _log_discovered_markets(markets: list[dict]):
+    """Append newly-seen markets to the discovery CSV.
+
+    Each unique market (by condition_id) is logged exactly once so
+    after 24 hours you can count rows per coin/interval and compare
+    to expected totals to find gaps.
+    """
+    import csv
+
+    global _logged_condition_ids
+
+    # On first call, seed the set from existing CSV rows
+    if not _logged_condition_ids and DISCOVERY_LOG.exists():
+        try:
+            with open(DISCOVERY_LOG, "r") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    cid = row.get("condition_id", "")
+                    if cid:
+                        _logged_condition_ids.add(cid)
+        except Exception:
+            pass
+
+    new_rows = []
+    for m in markets:
+        cid = m.get("condition_id", "")
+        if not cid or cid in _logged_condition_ids:
+            continue
+        _logged_condition_ids.add(cid)
+        new_rows.append({
+            "discovered_at": datetime.now(timezone.utc).isoformat(),
+            "coin": m.get("coin", ""),
+            "interval": m.get("interval", ""),
+            "slug": m.get("slug", ""),
+            "condition_id": cid,
+            "question": (m.get("question", ""))[:80],
+            "up_price": m["prices"][0] if len(m.get("prices", [])) >= 2 else "",
+            "down_price": m["prices"][1] if len(m.get("prices", [])) >= 2 else "",
+        })
+
+    if not new_rows:
+        return
+
+    write_header = not DISCOVERY_LOG.exists()
+    fieldnames = [
+        "discovered_at", "coin", "interval", "slug",
+        "condition_id", "question", "up_price", "down_price",
+    ]
+    try:
+        with open(DISCOVERY_LOG, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            if write_header:
+                writer.writeheader()
+            writer.writerows(new_rows)
+    except Exception as e:
+        print(f"[MOMENTUM] Discovery log write error: {e}", flush=True)
 
 
 # =============================================================================
