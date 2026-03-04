@@ -579,7 +579,13 @@
         const CoinROI = ({ coinRoi, copyTrader, fetchData, apiPrefix = '/api/copy-trader' }) => {
             if (!coinRoi || Object.keys(coinRoi).length === 0) return null;
 
+            const [expandedCoins, setExpandedCoins] = useState({});
             const pausedCoins = new Set(copyTrader.paused_coins || []);
+            const openByCoin = copyTrader.open_by_coin || {};
+
+            const toggleExpand = (coin) => {
+                setExpandedCoins(prev => ({ ...prev, [coin]: !prev[coin] }));
+            };
 
             // Sort: coins with trades first (by |pnl| desc), then coins with no data
             const sortedCoins = Object.entries(coinRoi).sort((a, b) => {
@@ -635,6 +641,20 @@
                 return amt ? `$${Number(amt).toFixed(0)}` : '$2';
             };
 
+            const formatTime = (ts) => {
+                if (!ts) return '';
+                try {
+                    const d = new Date(ts);
+                    const now = new Date();
+                    const diffMs = now - d;
+                    const diffMins = Math.floor(diffMs / 60000);
+                    if (diffMins < 60) return `${diffMins}m ago`;
+                    const diffHrs = Math.floor(diffMins / 60);
+                    if (diffHrs < 24) return `${diffHrs}h ago`;
+                    return `${Math.floor(diffHrs / 24)}d ago`;
+                } catch { return ''; }
+            };
+
             return (
                 <div className="mt-4 border-t border-slate-700 pt-4">
                     <p className="text-xs text-slate-400 font-medium mb-3 uppercase tracking-wide">Coin Performance</p>
@@ -643,53 +663,92 @@
                             const total = s.wins + s.losses;
                             if (total === 0 && s.open === 0) return null;
                             const isPaused = pausedCoins.has(coin);
+                            const isExpanded = expandedCoins[coin];
+                            const coinPositions = openByCoin[coin] || [];
+                            const hasPositions = coinPositions.length > 0;
                             return (
-                                <div key={coin} className={`rounded-lg border px-3 py-2 ${getHeatBg(s.roi, isPaused)}`}>
-                                    <div className="flex items-center justify-between mb-1">
-                                        <div className="flex items-center gap-2">
-                                            <span className="text-xs font-bold uppercase text-white">{coin}</span>
-                                            {isPaused && (
-                                                <span className="text-xs text-yellow-400 font-medium">PAUSED</span>
-                                            )}
-                                            {getStreakDisplay(s)}
-                                            {s.open > 0 && (
-                                                <span className="text-xs text-yellow-400/70">{s.open} open</span>
-                                            )}
+                                <div key={coin} className={`rounded-lg border ${getHeatBg(s.roi, isPaused)}`}>
+                                    <div
+                                        className={`px-3 py-2 ${hasPositions ? 'cursor-pointer' : ''}`}
+                                        onClick={() => hasPositions && toggleExpand(coin)}
+                                    >
+                                        <div className="flex items-center justify-between mb-1">
+                                            <div className="flex items-center gap-2">
+                                                <span className="text-xs font-bold uppercase text-white">{coin}</span>
+                                                {isPaused && (
+                                                    <span className="text-xs text-yellow-400 font-medium">PAUSED</span>
+                                                )}
+                                                {getStreakDisplay(s)}
+                                                {s.open > 0 && (
+                                                    <span className="text-xs text-yellow-400/70">
+                                                        {s.open} open {hasPositions ? (isExpanded ? '\u25B2' : '\u25BC') : ''}
+                                                    </span>
+                                                )}
+                                            </div>
+                                            <div className="flex items-center gap-2">
+                                                <span className="text-xs font-mono text-slate-400">{getLotDisplay(coin)}</span>
+                                                <span className={`text-sm font-mono font-bold ${getRoiColor(s.roi)}`}>
+                                                    {s.roi >= 0 ? '+' : ''}{s.roi.toFixed(1)}%
+                                                </span>
+                                                {copyTrader.running && (
+                                                    <button
+                                                        onClick={(e) => { e.stopPropagation(); toggleCoinPause(coin); }}
+                                                        className={`px-2 py-0.5 text-xs rounded border transition-all ${
+                                                            isPaused
+                                                                ? 'bg-green-500/20 text-green-400 border-green-500/30 hover:bg-green-500/30'
+                                                                : 'bg-yellow-500/20 text-yellow-400 border-yellow-500/30 hover:bg-yellow-500/30'
+                                                        }`}
+                                                        title={isPaused
+                                                            ? `Resume trading ${coin.toUpperCase()}`
+                                                            : `Pause ${coin.toUpperCase()} - stop new trades for this coin`}
+                                                    >
+                                                        {isPaused ? '\u25B6' : '\u23F8'}
+                                                    </button>
+                                                )}
+                                            </div>
                                         </div>
-                                        <div className="flex items-center gap-2">
-                                            <span className="text-xs font-mono text-slate-400">{getLotDisplay(coin)}</span>
-                                            <span className={`text-sm font-mono font-bold ${getRoiColor(s.roi)}`}>
-                                                {s.roi >= 0 ? '+' : ''}{s.roi.toFixed(1)}%
+                                        <div className="flex items-center justify-between text-xs">
+                                            <span className="text-slate-400">
+                                                {s.wins}W/{s.losses}L
+                                                {total > 0 && <span className="text-slate-500 ml-1">({s.win_rate.toFixed(0)}%)</span>}
                                             </span>
-                                            {copyTrader.running && (
-                                                <button
-                                                    onClick={() => toggleCoinPause(coin)}
-                                                    className={`px-2 py-0.5 text-xs rounded border transition-all ${
-                                                        isPaused
-                                                            ? 'bg-green-500/20 text-green-400 border-green-500/30 hover:bg-green-500/30'
-                                                            : 'bg-yellow-500/20 text-yellow-400 border-yellow-500/30 hover:bg-yellow-500/30'
-                                                    }`}
-                                                    title={isPaused
-                                                        ? `Resume trading ${coin.toUpperCase()}`
-                                                        : `Pause ${coin.toUpperCase()} - stop new trades for this coin`}
-                                                >
-                                                    {isPaused ? '\u25B6' : '\u23F8'}
-                                                </button>
-                                            )}
+                                            <span className={`font-mono ${s.pnl >= 0 ? 'text-green-400/80' : 'text-red-400/80'}`}>
+                                                {s.pnl >= 0 ? '+' : ''}${s.pnl.toFixed(2)}
+                                            </span>
+                                            <span className="text-slate-500 font-mono">
+                                                ${s.deployed.toFixed(0)} deployed
+                                            </span>
                                         </div>
                                     </div>
-                                    <div className="flex items-center justify-between text-xs">
-                                        <span className="text-slate-400">
-                                            {s.wins}W/{s.losses}L
-                                            {total > 0 && <span className="text-slate-500 ml-1">({s.win_rate.toFixed(0)}%)</span>}
-                                        </span>
-                                        <span className={`font-mono ${s.pnl >= 0 ? 'text-green-400/80' : 'text-red-400/80'}`}>
-                                            {s.pnl >= 0 ? '+' : ''}${s.pnl.toFixed(2)}
-                                        </span>
-                                        <span className="text-slate-500 font-mono">
-                                            ${s.deployed.toFixed(0)} deployed
-                                        </span>
-                                    </div>
+                                    {isExpanded && hasPositions && (
+                                        <div className="border-t border-slate-600/30 px-3 py-2 space-y-1.5">
+                                            <div className="flex items-center justify-between mb-1">
+                                                <span className="text-xs text-slate-500 uppercase tracking-wide">Open Positions</span>
+                                                <button
+                                                    onClick={() => toggleExpand(coin)}
+                                                    className="text-xs text-slate-500 hover:text-slate-300 px-1.5 py-0.5 rounded border border-slate-600/30 hover:border-slate-500/50 transition-all"
+                                                >
+                                                    Collapse
+                                                </button>
+                                            </div>
+                                            {coinPositions.map((pos, i) => (
+                                                <div key={i} className="bg-slate-800/50 rounded px-2.5 py-1.5 text-xs">
+                                                    <div className="flex items-center justify-between">
+                                                        <span className="text-slate-300 truncate mr-2" style={{maxWidth: '60%'}}>
+                                                            {pos.market}
+                                                        </span>
+                                                        <span className="text-slate-500 whitespace-nowrap">{formatTime(pos.timestamp)}</span>
+                                                    </div>
+                                                    <div className="flex items-center justify-between mt-0.5">
+                                                        <span className="text-blue-400">{pos.outcome}</span>
+                                                        <span className="text-slate-400 font-mono">
+                                                            {(pos.entry_price * 100).toFixed(1)}\u00A2 \u00B7 ${pos.amount.toFixed(2)}
+                                                        </span>
+                                                    </div>
+                                                </div>
+                                            ))}
+                                        </div>
+                                    )}
                                 </div>
                             );
                         })}

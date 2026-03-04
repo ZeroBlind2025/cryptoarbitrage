@@ -1240,6 +1240,22 @@ class MomentumEngine:
         # Per-coin performance breakdown
         coin_roi = self._compute_coin_roi(momentum_open, momentum_resolved)
 
+        # Group open positions by coin for detail drill-down
+        open_by_coin: dict = {}
+        for pos in momentum_open:
+            slug = pos.get("slug", "")
+            market = pos.get("market", "")
+            coin = detect_coin(slug, market) or "other"
+            if coin not in open_by_coin:
+                open_by_coin[coin] = []
+            open_by_coin[coin].append({
+                "market": pos.get("market", "")[:60],
+                "outcome": pos.get("outcome", ""),
+                "entry_price": float(pos.get("entry_price", 0) or 0),
+                "amount": float(pos.get("amount", 0) or 0),
+                "timestamp": pos.get("timestamp", ""),
+            })
+
         return {
             "trades_entered": self.trades_entered,
             "trades_skipped": self.trades_skipped,
@@ -1253,6 +1269,7 @@ class MomentumEngine:
             "win_rate": m_win_rate,
             "open_staked": m_open_staked,
             "coin_roi": coin_roi,
+            "open_by_coin": open_by_coin,
             "min_entry_price": self.min_entry_price,
             "max_entry_price": self.max_entry_price,
             "max_entries_per_market": self.max_entries_per_market,

@@ -1518,6 +1518,22 @@ class CopyTrader:
         # Per-coin ROI stats from resolved + open positions
         coin_roi = self._compute_coin_roi(open_positions, resolved_positions)
 
+        # Group open positions by coin for detail drill-down
+        open_by_coin: dict = {}
+        for pos in open_positions:
+            slug = pos.get("slug", "")
+            market = pos.get("market", "")
+            coin = detect_coin(slug, market) or "other"
+            if coin not in open_by_coin:
+                open_by_coin[coin] = []
+            open_by_coin[coin].append({
+                "market": pos.get("market", "")[:60],
+                "outcome": pos.get("outcome", ""),
+                "entry_price": self._safe_float(pos.get("entry_price", 0)),
+                "amount": self._safe_float(pos.get("amount", 0)),
+                "timestamp": pos.get("timestamp", ""),
+            })
+
         return {
             "trades_copied": self.trades_copied,
             "trades_skipped": self.trades_skipped,
@@ -1535,6 +1551,7 @@ class CopyTrader:
             "bet_amount": self._safe_float(self.bet_amount),
             "coin_bet_amounts": {k: self._safe_float(v) for k, v in self.coin_bet_amounts.items()},
             "coin_roi": coin_roi,
+            "open_by_coin": open_by_coin,
             "paused_coins": list(self.paused_coins),
             "dynamic_lot_sizing_enabled": self.dynamic_lot_sizing_enabled,
             "dynamic_lot_tiers": [{"win_rate": t, "lot": l} for t, l in self.dynamic_lot_tiers],
