@@ -99,7 +99,7 @@ MAX_ENTRY_PRICE = float(os.getenv("MOMENTUM_MAX_ENTRY_PRICE", "0.989"))
 INTERVAL_PRICE_BRACKETS: dict[str, list[tuple[float, float]]] = {
     "5m":  [(0.85, 0.95)],
     "15m": [(0.70, 0.80), (0.90, 0.99)],
-    # 60m: no interval-specific filter — use global min/max
+    "60m": [(0.85, 0.99)],
 }
 
 # How often to poll prices (seconds)
