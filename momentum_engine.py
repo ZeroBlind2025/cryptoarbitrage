@@ -607,6 +607,26 @@ def discover_active_markets() -> list[dict]:
 # Path for the discovery log CSV
 DISCOVERY_LOG = Path(__file__).parent / "market_discovery_log.csv"
 
+# Persistent trade log — one JSON object per line, append-only
+TRADE_LOG = Path(__file__).parent / "momentum_trades.jsonl"
+
+
+def _log_trade(event_type: str, data: dict):
+    """Append a trade event to the JSONL log.
+
+    event_type: 'entry', 'fill', 'failed', 'resolved', 'dry_run'
+    """
+    record = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "event": event_type,
+        **data,
+    }
+    try:
+        with open(TRADE_LOG, "a") as f:
+            f.write(json.dumps(record) + "\n")
+    except Exception:
+        pass
+
 # In-memory set of condition_ids already written (avoids re-reading CSV each scan)
 _logged_condition_ids: set = set()
 
@@ -1051,6 +1071,19 @@ class MomentumEngine:
                         trade_record["status"] = "failed"
 
                 self.trade_history.append(trade_record)
+                _log_trade(trade_record["status"], {
+                    "id": trade_record["id"],
+                    "coin": coin,
+                    "interval": market["interval"],
+                    "outcome": outcome,
+                    "price": price,
+                    "amount": trade_amount,
+                    "slug": slug,
+                    "market": title,
+                    "condition_id": condition_id,
+                    "token_id": token_id,
+                    "minutes_until_close": market.get("minutes_until_close"),
+                })
 
                 if trade_record["status"] in ("filled", "dry_run"):
                     # Update last buy price (NOT first — this is the key difference)
@@ -1268,6 +1301,22 @@ class MomentumEngine:
             position["resolved_at"] = datetime.now(timezone.utc).isoformat()
             position["winning_outcome"] = winning_outcome
             position["won"] = won
+            _log_trade("resolved", {
+                "id": position.get("id", ""),
+                "coin": position.get("slug", "").split("-")[0] if position.get("slug") else "",
+                "interval": position.get("interval", ""),
+                "outcome": position.get("outcome", ""),
+                "entry_price": entry_price,
+                "amount": amount,
+                "result": position.get("result", ""),
+                "pnl": pnl,
+                "won": won,
+                "winning_outcome": winning_outcome,
+                "slug": position.get("slug", ""),
+                "market": position.get("market", ""),
+                "condition_id": position.get("condition_id", ""),
+                "entered_at": position.get("timestamp", ""),
+            })
             self.positions["open"].remove(position)
             self.positions["resolved"].append(position)
             resolved_count += 1
