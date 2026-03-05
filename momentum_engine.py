@@ -281,6 +281,33 @@ def _parse_market(raw: dict) -> Optional[dict]:
     }
 
 
+def _fetch_clob_token_ids(condition_id: str) -> Optional[list[str]]:
+    """Fetch canonical CLOB token IDs for a market from the CLOB API.
+
+    The Gamma API returns clobTokenIds that may differ in format from
+    the actual CLOB order book token IDs. This queries the CLOB API
+    directly to get the exact IDs that the WebSocket uses.
+
+    Returns [token_id_0, token_id_1] or None on failure.
+    """
+    if not condition_id:
+        return None
+    try:
+        resp = requests.get(
+            f"{CLOB_API}/markets/{condition_id}",
+            timeout=3,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            tokens = data.get("tokens", [])
+            if len(tokens) >= 2:
+                return [str(tokens[0].get("token_id", "")),
+                        str(tokens[1].get("token_id", ""))]
+    except Exception:
+        pass
+    return None
+
+
 def _is_crypto_updown_event(title: str, slug: str) -> bool:
     """Check if an event is a crypto up-or-down event by title/slug."""
     combined = (title + " " + slug).lower()
@@ -598,10 +625,50 @@ def discover_active_markets() -> list[dict]:
     else:
         print("[MOMENTUM] No active updown markets found", flush=True)
 
-    # --- Log discovered markets to CSV (dedup by condition_id) ---
-    _log_discovered_markets(markets)
+    # --- Filter to only CURRENT + NEXT time window markets ---
+    # We only want ~8 active markets (4 coins × 2 intervals), not 32
+    # that include already-resolved and future windows.
+    now_ts = int(time.time())
+    active_markets = []
+    for m in markets:
+        minutes_left = m.get("minutes_until_close")
+        prices = m.get("prices", [])
+        # Skip resolved (0/1 prices)
+        if len(prices) == 2 and prices[0] in (0.0, 1.0) and prices[1] in (0.0, 1.0):
+            continue
+        # Skip markets that are already closed
+        if minutes_left is not None and minutes_left < 0:
+            continue
+        active_markets.append(m)
 
-    return markets
+    if len(active_markets) < len(markets):
+        print(f"[MOMENTUM] Filtered to {len(active_markets)} active markets "
+              f"(from {len(markets)} total)", flush=True)
+
+    # --- Enrich with canonical CLOB token IDs ---
+    # The Gamma API clobTokenIds may differ from the actual CLOB WS token IDs.
+    # Query CLOB API to get the exact IDs the WebSocket uses.
+    enriched = 0
+    for m in active_markets:
+        cid = m.get("condition_id", "")
+        clob_ids = _fetch_clob_token_ids(cid)
+        if clob_ids and len(clob_ids) == 2 and all(clob_ids):
+            gamma_ids = m["token_ids"]
+            if gamma_ids != clob_ids:
+                print(f"[MOMENTUM] Token ID FIX for {m['coin'].upper()}_{m['interval']}: "
+                      f"gamma={gamma_ids[0][:20]}... clob={clob_ids[0][:20]}...", flush=True)
+            m["token_ids"] = clob_ids
+            enriched += 1
+        time.sleep(0.02)
+
+    if enriched > 0:
+        print(f"[MOMENTUM] Enriched {enriched}/{len(active_markets)} markets "
+              f"with CLOB token IDs", flush=True)
+
+    # --- Log discovered markets to CSV (dedup by condition_id) ---
+    _log_discovered_markets(active_markets)
+
+    return active_markets
 
 
 # Path for the discovery log CSV
@@ -764,8 +831,10 @@ class MomentumEngine:
         self.last_ws_refresh = 0
         self.ws_refresh_interval = 30
 
-        # CLOB REST price cache — populated once per scan cycle
+        # CLOB REST price cache — populated every N seconds (not every scan)
         self._clob_price_cache: dict[str, float] = {}
+        self._last_clob_fetch = 0.0
+        self._clob_fetch_interval = 10  # seconds between REST batch fetches
 
         # WS live price cache — populated directly by WS callback.
         # Keyed by the EXACT asset_id the WS server sends back (which may
@@ -930,50 +999,63 @@ class MomentumEngine:
     def _fetch_clob_prices_batch(self, markets: list[dict]):
         """Fetch real-time best-ask prices for all active markets via CLOB REST.
 
-        Called once per scan cycle. Makes one /book request per token pair
-        but only for markets that the WebSocket doesn't have prices for.
-        Caches results in _clob_price_cache for instant lookup.
+        Called every ~10s. Fetches /price endpoint (lighter than /book)
+        for tokens missing WS data. Prioritises non-resolved markets.
         """
         self._clob_price_cache = {}
         tokens_to_fetch = []
 
         for m in markets:
+            # Skip resolved markets (0/1 prices)
+            prices = m.get("prices", [])
+            if len(prices) == 2 and prices[0] in (0.0, 1.0) and prices[1] in (0.0, 1.0):
+                continue
             for tid in m.get("token_ids", []):
-                # Skip tokens that already have WS prices
+                # Skip tokens that already have live WS prices
                 if self.ws:
                     _, ws_ask = self.ws.get_best_prices(tid)
                     if ws_ask is not None:
                         continue
+                # Also skip if already in ws_price_cache
+                ws_id = self._market_token_to_ws.get(tid)
+                if tid in self._ws_price_cache or (ws_id and ws_id in self._ws_price_cache):
+                    continue
                 tokens_to_fetch.append(tid)
 
         if not tokens_to_fetch:
             return
 
         fetched = 0
+        empty = 0
         for token_id in tokens_to_fetch:
             try:
+                # Use /price endpoint (lighter than /book, returns just the price)
                 resp = requests.get(
-                    f"{CLOB_API}/book",
-                    params={"token_id": token_id},
-                    timeout=5,
+                    f"{CLOB_API}/price",
+                    params={"token_id": token_id, "side": "buy"},
+                    timeout=2,
                 )
                 if resp.status_code == 200:
                     data = resp.json()
-                    asks = data.get("asks", [])
-                    if asks:
-                        best_ask = float(asks[0].get("price", 0))
-                        if best_ask > 0:
-                            self._clob_price_cache[token_id] = best_ask
+                    # /price returns {"price": "0.935"} or similar
+                    price_val = data.get("price")
+                    if price_val is not None:
+                        p = float(price_val)
+                        if p > 0:
+                            self._clob_price_cache[token_id] = p
                             fetched += 1
+                        else:
+                            empty += 1
+                    else:
+                        empty += 1
                 elif resp.status_code == 429:
-                    # Rate limited — stop fetching, use what we have
                     print(f"[MOMENTUM] CLOB REST rate limited after {fetched} fetches", flush=True)
                     break
             except Exception:
                 pass
 
-        if fetched > 0:
-            print(f"[MOMENTUM] CLOB REST: fetched {fetched}/{len(tokens_to_fetch)} prices", flush=True)
+        print(f"[MOMENTUM] CLOB REST: {fetched} prices, {empty} empty "
+              f"({len(tokens_to_fetch)} tokens queried)", flush=True)
 
     def _check_5m_boundary(self) -> list[dict]:
         """Fast targeted discovery when a new 5m epoch starts.
@@ -1084,9 +1166,11 @@ class MomentumEngine:
         if not markets:
             return 0
 
-        # Fetch real-time CLOB prices for tokens missing WS data.
-        # This runs once per cycle (not per-token) to avoid rate limits.
-        self._fetch_clob_prices_batch(markets)
+        # Fetch real-time CLOB prices periodically (not every 1s scan cycle).
+        # 31 REST calls at 2s timeout = ~6s worst case, so run every 10s.
+        if now - self._last_clob_fetch >= self._clob_fetch_interval:
+            self._fetch_clob_prices_batch(markets)
+            self._last_clob_fetch = now
 
         # Diagnostic: log price source stats every 30 scans (~30s)
         if self.scans_completed % 30 == 1:
@@ -1116,13 +1200,13 @@ class MomentumEngine:
                   f"ws_cache={len(self._ws_price_cache)} map={len(self._ws_to_market_token)} "
                   f"(total {total} tokens)", flush=True)
 
-        # Every 15s: dump all live prices for active (non-resolved) markets
-        if self.scans_completed % 15 == 1:
+        # Every 30s: dump prices for markets above 60¢ (tradeable range)
+        if self.scans_completed % 30 == 1:
             price_lines = []
             for m in markets:
                 prices_raw = m.get("prices", [])
                 if len(prices_raw) == 2 and prices_raw[0] in (0.0, 1.0) and prices_raw[1] in (0.0, 1.0):
-                    continue  # skip resolved
+                    continue
                 for oi in range(min(2, len(m.get("token_ids", [])))):
                     tid = m["token_ids"][oi]
                     lp = self.get_live_price(tid)
@@ -1130,15 +1214,15 @@ class MomentumEngine:
                     outcome = m["outcomes"][oi] if oi < len(m.get("outcomes", [])) else "?"
                     src = "live" if lp is not None else "gamma"
                     p = lp if lp is not None else gp
-                    if p is not None and p > 0.5:  # only show the "high" side
+                    if p is not None and p > 0.60:
+                        gp_str = f" gamma={gp*100:.1f}¢" if gp is not None else ""
                         price_lines.append(
                             f"  {m['coin'].upper()}_{m['interval']} {outcome}: "
-                            f"{p*100:.1f}¢ ({src}) gamma={gp*100:.1f}¢" if gp else
-                            f"  {m['coin'].upper()}_{m['interval']} {outcome}: {p*100:.1f}¢ ({src})"
+                            f"{p*100:.1f}¢ ({src}){gp_str}"
                         )
             if price_lines:
-                print(f"[MOMENTUM] Live prices (>{50}¢):", flush=True)
-                for line in price_lines[:20]:
+                print(f"[MOMENTUM] Prices >60¢ ({len(price_lines)}):", flush=True)
+                for line in price_lines[:16]:
                     print(line, flush=True)
 
         entered = 0
@@ -1220,16 +1304,24 @@ class MomentumEngine:
                         continue
 
                 # --- GUARD: Upward-only re-entry ---
-                # Key difference: compare against LAST buy price, not first
+                # Key difference: compare against LAST buy price, not first.
+                # With a LIVE price source (ws/clob_rest), allow re-entry at
+                # the same price since it's a fresh observation. With stale
+                # gamma prices, require strictly higher to avoid spamming
+                # the same static price every scan cycle.
                 if market_key in self.entered_markets:
                     last_buy_price = self.entered_markets[market_key]
-                    if price <= last_buy_price:
-                        # Price is at or below last buy — don't chase
-                        print(f"  REJECT upward_only: {price*100:.1f}¢ <= last_buy {last_buy_price*100:.1f}¢ for {_mkt_label} {outcome}", flush=True)
-                        continue
+                    if _price_src == "gamma":
+                        # Stale source: require strictly higher
+                        if price <= last_buy_price:
+                            continue  # silent — this fires every cycle
                     else:
-                        print(f"[MOMENTUM] Re-entry OK ({coin.upper()} {outcome}): "
-                              f"price {price*100:.1f}¢ > last buy {last_buy_price*100:.1f}¢", flush=True)
+                        # Live source: require higher (not equal — equal means
+                        # the market hasn't moved, no new signal)
+                        if price <= last_buy_price:
+                            continue
+                    print(f"[MOMENTUM] Re-entry OK ({coin.upper()} {outcome}): "
+                          f"price {price*100:.1f}¢ > last buy {last_buy_price*100:.1f}¢ ({_price_src})", flush=True)
 
                 # --- ENTER THE TRADE ---
                 trade_amount = self.coin_bet_amounts.get(coin, self.bet_amount)
