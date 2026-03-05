@@ -101,7 +101,7 @@ INTERVAL_PRICE_BRACKETS: dict[str, list[tuple[float, float]]] = {
 }
 
 # How often to poll prices (seconds)
-POLL_INTERVAL = int(os.getenv("MOMENTUM_POLL_INTERVAL", "10"))
+POLL_INTERVAL = int(os.getenv("MOMENTUM_POLL_INTERVAL", "1"))
 
 # Max entries per market (same as copy trader default)
 MAX_ENTRIES_PER_MARKET = int(os.getenv("COPY_MAX_ENTRIES_PER_MARKET", "2"))
@@ -792,6 +792,13 @@ class MomentumEngine:
         self.trade_history: list = []
         self.scans_completed = 0
 
+        # Market discovery cache — REST calls are slow, WebSocket prices are fast.
+        # Only re-discover markets every N seconds; use cached list + WS prices
+        # for the fast per-second price checks.
+        self._cached_markets: list = []
+        self._last_market_discovery = 0.0
+        self._market_discovery_interval = 30  # re-discover every 30s
+
         # Resolution
         self.last_resolution_check = 0
         self.resolution_check_interval = 60
@@ -900,7 +907,14 @@ class MomentumEngine:
         self.scans_completed += 1
         self._refresh_ws_tokens()
 
-        markets = discover_active_markets()
+        # Use cached markets for fast WS-driven price checks.
+        # Only re-discover via REST every _market_discovery_interval seconds.
+        now = time.time()
+        if now - self._last_market_discovery >= self._market_discovery_interval or not self._cached_markets:
+            self._cached_markets = discover_active_markets()
+            self._last_market_discovery = now
+
+        markets = self._cached_markets
         if not markets:
             return 0
 
