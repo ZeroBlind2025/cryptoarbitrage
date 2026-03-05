@@ -94,12 +94,10 @@ MAX_ENTRY_PRICE = float(os.getenv("MOMENTUM_MAX_ENTRY_PRICE", "0.989"))
 #
 # 5m  bracket: 80-<99¢ (upper exclusive — 99¢+ filtered out)
 # 15m bracket: 76-<99¢
-# 60m bracket: 85-99¢ (unchanged)
 # ---------------------------------------------------------------------------
 INTERVAL_PRICE_BRACKETS: dict[str, list[tuple[float, float]]] = {
     "5m":  [(0.80, 0.99)],
     "15m": [(0.76, 0.99)],
-    "60m": [(0.85, 0.99)],
 }
 
 # How often to poll prices (seconds)
@@ -126,7 +124,7 @@ COIN_SLUG_NAMES = {
     "sol": "solana",
     "xrp": "xrp",
 }
-INTERVALS = ["5m", "15m", "60m"]
+INTERVALS = ["5m", "15m"]
 
 # Interval detection patterns for question text
 # e.g. "9:00AM-9:15AM" = 15m, "9:00AM-9:05AM" = 5m, "12PM" (hourly) = 60m
@@ -815,7 +813,7 @@ class MomentumEngine:
             for ivl, brackets in sorted(self.interval_price_brackets.items()):
                 ranges = " | ".join(f"{lo*100:.0f}-{hi*100:.0f}¢" for lo, hi in brackets)
                 print(f"    {ivl}: {ranges}")
-            other = [i for i in ["5m", "15m", "60m"] if i not in self.interval_price_brackets]
+            other = [i for i in INTERVALS if i not in self.interval_price_brackets]
             if other:
                 print(f"    {', '.join(other)}: global range ({self.min_entry_price*100:.0f}-{self.max_entry_price*100:.0f}¢)")
         print(f"  Re-entry: upward only (current > last buy)")
