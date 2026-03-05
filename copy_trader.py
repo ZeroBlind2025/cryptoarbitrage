@@ -6,7 +6,7 @@ POLY ALGO - Algorithmic trader following a specific trader's crypto bets
 Monitors a target trader's activity and copies their trades on crypto markets
 (15, 30, and 60 minute timeframes).
 
-Target: 0xd0d6053c3c37e727402d84c14069780d360993aa
+Target: configured via COPY_TARGET_ADDRESS env var (default: 0xd0d6053c3c37e727402d84c14069780d360993aa)
 
 Usage:
     python copy_trader.py              # Dry run mode (preview only)
@@ -52,7 +52,7 @@ except ImportError:
 # =============================================================================
 
 # Target trader to copy
-TARGET_ADDRESS = "0xd0d6053c3c37e727402d84c14069780d360993aa"
+TARGET_ADDRESS = os.getenv("COPY_TARGET_ADDRESS", "0xd0d6053c3c37e727402d84c14069780d360993aa")
 
 # Your credentials (from environment)
 FUNDER_ADDRESS = os.getenv("POLYMARKET_FUNDER_ADDRESS", os.getenv("POLYGON_ADDRESS", ""))
