@@ -1289,12 +1289,9 @@ class CopyTrader:
                 if sell_price > 0 and shares > 0:
                     proceeds = sell_price * shares
                     pnl = proceeds - amount_spent
-                elif entry_price > 0:
-                    # dry run with no live bid — estimate flat
-                    proceeds = amount_spent
-                    pnl = 0.0
                 else:
-                    proceeds = 0.0
+                    # No live bid available — return capital flat so balance/equity don't drop
+                    proceeds = amount_spent
                     pnl = 0.0
 
                 position["result"] = "SOLD"
