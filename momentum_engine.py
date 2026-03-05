@@ -333,6 +333,9 @@ def discover_active_markets() -> list[dict]:
     now_ts = int(time.time())
 
     # --- 5m / 15m: unix-timestamp based ---
+    # Polymarket slug timestamps follow floor-aligned unix seconds:
+    #   5m:  Math.floor(now / 300000) * 300  (i.e. floor to 300s boundary)
+    #   15m: Math.floor(now / 900000) * 900  (i.e. floor to 900s boundary)
     ts_slug_configs = [
         ("5m", 300), ("15m", 900),
     ]
@@ -343,9 +346,11 @@ def discover_active_markets() -> list[dict]:
         coin_full = COIN_SLUG_NAMES.get(coin_abbr, coin_abbr)
         for tag, window_secs in ts_slug_configs:
             base_ts = (now_ts // window_secs) * window_secs
-            # Check next, current, and previous window
-            # Next window may already be listed on Polymarket ahead of time
-            for ts in [base_ts + window_secs, base_ts, base_ts - window_secs]:
+            # Check next, current, and TWO previous windows.
+            # "Half Missing" fix: Polymarket keeps the previous interval open
+            # for a few minutes while the new one starts. Check 2 back to catch
+            # markets that are still settling.
+            for ts in [base_ts + window_secs, base_ts, base_ts - window_secs, base_ts - 2 * window_secs]:
                 slug_variants = [f"{coin_abbr}-updown-{tag}-{ts}"]
                 if coin_full != coin_abbr:
                     slug_variants.append(f"{coin_full}-updown-{tag}-{ts}")
@@ -503,9 +508,9 @@ def discover_active_markets() -> list[dict]:
     for coin_abbr in CRYPTO_COINS:
         coin_name = COIN_SLUG_NAMES.get(coin_abbr, coin_abbr)
         for tag, window_secs in interval_configs:
-            # Next + current + previous window (next may already be listed)
+            # Next + current + 2 previous windows (settling markets stay open)
             base_ts = (now_ts // window_secs) * window_secs
-            timestamps = [base_ts + window_secs, base_ts, base_ts - window_secs]
+            timestamps = [base_ts + window_secs, base_ts, base_ts - window_secs, base_ts - 2 * window_secs]
 
             for ts in timestamps:
                 # Try BOTH abbreviated and full coin names
@@ -517,13 +522,11 @@ def discover_active_markets() -> list[dict]:
 
                 for slug_pattern in slug_variants:
                     try:
+                        # Don't filter active/closed for exact slug lookups —
+                        # settling markets may have active=false but still be tradeable
                         resp = requests.get(
                             f"{GAMMA_API}/markets",
-                            params={
-                                "slug": slug_pattern,
-                                "active": "true",
-                                "closed": "false",
-                            },
+                            params={"slug": slug_pattern},
                             timeout=10,
                         )
                         if resp.status_code == 200:
@@ -569,9 +572,14 @@ def discover_active_markets() -> list[dict]:
         time.sleep(0.02)
 
     # ================================================================
-    # Strategy 3: Broad /markets fallback
-    # Fetch recent active markets and filter by "Up or Down" keyword.
+    # Strategy 3: Broad /markets search with question-text filtering
+    # This is the most reliable discovery method — fetch active markets
+    # and filter locally for crypto "Up or Down" markets by question text.
+    # Uses the same approach proven by Polymarket's own discovery scripts.
     # ================================================================
+    _ASSET_NAMES = ["Bitcoin", "Ethereum", "Solana", "XRP",
+                    "bitcoin", "ethereum", "solana", "xrp"]
+    broad_found = 0
     try:
         response = requests.get(
             f"{GAMMA_API}/markets",
@@ -582,14 +590,44 @@ def discover_active_markets() -> list[dict]:
         all_markets = response.json()
 
         for raw in all_markets:
-            question = (raw.get("question") or "").lower()
+            question = raw.get("question") or ""
             slug = (raw.get("slug") or "").lower()
-            if "up or down" not in question and "updown" not in slug:
-                continue
-            _add_market(raw)
+            # Filter: must be a crypto updown market
+            q_lower = question.lower()
+            is_updown = ("up or down" in q_lower or "updown" in slug
+                         or "up-or-down" in slug)
+            is_crypto = any(a.lower() in q_lower or a.lower() in slug
+                          for a in _ASSET_NAMES[:4])
+            if is_updown and is_crypto:
+                if _add_market(raw):
+                    broad_found += 1
 
     except Exception as e:
         print(f"[MOMENTUM] Broad search error: {e}", flush=True)
+
+    # Also try fetching from /events with active+closed filter
+    # Events endpoint groups markets by event, may surface different results
+    try:
+        resp = requests.get(
+            f"{GAMMA_API}/events",
+            params={"active": "true", "closed": "false", "limit": 200},
+            timeout=15,
+        )
+        if resp.status_code == 200:
+            events = resp.json()
+            for event in events:
+                event_title = event.get("title", "")
+                event_slug = event.get("slug", "")
+                if not _is_crypto_updown_event(event_title, event_slug):
+                    continue
+                for mkt in event.get("markets", []):
+                    if _add_market(mkt):
+                        broad_found += 1
+    except Exception as e:
+        print(f"[MOMENTUM] Events broad search error: {e}", flush=True)
+
+    if broad_found > 0:
+        print(f"[MOMENTUM] Broad search: found {broad_found} new markets", flush=True)
 
     if markets:
         coins_found = set(m["coin"] for m in markets)
@@ -603,6 +641,30 @@ def discover_active_markets() -> list[dict]:
         print(f"[MOMENTUM] Discovered {len(markets)} markets: "
               f"coins={sorted(coins_found)}, intervals=[{ivl_str}]",
               flush=True)
+
+        # Explicit per-market log so gaps are visible in real time
+        import re as _re
+        for m in markets:
+            coin_upper = m["coin"].upper()
+            ivl = m["interval"]
+            slug = m.get("slug", "")
+            # Extract unix timestamp from slug (e.g. xrp-updown-15m-1772675100)
+            ts_match = _re.search(r'-(\d{10})$', slug)
+            ts_label = ts_match.group(1) if ts_match else ""
+            # Try to show human-readable time window from question
+            q = m.get("question", "")
+            time_match = _re.search(
+                r'(\d{1,2}:\d{2}\s*[AP]M\s*[-–]\s*\d{1,2}:\d{2}\s*[AP]M)',
+                q, _re.IGNORECASE
+            )
+            if not time_match:
+                time_match = _re.search(r'(\d{1,2}[AP]M\s+ET)', q, _re.IGNORECASE)
+            time_window = time_match.group(1) if time_match else ""
+            up_price = m["prices"][0] if len(m.get("prices", [])) >= 2 else "?"
+            dn_price = m["prices"][1] if len(m.get("prices", [])) >= 2 else "?"
+            print(f"  FOUND {coin_upper}_{ivl}  {time_window}  "
+                  f"ts={ts_label}  Up={up_price}  Down={dn_price}  "
+                  f"slug={slug[:50]}", flush=True)
     else:
         print("[MOMENTUM] No active updown markets found", flush=True)
 
@@ -972,6 +1034,7 @@ class MomentumEngine:
                         "outcome": outcome,
                         "market": title,
                         "slug": slug,
+                        "interval": market.get("interval", ""),
                         "entry_price": price,
                         "amount": trade_amount,
                         "potential_payout": trade_amount / price if price > 0 else 0,
@@ -1048,6 +1111,11 @@ class MomentumEngine:
             )
 
             if not result or not result.get("resolved"):
+                # Track unresolved attempts with timestamps for smarter retry
+                attempts = position.get("_resolve_attempts", 0) + 1
+                position["_resolve_attempts"] = attempts
+                if attempts == 1:
+                    position["_first_resolve_check"] = time.time()
                 continue
 
             entry_price = position.get("entry_price", 0)
@@ -1104,13 +1172,24 @@ class MomentumEngine:
                 self.positions["stats"]["losses"] = self.positions["stats"].get("losses", 0) + 1
                 print(f"[MOMENTUM] LOSS: {position['market'][:30]} | -${amount:.2f}", flush=True)
             else:
-                attempts = position.get("_resolve_attempts", 0) + 1
-                position["_resolve_attempts"] = attempts
-                if attempts < 5:
+                # Interval-aware retry: 60m markets need much longer to settle
+                # than 5m/15m. Use time-based threshold instead of fixed attempts.
+                first_check = position.get("_first_resolve_check", time.time())
+                elapsed_mins = (time.time() - first_check) / 60
+                # Max wait: 15 min for 5m, 30 min for 15m, 120 min for 60m
+                interval = position.get("interval", "")
+                if interval == "5m":
+                    max_wait_mins = 15
+                elif interval == "15m":
+                    max_wait_mins = 30
+                else:
+                    max_wait_mins = 120  # 60m markets can take a while
+                if elapsed_mins < max_wait_mins:
                     continue
                 pnl = 0
                 position["result"] = "UNKNOWN"
                 position["pnl"] = 0
+                print(f"[MOMENTUM] UNKNOWN after {elapsed_mins:.0f}min: {position['market'][:30]}", flush=True)
 
             # Update totals
             self.positions["stats"]["total_pnl"] = self.positions["stats"].get("total_pnl", 0) + pnl

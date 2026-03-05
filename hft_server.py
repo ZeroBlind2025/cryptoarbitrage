@@ -265,6 +265,7 @@ def discover_markets() -> list[dict]:
             base_ts + 900,    # Next window
             base_ts + 1800,   # +30 min
             base_ts - 900,    # Previous (might still be active)
+            base_ts - 1800,   # 2 windows back (settling)
         ]
 
         # Search for each crypto symbol
@@ -275,11 +276,7 @@ def discover_markets() -> list[dict]:
                 try:
                     resp = requests.get(
                         f"{GAMMA_API}/markets",
-                        params={
-                            "slug": slug_pattern,
-                            "active": "true",
-                            "closed": "false",
-                        },
+                        params={"slug": slug_pattern},
                         timeout=10
                     )
                     if resp.status_code == 200:
@@ -318,7 +315,7 @@ def discover_markets() -> list[dict]:
                 all_markets = resp.json()
                 for raw in all_markets:
                     slug = raw.get("slug", "")
-                    if "updown-15m" in slug.lower() or "-15m-" in slug.lower():
+                    if "updown" in slug.lower() or "up-or-down" in slug.lower():
                         # Check if we already have this market
                         if not any(m["slug"] == slug for m in markets):
                             market_data = parse_market_data(raw)

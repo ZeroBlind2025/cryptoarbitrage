@@ -170,9 +170,10 @@ class MarketDiscovery:
         slugs_to_try = []
         for coin in coin_slugs:
             for tag, window_secs in interval_configs:
-                # Only the CURRENT window — the one we're inside right now
+                # Current + next + 2 previous windows (settling markets stay open)
                 base_ts = (now_ts // window_secs) * window_secs
-                slugs_to_try.append(f"{coin}-updown-{tag}-{base_ts}")
+                for offset in [window_secs, 0, -window_secs, -2 * window_secs]:
+                    slugs_to_try.append(f"{coin}-updown-{tag}-{base_ts + offset}")
 
         print(f"    Generated {len(slugs_to_try)} event slugs to check")
 
