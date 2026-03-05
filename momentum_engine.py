@@ -924,6 +924,9 @@ class MomentumEngine:
                 # Market is closed or about to close — skip
                 continue
 
+            # Build a short label for rejection logging
+            _mkt_label = f"{coin.upper()}_{market['interval']} {slug[:30]}"
+
             # Check each side (outcome 0 and 1)
             for oi in range(2):
                 outcome = market["outcomes"][oi]
@@ -947,6 +950,10 @@ class MomentumEngine:
                     if price < self.min_entry_price or price > self.max_entry_price:
                         continue
 
+                # --- Price qualifies! Log that we're evaluating this candidate ---
+                _price_src = "ws" if live_price else "gamma"
+                print(f"[MOMENTUM] CANDIDATE {_mkt_label} {outcome} @ {price*100:.1f}¢ ({_price_src})", flush=True)
+
                 # Key by (condition_id, token_id) — stable across API ordering changes
                 market_key = (condition_id, token_id)
 
@@ -955,11 +962,13 @@ class MomentumEngine:
                 opposite_key = (condition_id, other_token_id)
                 if opposite_key in self.entered_markets:
                     self.trades_skipped += 1
+                    print(f"  REJECT opposite_held: already hold other side of {_mkt_label}", flush=True)
                     continue
 
                 # --- GUARD: Max entries per market ---
                 if market_key in self.market_entry_count:
                     if self.market_entry_count[market_key] >= self.max_entries_per_market:
+                        print(f"  REJECT max_entries: {self.market_entry_count[market_key]}/{self.max_entries_per_market} for {_mkt_label} {outcome}", flush=True)
                         continue
 
                 # --- GUARD: Upward-only re-entry ---
@@ -968,6 +977,7 @@ class MomentumEngine:
                     last_buy_price = self.entered_markets[market_key]
                     if price <= last_buy_price:
                         # Price is at or below last buy — don't chase
+                        print(f"  REJECT upward_only: {price*100:.1f}¢ <= last_buy {last_buy_price*100:.1f}¢ for {_mkt_label} {outcome}", flush=True)
                         continue
                     else:
                         print(f"[MOMENTUM] Re-entry OK ({coin.upper()} {outcome}): "
