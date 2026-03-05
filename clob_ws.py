@@ -322,6 +322,18 @@ class CLOBWebSocket:
 
         self.price_changes += 1
 
+        # One-time diagnostic: compare WS asset_id format vs our subscribed token_ids
+        if self.price_changes <= 3 and self._subscribed_tokens:
+            sample_sub = next(iter(self._subscribed_tokens))
+            match = "MATCH" if asset_id in self._subscribed_tokens else "NO MATCH"
+            print(f"[CLOB WS DIAG] asset_id={asset_id[:60]}... "
+                  f"subscribed_sample={sample_sub[:60]}... → {match}",
+                  flush=True)
+            if match == "NO MATCH":
+                # Show full IDs to debug format mismatch
+                print(f"[CLOB WS DIAG] FULL asset_id  = {asset_id}", flush=True)
+                print(f"[CLOB WS DIAG] FULL subscribed= {sample_sub}", flush=True)
+
         changes = data.get("price_changes", [data])  # Might be single or array
         if not isinstance(changes, list):
             changes = [changes]
