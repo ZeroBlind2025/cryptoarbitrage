@@ -1226,9 +1226,30 @@ class CopyTrader:
             title = position.get("market", "Unknown")[:50]
             outcome = position.get("outcome", "?")
 
+            # Derive target's sell price from the sell event (usdcSize / size)
+            target_usdc = float(sell.get("usdcSize") or sell.get("usdc_size") or sell.get("amount") or 0)
+            target_shares = float(sell.get("size") or 1)
+            target_sell_price = (target_usdc / target_shares) if target_shares > 0 and target_usdc > 0 else None
+
+            # WS live bid as fallback
+            ws_bid = None
+            if self.ws and token_id:
+                ws_bid, _ = self.ws.get_best_prices(token_id)
+                if not ws_bid and token_id not in getattr(self.ws, '_subscribed_tokens', set()):
+                    # Token not subscribed yet — subscribe and give WS a moment to populate
+                    self.ws.subscribe([token_id])
+                    time.sleep(1.5)
+                    ws_bid, _ = self.ws.get_best_prices(token_id)
+
+            # Best available price: target's sell price → WS bid → None
+            best_price = target_sell_price or ws_bid
+
             print(f"\n[ALGO] TARGET SELL DETECTED!")
             print(f"       Market: {title}")
             print(f"       Selling: {shares:.2f} shares of {outcome}")
+            if best_price:
+                src = "target price" if target_sell_price else "WS bid"
+                print(f"       Price: {best_price*100:.1f}¢ ({src})")
 
             trade_record = {
                 "id": f"sell_{sell_id}",
@@ -1244,22 +1265,14 @@ class CopyTrader:
             }
 
             if self.dry_run:
-                live_bid = None
-                if self.ws and token_id:
-                    live_bid, _ = self.ws.get_best_prices(token_id)
-                if live_bid:
-                    trade_record["price"] = live_bid
-                    print(f"       DRY RUN - would sell @ {live_bid*100:.1f}¢ (live bid)")
-                else:
-                    print(f"       DRY RUN - would sell position")
+                if best_price:
+                    trade_record["price"] = best_price
                 trade_record["status"] = "dry_run"
                 copied += 1
             else:
                 if token_id and self.client and shares > 0:
-                    live_bid = None
-                    if self.ws:
-                        live_bid, _ = self.ws.get_best_prices(token_id)
                     buffer = PRICE_BUFFER_BPS / 10000
+                    live_bid = ws_bid  # already fetched above
                     if live_bid:
                         min_price = max(live_bid * (1 - buffer), 0.01)
                         print(f"       Sell limit: {min_price:.4f} (live bid {live_bid:.4f} - {PRICE_BUFFER_BPS}bps)")
@@ -1268,9 +1281,10 @@ class CopyTrader:
                     fill = place_sell(self.client, token_id, shares, min_price=min_price)
                     if fill.get("success"):
                         trade_record["status"] = "filled"
-                        if fill.get("fill_price"):
-                            trade_record["price"] = fill["fill_price"]
-                            print(f"       SELL EXECUTED! Fill: {fill['fill_price']:.4f}")
+                        fill_price = fill.get("fill_price") or best_price
+                        if fill_price:
+                            trade_record["price"] = fill_price
+                            print(f"       SELL EXECUTED! Fill: {fill_price:.4f}")
                         else:
                             print(f"       SELL EXECUTED!")
                         copied += 1
