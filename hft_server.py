@@ -1802,8 +1802,8 @@ def api_copy_download():
     # Create CSV
     output = StringIO()
     fieldnames = [
-        "timestamp", "resolved_at", "source", "market", "direction", "outcome",
-        "amount", "entry_price", "result", "won", "pnl",
+        "timestamp", "closed_at", "source", "market", "direction", "outcome",
+        "amount", "entry_price", "sell_price", "result", "won", "pnl",
         "winning_outcome", "condition_id", "token_id"
     ]
     writer = csv.DictWriter(output, fieldnames=fieldnames, extrasaction='ignore')
@@ -1825,25 +1825,32 @@ def api_copy_download():
         else:
             direction = outcome
 
-        # Properly handle won=None (unknown) vs won=True/False
+        # won: handle SOLD positions and True/False/None
+        result = pos.get("result", "UNKNOWN")
         won_val = pos.get("won")
-        if won_val is True:
+        if result == "SOLD":
+            won_str = "SOLD"
+        elif won_val is True:
             won_str = "YES"
         elif won_val is False:
             won_str = "NO"
         else:
             won_str = "UNKNOWN"
 
+        # closed_at: prefer resolved_at, fall back to sold_at
+        closed_at = pos.get("resolved_at") or pos.get("sold_at", "")
+
         row = {
             "timestamp": pos.get("timestamp", ""),
-            "resolved_at": pos.get("resolved_at", ""),
+            "closed_at": closed_at,
             "source": pos.get("source", "copy_trader"),
             "market": pos.get("market", ""),
             "direction": direction,
             "outcome": outcome,
             "amount": pos.get("amount", 0),
             "entry_price": pos.get("entry_price") or pos.get("price", 0),
-            "result": pos.get("result", "UNKNOWN"),
+            "sell_price": pos.get("sell_price", ""),
+            "result": result,
             "won": won_str,
             "pnl": pos.get("pnl", 0),
             "winning_outcome": pos.get("winning_outcome", ""),

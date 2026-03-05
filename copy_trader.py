@@ -1300,6 +1300,7 @@ class CopyTrader:
                     del self.market_entry_count[market_key]
                 self.positions.setdefault("resolved", []).append(position)
                 save_positions(self.positions)
+                trade_record["pnl"] = pnl
                 print(f"       Position closed. PnL: ${pnl:+.2f} | Balance: ${self.positions['stats'].get('balance', 0):.2f}")
 
             self.trade_history.append(trade_record)
