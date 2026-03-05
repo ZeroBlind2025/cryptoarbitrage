@@ -92,13 +92,13 @@ MAX_ENTRY_PRICE = float(os.getenv("MOMENTUM_MAX_ENTRY_PRICE", "0.989"))
 # at least ONE bracket to qualify.  Intervals not listed here use the global
 # MIN_ENTRY_PRICE / MAX_ENTRY_PRICE range.
 #
-# 5m  sweet spot: 0.85-0.95 (94-96% WR, best ROI in dataset)
-# 15m sweet spots: 0.70-0.80 (80% WR, 8.8% ROI) + 0.90-0.99
-# 0.80-0.85 is a dead zone across both windows — excluded.
+# 5m  bracket: 80-<99¢ (upper exclusive — 99¢+ filtered out)
+# 15m bracket: 76-<99¢
+# 60m bracket: 85-99¢ (unchanged)
 # ---------------------------------------------------------------------------
 INTERVAL_PRICE_BRACKETS: dict[str, list[tuple[float, float]]] = {
-    "5m":  [(0.85, 0.95)],
-    "15m": [(0.70, 0.80), (0.90, 0.99)],
+    "5m":  [(0.80, 0.99)],
+    "15m": [(0.76, 0.99)],
     "60m": [(0.85, 0.99)],
 }
 
@@ -1121,12 +1121,28 @@ class MomentumEngine:
             )
 
             if not result or not result.get("resolved"):
-                # Track unresolved attempts with timestamps for smarter retry
-                attempts = position.get("_resolve_attempts", 0) + 1
-                position["_resolve_attempts"] = attempts
-                if attempts == 1:
-                    position["_first_resolve_check"] = time.time()
-                continue
+                # Fallback: use live WebSocket price for resolution
+                # If price has hit an extreme (≤0.02 or ≥0.98), the market
+                # has effectively settled even if the API hasn't flagged it.
+                # This is critical for 60m markets which were never in the
+                # copy trader and may not resolve via target-trader checks.
+                live_price = self.get_live_price(token_id) if token_id else None
+                if live_price is not None and (live_price >= 0.98 or live_price <= 0.02):
+                    our_token_won = live_price >= 0.98
+                    print(f"[MOMENTUM] Price-based resolution: {position['market'][:30]} "
+                          f"| price={live_price:.4f} → {'WIN' if our_token_won else 'LOSS'}", flush=True)
+                    result = {
+                        "resolved": True,
+                        "our_token_won": our_token_won,
+                        "winning_outcome": our_outcome if our_token_won else None,
+                    }
+                else:
+                    # Track unresolved attempts with timestamps for smarter retry
+                    attempts = position.get("_resolve_attempts", 0) + 1
+                    position["_resolve_attempts"] = attempts
+                    if attempts == 1:
+                        position["_first_resolve_check"] = time.time()
+                    continue
 
             entry_price = position.get("entry_price", 0)
             amount = position.get("amount", 0)
