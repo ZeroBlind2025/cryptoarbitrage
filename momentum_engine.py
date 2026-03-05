@@ -101,7 +101,7 @@ INTERVAL_PRICE_BRACKETS: dict[str, list[tuple[float, float]]] = {
 }
 
 # How often to poll prices (seconds)
-POLL_INTERVAL = int(os.getenv("MOMENTUM_POLL_INTERVAL", "10"))
+POLL_INTERVAL = int(os.getenv("MOMENTUM_POLL_INTERVAL", "1"))
 
 # Max entries per market (same as copy trader default)
 MAX_ENTRIES_PER_MARKET = int(os.getenv("COPY_MAX_ENTRIES_PER_MARKET", "2"))
