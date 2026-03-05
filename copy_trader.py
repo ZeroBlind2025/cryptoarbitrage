@@ -1307,6 +1307,12 @@ class CopyTrader:
                     stats = self.positions["stats"]
                     stats["total_pnl"] = stats.get("total_pnl", 0.0) + pnl
                     stats["balance"] = stats.get("balance", ALGO_STARTING_BALANCE) + proceeds
+                    if sell_price > 0:
+                        # Only count as win/loss when we have an actual price
+                        if pnl > 0:
+                            stats["wins"] = stats.get("wins", 0) + 1
+                        else:
+                            stats["losses"] = stats.get("losses", 0) + 1
                     open_staked = sum(p.get("amount", 0) for p in self.positions.get("open", []) if p is not position)
                     stats.setdefault("balance_history", []).append({
                         "timestamp": trade_record["timestamp"],
@@ -1690,6 +1696,14 @@ class CopyTrader:
             elif result == "LOSS":
                 coin_data[coin]["losses"] += 1
                 coin_data[coin]["results"].append("L")
+            elif result == "SOLD" and pos.get("sell_price", 0) > 0:
+                # Early sell — count as win/loss based on actual PnL
+                if pnl > 0:
+                    coin_data[coin]["wins"] += 1
+                    coin_data[coin]["results"].append("W")
+                else:
+                    coin_data[coin]["losses"] += 1
+                    coin_data[coin]["results"].append("L")
 
         # Process open positions (count + deployed, no pnl yet)
         for pos in open_positions:
