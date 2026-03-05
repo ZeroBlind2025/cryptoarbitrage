@@ -363,33 +363,76 @@ def get_market_resolution(condition_id: str = "", slug: str = "", token_id: str 
 def get_active_crypto_tokens() -> list[str]:
     """Fetch token IDs for currently active crypto updown markets.
 
-    Queries the Gamma API for open crypto markets and returns all CLOB
-    token IDs so the WebSocket can subscribe to real-time prices.
+    Uses multiple strategies to find crypto markets:
+      1. Targeted slug_contains queries for each crypto coin (most reliable)
+      2. Broad /markets fetch with client-side filtering (fallback)
+
+    Returns all CLOB token IDs so the WebSocket can subscribe to real-time prices.
     """
-    try:
-        response = requests.get(
-            f"{GAMMA_API}/markets",
-            params={"closed": "false", "limit": 50},
-            timeout=10,
-        )
-        response.raise_for_status()
-        markets = response.json()
-        token_ids = []
-        for m in markets:
-            slug = (m.get("slug") or m.get("conditionId") or "").lower()
-            question = (m.get("question") or "").lower()
-            # Only crypto updown markets
-            if not any(p in slug or p in question for p in CRYPTO_SLUGS):
+    token_ids = []
+    seen_cids = set()
+
+    def _extract_tokens(markets_list):
+        for m in markets_list:
+            cid = m.get("conditionId") or m.get("condition_id") or ""
+            if cid in seen_cids:
                 continue
-            # Collect both token IDs (Up and Down)
+            slug = (m.get("slug") or "").lower()
+            question = (m.get("question") or "").lower()
+            combined = slug + " " + question
+            # Must be crypto updown
+            is_crypto = any(p in combined for p in CRYPTO_SLUGS)
+            is_updown = ("up or down" in combined or "updown" in combined
+                         or "up-or-down" in combined)
+            if not (is_crypto and is_updown):
+                continue
+            seen_cids.add(cid)
             clob_ids = m.get("clobTokenIds") or []
             if isinstance(clob_ids, str):
-                clob_ids = json.loads(clob_ids) if clob_ids.startswith("[") else [clob_ids]
+                try:
+                    clob_ids = json.loads(clob_ids)
+                except (json.JSONDecodeError, ValueError):
+                    clob_ids = [clob_ids] if clob_ids else []
             token_ids.extend(clob_ids)
-        return token_ids
-    except Exception as e:
-        print(f"[ALGO] Error fetching active crypto tokens: {e}")
-        return []
+
+    # Strategy 1: Targeted slug_contains queries (finds crypto markets directly)
+    slug_terms = [
+        "btc-updown", "eth-updown", "sol-updown", "xrp-updown",
+        "bitcoin-updown", "ethereum-updown", "solana-updown",
+    ]
+    for term in slug_terms:
+        try:
+            resp = requests.get(
+                f"{GAMMA_API}/markets",
+                params={
+                    "slug_contains": term,
+                    "active": "true",
+                    "closed": "false",
+                    "limit": 100,
+                },
+                timeout=10,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                if isinstance(data, list):
+                    _extract_tokens(data)
+        except Exception:
+            pass
+
+    # Strategy 2: Broad fetch (catches anything missed)
+    if not token_ids:
+        try:
+            response = requests.get(
+                f"{GAMMA_API}/markets",
+                params={"active": "true", "closed": "false", "limit": 200},
+                timeout=10,
+            )
+            response.raise_for_status()
+            _extract_tokens(response.json())
+        except Exception as e:
+            print(f"[ALGO] Error fetching active crypto tokens: {e}")
+
+    return token_ids
 
 
 def get_profile_name(wallet_address: str) -> str:

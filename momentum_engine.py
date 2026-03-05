@@ -762,7 +762,7 @@ class MomentumEngine:
         # WebSocket for live prices
         self.ws: Optional["CLOBWebSocket"] = None
         self.last_ws_refresh = 0
-        self.ws_refresh_interval = 300
+        self.ws_refresh_interval = 30
 
     def start(self):
         """Initialize the momentum engine."""
@@ -826,25 +826,73 @@ class MomentumEngine:
             print(f"[MOMENTUM] WebSocket start failed: {e}", flush=True)
             self.ws = None
 
-    def _refresh_ws_tokens(self):
-        """Subscribe to active crypto tokens."""
+    def _refresh_ws_tokens(self, force: bool = False):
+        """Subscribe to active crypto tokens from discovered markets.
+
+        Uses the momentum engine's own discovered markets (which are
+        comprehensive) instead of get_active_crypto_tokens() which only
+        fetches 50 generic markets from Gamma.
+        """
         if not self.ws:
             return
         now = time.time()
-        if now - self.last_ws_refresh < self.ws_refresh_interval:
+        if not force and now - self.last_ws_refresh < self.ws_refresh_interval:
             return
         self.last_ws_refresh = now
-        token_ids = get_active_crypto_tokens()
+
+        # Collect token IDs from our discovered markets (most reliable source)
+        token_ids = []
+        for m in self._cached_markets:
+            token_ids.extend(m.get("token_ids", []))
+
+        # Fallback to generic fetch only if we have no cached markets yet
+        if not token_ids:
+            token_ids = get_active_crypto_tokens()
+
         if token_ids:
             self.ws.subscribe(token_ids)
-            print(f"[MOMENTUM] WebSocket subscribed to {len(token_ids)} tokens", flush=True)
+            print(f"[MOMENTUM] WebSocket subscribed to {len(token_ids)} tokens "
+                  f"from {len(self._cached_markets)} markets", flush=True)
 
     def get_live_price(self, token_id: str) -> Optional[float]:
-        """Get real-time best ask from WebSocket."""
-        if not self.ws or not token_id:
+        """Get real-time price, trying WebSocket first then CLOB REST.
+
+        Returns best_ask (the price you'd pay to buy).
+        Falls back to CLOB REST /book endpoint when WS has no data,
+        which happens when the token was recently discovered and WS
+        hasn't received a price update yet.
+        """
+        if not token_id:
             return None
-        _, best_ask = self.ws.get_best_prices(token_id)
-        return best_ask
+
+        # Try WebSocket first (sub-100ms, most accurate)
+        if self.ws:
+            _, best_ask = self.ws.get_best_prices(token_id)
+            if best_ask is not None:
+                return best_ask
+
+        # Fallback: CLOB REST /book endpoint for real-time order book
+        return self._fetch_clob_book_price(token_id)
+
+    def _fetch_clob_book_price(self, token_id: str) -> Optional[float]:
+        """Fetch best ask from CLOB REST API /book endpoint."""
+        try:
+            resp = requests.get(
+                f"{CLOB_API}/book",
+                params={"token_id": token_id},
+                timeout=5,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                asks = data.get("asks", [])
+                if asks:
+                    # asks are sorted by price ascending; first = best ask
+                    best_ask = float(asks[0].get("price", 0))
+                    if best_ask > 0:
+                        return best_ask
+        except Exception:
+            pass
+        return None
 
     def _check_5m_boundary(self) -> list[dict]:
         """Fast targeted discovery when a new 5m epoch starts.
@@ -942,8 +990,14 @@ class MomentumEngine:
         # Only re-discover via REST every _market_discovery_interval seconds.
         now = time.time()
         if now - self._last_market_discovery >= self._market_discovery_interval or not self._cached_markets:
+            prev_count = len(self._cached_markets)
             self._cached_markets = discover_active_markets()
             self._last_market_discovery = now
+
+            # Force WS resubscription when markets change so new tokens
+            # get live prices immediately instead of waiting 30s
+            if len(self._cached_markets) != prev_count:
+                self._refresh_ws_tokens(force=True)
 
         markets = self._cached_markets
         if not markets:
@@ -977,9 +1031,19 @@ class MomentumEngine:
                 other_token_id = market["token_ids"][1 - oi]
                 gamma_price = market["prices"][oi]
 
-                # Get best available price
+                # Get best available price (WS → CLOB REST → Gamma)
                 live_price = self.get_live_price(token_id)
-                price = live_price if live_price else gamma_price
+                if live_price is not None:
+                    price = live_price
+                    # Distinguish WS vs CLOB REST source
+                    if self.ws:
+                        _, ws_ask = self.ws.get_best_prices(token_id)
+                        _price_src = "ws" if ws_ask is not None else "clob_rest"
+                    else:
+                        _price_src = "clob_rest"
+                else:
+                    price = gamma_price
+                    _price_src = "gamma"
 
                 # --- FILTER: Price must be in range ---
                 # Use per-interval brackets if defined, else global min/max
@@ -994,7 +1058,6 @@ class MomentumEngine:
                         continue
 
                 # --- Price qualifies! Log that we're evaluating this candidate ---
-                _price_src = "ws" if live_price else "gamma"
                 print(f"[MOMENTUM] CANDIDATE {_mkt_label} {outcome} @ {price*100:.1f}¢ ({_price_src})", flush=True)
 
                 # Key by (condition_id, token_id) — stable across API ordering changes
