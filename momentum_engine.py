@@ -767,6 +767,16 @@ class MomentumEngine:
         # CLOB REST price cache — populated once per scan cycle
         self._clob_price_cache: dict[str, float] = {}
 
+        # WS live price cache — populated directly by WS callback.
+        # Keyed by the EXACT asset_id the WS server sends back (which may
+        # differ from the token_ids in our discovered markets).
+        self._ws_price_cache: dict[str, float] = {}  # asset_id -> best_ask
+
+        # Bidirectional token ID map: ws_asset_id <-> our_token_id
+        # Built once after first WS prices arrive.
+        self._ws_to_market_token: dict[str, str] = {}
+        self._market_token_to_ws: dict[str, str] = {}
+
     def start(self):
         """Initialize the momentum engine."""
         balance = self.positions.get("stats", {}).get("balance", ALGO_STARTING_BALANCE)
@@ -813,18 +823,23 @@ class MomentumEngine:
         if self.entered_markets:
             print(f"[MOMENTUM] Resumed {len(self.entered_markets)} active entries from open positions", flush=True)
 
-    def _on_ws_price(self, token_id: str, bid: float, ask: float):
-        """Log every WS price update for visibility."""
-        # Reverse-lookup which market/outcome this token belongs to
-        label = token_id[:16]
-        for m in self._cached_markets:
-            tids = m.get("token_ids", [])
-            if token_id in tids:
-                idx = tids.index(token_id)
-                outcome = m["outcomes"][idx] if idx < len(m.get("outcomes", [])) else "?"
-                label = f"{m['coin'].upper()}_{m['interval']} {outcome}"
-                break
-        print(f"[WS PRICE] {label}: bid={bid:.3f} ask={ask:.3f}", flush=True)
+    def _on_ws_price(self, ws_asset_id: str, bid: float, ask: float):
+        """Handle WS price update — cache it and try to map to our markets."""
+        self._ws_price_cache[ws_asset_id] = ask
+
+        # Try to build the bidirectional map if not yet mapped
+        if ws_asset_id not in self._ws_to_market_token:
+            # Direct match: ws_asset_id IS one of our market token_ids
+            for m in self._cached_markets:
+                tids = m.get("token_ids", [])
+                if ws_asset_id in tids:
+                    self._ws_to_market_token[ws_asset_id] = ws_asset_id
+                    self._market_token_to_ws[ws_asset_id] = ws_asset_id
+                    idx = tids.index(ws_asset_id)
+                    outcome = m["outcomes"][idx] if idx < len(m.get("outcomes", [])) else "?"
+                    print(f"[WS MAP] Mapped {ws_asset_id[:20]}... → "
+                          f"{m['coin'].upper()}_{m['interval']} {outcome}", flush=True)
+                    break
 
     def _start_ws(self):
         """Start WebSocket for real-time prices."""
@@ -878,21 +893,38 @@ class MomentumEngine:
             print(f"[MOMENTUM] WebSocket subscribed to {len(token_ids)} tokens "
                   f"from {len(self._cached_markets)} markets", flush=True)
 
-    def get_live_price(self, token_id: str) -> Optional[float]:
-        """Get real-time price from WS or the per-cycle CLOB REST cache.
+            # One-time diagnostic: log full token ID format for debugging
+            if self.scans_completed <= 1 and token_ids:
+                print(f"[MOMENTUM] Token ID sample (full): {token_ids[0]}", flush=True)
+                if len(token_ids) > 1:
+                    print(f"[MOMENTUM] Token ID sample (full): {token_ids[1]}", flush=True)
 
+    def get_live_price(self, token_id: str) -> Optional[float]:
+        """Get real-time price from WS or CLOB REST cache.
+
+        Tries multiple lookups to handle token ID format mismatches
+        between Gamma API and the WS server.
         Returns best_ask (the price you'd pay to buy).
         """
         if not token_id:
             return None
 
-        # Try WebSocket first (sub-100ms, most accurate)
+        # 1. Direct WS book lookup (token_id matches WS asset_id)
         if self.ws:
             _, best_ask = self.ws.get_best_prices(token_id)
             if best_ask is not None:
                 return best_ask
 
-        # Try CLOB REST cache (populated once per scan cycle)
+        # 2. WS price cache via mapped asset_id
+        ws_id = self._market_token_to_ws.get(token_id)
+        if ws_id and ws_id in self._ws_price_cache:
+            return self._ws_price_cache[ws_id]
+
+        # 3. Direct WS price cache (in case token_id == ws_asset_id)
+        if token_id in self._ws_price_cache:
+            return self._ws_price_cache[token_id]
+
+        # 4. CLOB REST cache (populated once per scan cycle)
         return self._clob_price_cache.get(token_id)
 
     def _fetch_clob_prices_batch(self, markets: list[dict]):
@@ -1058,18 +1090,56 @@ class MomentumEngine:
 
         # Diagnostic: log price source stats every 30 scans (~30s)
         if self.scans_completed % 30 == 1:
-            ws_count = 0
-            clob_count = len(self._clob_price_cache)
-            if self.ws:
-                for m in markets:
-                    for tid in m.get("token_ids", []):
+            ws_direct = 0
+            ws_mapped = 0
+            clob_count = 0
+            gamma_count = 0
+            for m in markets:
+                for tid in m.get("token_ids", []):
+                    if self.ws:
                         _, ask = self.ws.get_best_prices(tid)
                         if ask is not None:
-                            ws_count += 1
-            total_tokens = sum(len(m.get("token_ids", [])) for m in markets)
-            gamma_count = total_tokens - ws_count - clob_count
-            print(f"[MOMENTUM] Price sources: ws={ws_count} clob_rest={clob_count} "
-                  f"gamma={max(0, gamma_count)} (total {total_tokens} tokens)", flush=True)
+                            ws_direct += 1
+                            continue
+                    ws_id = self._market_token_to_ws.get(tid)
+                    if ws_id and ws_id in self._ws_price_cache:
+                        ws_mapped += 1
+                    elif tid in self._ws_price_cache:
+                        ws_direct += 1
+                    elif tid in self._clob_price_cache:
+                        clob_count += 1
+                    else:
+                        gamma_count += 1
+            total = ws_direct + ws_mapped + clob_count + gamma_count
+            print(f"[MOMENTUM] Price sources: ws_direct={ws_direct} ws_mapped={ws_mapped} "
+                  f"clob_rest={clob_count} gamma={gamma_count} | "
+                  f"ws_cache={len(self._ws_price_cache)} map={len(self._ws_to_market_token)} "
+                  f"(total {total} tokens)", flush=True)
+
+        # Every 15s: dump all live prices for active (non-resolved) markets
+        if self.scans_completed % 15 == 1:
+            price_lines = []
+            for m in markets:
+                prices_raw = m.get("prices", [])
+                if len(prices_raw) == 2 and prices_raw[0] in (0.0, 1.0) and prices_raw[1] in (0.0, 1.0):
+                    continue  # skip resolved
+                for oi in range(min(2, len(m.get("token_ids", [])))):
+                    tid = m["token_ids"][oi]
+                    lp = self.get_live_price(tid)
+                    gp = m["prices"][oi] if oi < len(m.get("prices", [])) else None
+                    outcome = m["outcomes"][oi] if oi < len(m.get("outcomes", [])) else "?"
+                    src = "live" if lp is not None else "gamma"
+                    p = lp if lp is not None else gp
+                    if p is not None and p > 0.5:  # only show the "high" side
+                        price_lines.append(
+                            f"  {m['coin'].upper()}_{m['interval']} {outcome}: "
+                            f"{p*100:.1f}¢ ({src}) gamma={gp*100:.1f}¢" if gp else
+                            f"  {m['coin'].upper()}_{m['interval']} {outcome}: {p*100:.1f}¢ ({src})"
+                        )
+            if price_lines:
+                print(f"[MOMENTUM] Live prices (>{50}¢):", flush=True)
+                for line in price_lines[:20]:
+                    print(line, flush=True)
 
         entered = 0
 
@@ -1099,16 +1169,20 @@ class MomentumEngine:
                 other_token_id = market["token_ids"][1 - oi]
                 gamma_price = market["prices"][oi]
 
-                # Get best available price (WS → CLOB REST → Gamma)
+                # Get best available price (WS → WS cache → CLOB REST → Gamma)
                 live_price = self.get_live_price(token_id)
                 if live_price is not None:
                     price = live_price
-                    # Distinguish WS vs CLOB REST source
+                    # Determine source for logging
+                    _price_src = "gamma"  # default
                     if self.ws:
                         _, ws_ask = self.ws.get_best_prices(token_id)
-                        _price_src = "ws" if ws_ask is not None else "clob_rest"
-                    else:
-                        _price_src = "clob_rest"
+                        if ws_ask is not None:
+                            _price_src = "ws"
+                        elif token_id in self._ws_price_cache or self._market_token_to_ws.get(token_id) in self._ws_price_cache:
+                            _price_src = "ws_cache"
+                        elif token_id in self._clob_price_cache:
+                            _price_src = "clob_rest"
                 else:
                     price = gamma_price
                     _price_src = "gamma"

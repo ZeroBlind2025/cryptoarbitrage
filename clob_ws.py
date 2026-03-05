@@ -234,9 +234,9 @@ class CLOBWebSocket:
         self.messages_received += 1
         self.last_message_time = datetime.now()
 
-        # Log first 50 raw messages and then every 500th for diagnostics
-        if self.messages_received <= 50 or self.messages_received % 500 == 0:
-            preview = message[:200] if isinstance(message, str) else str(message)[:200]
+        # Log first 5 raw messages for format diagnostics, then every 1000th
+        if self.messages_received <= 5 or self.messages_received % 1000 == 0:
+            preview = message[:300] if isinstance(message, str) else str(message)[:300]
             print(f"[CLOB WS RAW #{self.messages_received}] {preview}", flush=True)
 
         try:
