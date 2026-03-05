@@ -34,7 +34,7 @@ except ImportError:
 try:
     from py_clob_client.client import ClobClient
     from py_clob_client.clob_types import MarketOrderArgs, OrderType
-    from py_clob_client.order_builder.constants import BUY
+    from py_clob_client.order_builder.constants import BUY, SELL
     HAS_CLOB_CLIENT = True
 except ImportError:
     HAS_CLOB_CLIENT = False
@@ -459,6 +459,31 @@ def get_latest_bets(wallet_address: str, limit: int = 20, verbose: bool = False,
         return []
 
 
+def get_latest_sells(wallet_address: str, limit: int = 20, verbose: bool = False) -> list:
+    """Get recent sell trades for a wallet using server-side filtering"""
+    try:
+        url = f"{DATA_API}/activity"
+        params = {
+            "user": wallet_address,
+            "limit": limit,
+            "type": "TRADE",
+            "side": "SELL",
+        }
+        response = requests.get(url, params=params, timeout=10)
+
+        if verbose:
+            print(f"[ALGO] GET {url}?user={wallet_address[:12]}...&limit={limit}&type=TRADE&side=SELL => HTTP {response.status_code}", flush=True)
+
+        response.raise_for_status()
+        data = response.json()
+        if not data:
+            return []
+        return data if isinstance(data, list) else data.get("data", data.get("results", data.get("activities", [])))
+    except Exception as e:
+        print(f"[ALGO] Error fetching sell activity: {e}", flush=True)
+        return []
+
+
 def is_crypto_market(bet: dict) -> bool:
     """Check if bet is on a crypto market (15, 30, or 60 min)"""
     slug = bet.get("slug", "").lower()
@@ -582,6 +607,53 @@ def place_bet(client: "ClobClient", token_id: str, amount: float, max_price: flo
         return {}
 
 
+def place_sell(client: "ClobClient", token_id: str, size: float, min_price: float = 0) -> dict:
+    """Place a sell order for `size` shares of token_id.
+
+    Uses a GTC limit order at min_price so we don't sell for less than the
+    current market value. Falls back to FOK market sell if no min_price given.
+    """
+    try:
+        if min_price and min_price > 0:
+            limit_price = max(round(min_price, 4), 0.01)
+            print(f"[ALGO] Sell limit: {size:.2f} shares @ min {limit_price:.4f}")
+            order = client.create_order(
+                token_id=token_id,
+                price=limit_price,
+                size=round(size, 2),
+                side=SELL,
+            )
+            result = client.post_order(order)
+        else:
+            print(f"[ALGO] WARNING: No min_price, using FOK market sell")
+            order = MarketOrderArgs(
+                token_id=token_id,
+                amount=size,
+                side=SELL,
+                order_type=OrderType.FOK
+            )
+            signed_order = client.create_market_order(order)
+            result = client.post_order(signed_order, OrderType.FOK)
+
+        fill_info = {"success": True}
+        if isinstance(result, dict):
+            status = result.get("status", "").lower()
+            if status in ("rejected", "failed", "expired"):
+                print(f"[ALGO] Sell order {status}: {result}")
+                return {}
+            shares_filled = float(result.get("size") or result.get("filledSize") or 0)
+            usdc_filled = float(result.get("matchedAmount") or result.get("amount") or 0)
+            if shares_filled > 0:
+                fill_info["fill_price"] = usdc_filled / shares_filled
+                fill_info["shares"] = shares_filled
+                fill_info["usdc"] = usdc_filled
+            print(f"[ALGO] Sell fill details: {result}")
+        return fill_info
+    except Exception as e:
+        print(f"[ALGO] Sell order error: {e}")
+        return {}
+
+
 # =============================================================================
 # COPY TRADING LOGIC
 # =============================================================================
@@ -593,7 +665,8 @@ class CopyTrader:
         self.dry_run = dry_run
         self.crypto_only = crypto_only
         self.client: Optional["ClobClient"] = None
-        self.copied_trades: set = set()  # Track copied trade IDs
+        self.copied_trades: set = set()  # Track copied buy trade IDs
+        self.copied_sells: set = set()   # Track copied sell trade IDs
         self.copied_sizes: set = set()  # Track (condition_id, target_size) to dedup re-scans
         self.entered_markets: dict = {}  # (condition_id, outcome_index) → entry_price
         self.market_entry_count: dict = {}  # (condition_id, outcome_index) → number of entries
@@ -751,6 +824,13 @@ class CopyTrader:
                 self.copied_sizes.add((cid, str(oi), str(round(float(target_size), 2))))
         print(f"[ALGO] Marked {len(self.copied_trades)} existing trades ({len(self.copied_sizes)} unique sizes) as seen. Waiting for NEW trades...")
 
+        # Snapshot existing sells so we don't mirror historical ones on startup
+        existing_sells = get_latest_sells(TARGET_ADDRESS, limit=50)
+        for sell in existing_sells:
+            sell_id = sell.get("id") or f"{sell.get('conditionId')}_{sell.get('timestamp')}_SELL"
+            self.copied_sells.add(sell_id)
+        print(f"[ALGO] Marked {len(self.copied_sells)} existing sell trades as seen.")
+
         # Seed entered_markets and market_entry_count from existing open
         # positions so we don't chase markets we already have exposure to
         # after a restart.
@@ -828,6 +908,9 @@ class CopyTrader:
 
         # Periodically refresh WebSocket token subscriptions (new markets open)
         self._refresh_ws_tokens()
+
+        # Check for sells first — close positions before potentially re-entering
+        copied += self._check_and_copy_sells()
 
         # Get target's recent bets — always verbose to diagnose scanning
         bets = get_latest_bets(TARGET_ADDRESS, verbose=True)
@@ -908,13 +991,7 @@ class CopyTrader:
                 self.trades_skipped += 1
                 continue
 
-            # Price band filter: only trade when entry price is in the profitable range
-            MIN_ENTRY_PRICE = 0.60
-            MAX_ENTRY_PRICE = 0.989
-            if price and (price < MIN_ENTRY_PRICE or price > MAX_ENTRY_PRICE):
-                print(f"[ALGO] Skip (price {price:.3f} outside {MIN_ENTRY_PRICE}-{MAX_ENTRY_PRICE}): {title} | {outcome}")
-                self.trades_skipped += 1
-                continue
+            # Price band filter disabled — copy all prices exactly as target trades
 
             # Check if we already have this position
             # Try multiple field names for condition_id (API may use camelCase or snake_case)
@@ -926,39 +1003,13 @@ class CopyTrader:
             if outcome_index is None:
                 outcome_index = 0
 
-            # --- GUARD 1: Block chasing, allow conviction ---
-            # If we already hold this side, only re-enter when the current
-            # price is ABOVE our initial entry (market moving in our favour).
-            # Block when price is at or below entry — that's throwing good
-            # money after bad (e.g. 47¢→35¢→20¢ spiral).
+            # GUARD 1 disabled — copy re-entries exactly as target trades
             market_key = (condition_id, outcome_index)
             if condition_id and market_key in self.entered_markets:
-                initial_entry = self.entered_markets[market_key]
-                if initial_entry and price <= initial_entry:
-                    print(f"[ALGO] Skip (chasing — price {price:.3f} <= entry {initial_entry:.3f}): {title} | {outcome}")
-                    self.trades_skipped += 1
-                    continue
-                else:
-                    print(f"[ALGO] Re-entry OK (conviction — price {price:.3f} > entry {initial_entry:.3f}): {title} | {outcome}")
+                print(f"[ALGO] Re-entry: {title} | {outcome} (price {price:.3f})")
 
-            # --- GUARD 2: Cap re-entries per market window ---
-            # Prevent piling into the same condition_id beyond max_entries_per_market.
-            # This reduces EXTRA_COPY duplicates where the target's multiple buys
-            # on the same window cause us to copy each one.
-            if condition_id and market_key in self.market_entry_count:
-                count = self.market_entry_count[market_key]
-                if count >= self.max_entries_per_market:
-                    print(f"[ALGO] Skip (max {self.max_entries_per_market} entries reached for this market): {title} | {outcome}")
-                    self.trades_skipped += 1
-                    continue
-
-            # --- GUARD 3: Block opposite side ---
-            # Don't bet both Up and Down on the same market. Betting both
-            # sides cancels out any edge and just pays the vig.
-            if condition_id and has_opposite_position(self.entered_markets, condition_id, outcome_index):
-                print(f"[ALGO] Skip (opposite side already entered): {title} | {outcome}")
-                self.trades_skipped += 1
-                continue
+            # GUARD 2 disabled — no re-entry cap
+            # GUARD 3 disabled — opposite side block removed
 
             # Legacy size-based dedup kept as a secondary safety net
             target_size = bet.get("size", 0)
@@ -1102,6 +1153,161 @@ class CopyTrader:
                     print(f"[ALGO] Callback error: {e}")
 
             self.trades_copied += copied
+
+        return copied
+
+    def _check_and_copy_sells(self) -> int:
+        """Check for target's sell trades and mirror them against our open positions."""
+        sells = get_latest_sells(TARGET_ADDRESS, verbose=True)
+        if not sells:
+            return 0
+
+        copied = 0
+        for sell in sells:
+            sell_id = sell.get("id") or f"{sell.get('conditionId')}_{sell.get('timestamp')}_SELL"
+
+            if sell_id in self.copied_sells:
+                continue
+            self.copied_sells.add(sell_id)
+
+            # Filter for crypto markets
+            if self.crypto_only and not is_crypto_market(sell):
+                continue
+
+            condition_id = sell.get("conditionId") or sell.get("condition_id") or ""
+            outcome_index = sell.get("outcomeIndex")
+            if outcome_index is None:
+                outcome_index = sell.get("outcome_index", 0)
+            market_key = (condition_id, outcome_index)
+
+            # Only act if we hold this position
+            if market_key not in self.entered_markets:
+                continue
+
+            # Find the matching open position
+            position = None
+            for p in self.positions.get("open", []):
+                if p.get("condition_id") == condition_id and p.get("outcome_index") == outcome_index:
+                    position = p
+                    break
+
+            if not position:
+                continue
+
+            token_id = position.get("token_id") or sell.get("asset", "")
+            shares = position.get("potential_payout", 0)
+            title = position.get("market", "Unknown")[:50]
+            outcome = position.get("outcome", "?")
+
+            print(f"\n[ALGO] TARGET SELL DETECTED!")
+            print(f"       Market: {title}")
+            print(f"       Selling: {shares:.2f} shares of {outcome}")
+
+            trade_record = {
+                "id": f"sell_{sell_id}",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "market": title,
+                "slug": position.get("slug", ""),
+                "outcome": outcome,
+                "side": "SELL",
+                "shares": shares,
+                "coin": detect_coin(position.get("slug", ""), title),
+                "target_trader": self.target_name,
+                "source": "copy_trader",
+            }
+
+            if self.dry_run:
+                live_bid = None
+                if self.ws and token_id:
+                    live_bid, _ = self.ws.get_best_prices(token_id)
+                if live_bid:
+                    trade_record["price"] = live_bid
+                    print(f"       DRY RUN - would sell @ {live_bid*100:.1f}¢ (live bid)")
+                else:
+                    print(f"       DRY RUN - would sell position")
+                trade_record["status"] = "dry_run"
+                copied += 1
+            else:
+                if token_id and self.client and shares > 0:
+                    live_bid = None
+                    if self.ws:
+                        live_bid, _ = self.ws.get_best_prices(token_id)
+                    buffer = PRICE_BUFFER_BPS / 10000
+                    if live_bid:
+                        min_price = max(live_bid * (1 - buffer), 0.01)
+                        print(f"       Sell limit: {min_price:.4f} (live bid {live_bid:.4f} - {PRICE_BUFFER_BPS}bps)")
+                    else:
+                        min_price = 0
+                    fill = place_sell(self.client, token_id, shares, min_price=min_price)
+                    if fill.get("success"):
+                        trade_record["status"] = "filled"
+                        if fill.get("fill_price"):
+                            trade_record["price"] = fill["fill_price"]
+                            print(f"       SELL EXECUTED! Fill: {fill['fill_price']:.4f}")
+                        else:
+                            print(f"       SELL EXECUTED!")
+                        copied += 1
+                    else:
+                        print(f"       SELL FAILED!")
+                        trade_record["status"] = "failed"
+                else:
+                    print(f"       No token ID, client, or shares to sell")
+                    trade_record["status"] = "error"
+
+            # If sold (or dry run), close the position and record PnL
+            if trade_record["status"] in ["filled", "dry_run"]:
+                sell_price = trade_record.get("price", 0)
+                entry_price = position.get("entry_price", 0)
+                amount_spent = position.get("amount", 0)
+                if sell_price > 0 and shares > 0:
+                    proceeds = sell_price * shares
+                    pnl = proceeds - amount_spent
+                elif entry_price > 0:
+                    # dry run with no live bid — estimate flat
+                    proceeds = amount_spent
+                    pnl = 0.0
+                else:
+                    proceeds = 0.0
+                    pnl = 0.0
+
+                position["result"] = "SOLD"
+                position["pnl"] = pnl
+                position["sold_at"] = trade_record["timestamp"]
+                position["sell_price"] = sell_price
+
+                # Update stats
+                try:
+                    stats = self.positions["stats"]
+                    stats["total_pnl"] = stats.get("total_pnl", 0.0) + pnl
+                    stats["balance"] = stats.get("balance", ALGO_STARTING_BALANCE) + proceeds
+                    open_staked = sum(p.get("amount", 0) for p in self.positions.get("open", []) if p is not position)
+                    stats.setdefault("balance_history", []).append({
+                        "timestamp": trade_record["timestamp"],
+                        "balance": stats["balance"],
+                        "pnl": stats["total_pnl"],
+                        "equity": stats["balance"] + open_staked,
+                        "event": "sell",
+                        "detail": f"SELL {outcome} {title[:30]} pnl={pnl:+.2f}"
+                    })
+                except Exception:
+                    pass
+
+                if position in self.positions.get("open", []):
+                    self.positions["open"].remove(position)
+                if market_key in self.entered_markets:
+                    del self.entered_markets[market_key]
+                if market_key in self.market_entry_count:
+                    del self.market_entry_count[market_key]
+                self.positions.setdefault("resolved", []).append(position)
+                save_positions(self.positions)
+                print(f"       Position closed. PnL: ${pnl:+.2f} | Balance: ${self.positions['stats'].get('balance', 0):.2f}")
+
+            self.trade_history.append(trade_record)
+            if self.on_trade:
+                try:
+                    self.on_trade(trade_record)
+                except Exception as e:
+                    print(f"[ALGO] Sell callback error: {e}")
 
         return copied
 
