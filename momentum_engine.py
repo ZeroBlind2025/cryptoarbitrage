@@ -764,6 +764,9 @@ class MomentumEngine:
         self.last_ws_refresh = 0
         self.ws_refresh_interval = 30
 
+        # CLOB REST price cache — populated once per scan cycle
+        self._clob_price_cache: dict[str, float] = {}
+
     def start(self):
         """Initialize the momentum engine."""
         balance = self.positions.get("stats", {}).get("balance", ALGO_STARTING_BALANCE)
@@ -810,12 +813,26 @@ class MomentumEngine:
         if self.entered_markets:
             print(f"[MOMENTUM] Resumed {len(self.entered_markets)} active entries from open positions", flush=True)
 
+    def _on_ws_price(self, token_id: str, bid: float, ask: float):
+        """Log every WS price update for visibility."""
+        # Reverse-lookup which market/outcome this token belongs to
+        label = token_id[:16]
+        for m in self._cached_markets:
+            tids = m.get("token_ids", [])
+            if token_id in tids:
+                idx = tids.index(token_id)
+                outcome = m["outcomes"][idx] if idx < len(m.get("outcomes", [])) else "?"
+                label = f"{m['coin'].upper()}_{m['interval']} {outcome}"
+                break
+        print(f"[WS PRICE] {label}: bid={bid:.3f} ask={ask:.3f}", flush=True)
+
     def _start_ws(self):
         """Start WebSocket for real-time prices."""
         if not HAS_CLOB_WS:
             return
         try:
             self.ws = CLOBWebSocket(
+                on_price_change=self._on_ws_price,
                 on_connect=lambda: print("[MOMENTUM] WebSocket connected", flush=True),
                 on_disconnect=lambda: print("[MOMENTUM] WebSocket disconnected", flush=True),
             )
@@ -840,9 +857,16 @@ class MomentumEngine:
             return
         self.last_ws_refresh = now
 
-        # Collect token IDs from our discovered markets (most reliable source)
+        # Collect token IDs from our discovered markets (most reliable source).
+        # Skip already-resolved markets (prices 0.0/1.0) — subscribing to
+        # expired tokens triggers "INVALID OPERATION" from the WS server.
         token_ids = []
         for m in self._cached_markets:
+            prices = m.get("prices", [])
+            if len(prices) == 2:
+                # Resolved: one side is 0.0 and the other is 1.0
+                if (prices[0] in (0.0, 1.0) and prices[1] in (0.0, 1.0)):
+                    continue
             token_ids.extend(m.get("token_ids", []))
 
         # Fallback to generic fetch only if we have no cached markets yet
@@ -855,12 +879,9 @@ class MomentumEngine:
                   f"from {len(self._cached_markets)} markets", flush=True)
 
     def get_live_price(self, token_id: str) -> Optional[float]:
-        """Get real-time price, trying WebSocket first then CLOB REST.
+        """Get real-time price from WS or the per-cycle CLOB REST cache.
 
         Returns best_ask (the price you'd pay to buy).
-        Falls back to CLOB REST /book endpoint when WS has no data,
-        which happens when the token was recently discovered and WS
-        hasn't received a price update yet.
         """
         if not token_id:
             return None
@@ -871,28 +892,56 @@ class MomentumEngine:
             if best_ask is not None:
                 return best_ask
 
-        # Fallback: CLOB REST /book endpoint for real-time order book
-        return self._fetch_clob_book_price(token_id)
+        # Try CLOB REST cache (populated once per scan cycle)
+        return self._clob_price_cache.get(token_id)
 
-    def _fetch_clob_book_price(self, token_id: str) -> Optional[float]:
-        """Fetch best ask from CLOB REST API /book endpoint."""
-        try:
-            resp = requests.get(
-                f"{CLOB_API}/book",
-                params={"token_id": token_id},
-                timeout=5,
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                asks = data.get("asks", [])
-                if asks:
-                    # asks are sorted by price ascending; first = best ask
-                    best_ask = float(asks[0].get("price", 0))
-                    if best_ask > 0:
-                        return best_ask
-        except Exception:
-            pass
-        return None
+    def _fetch_clob_prices_batch(self, markets: list[dict]):
+        """Fetch real-time best-ask prices for all active markets via CLOB REST.
+
+        Called once per scan cycle. Makes one /book request per token pair
+        but only for markets that the WebSocket doesn't have prices for.
+        Caches results in _clob_price_cache for instant lookup.
+        """
+        self._clob_price_cache = {}
+        tokens_to_fetch = []
+
+        for m in markets:
+            for tid in m.get("token_ids", []):
+                # Skip tokens that already have WS prices
+                if self.ws:
+                    _, ws_ask = self.ws.get_best_prices(tid)
+                    if ws_ask is not None:
+                        continue
+                tokens_to_fetch.append(tid)
+
+        if not tokens_to_fetch:
+            return
+
+        fetched = 0
+        for token_id in tokens_to_fetch:
+            try:
+                resp = requests.get(
+                    f"{CLOB_API}/book",
+                    params={"token_id": token_id},
+                    timeout=5,
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    asks = data.get("asks", [])
+                    if asks:
+                        best_ask = float(asks[0].get("price", 0))
+                        if best_ask > 0:
+                            self._clob_price_cache[token_id] = best_ask
+                            fetched += 1
+                elif resp.status_code == 429:
+                    # Rate limited — stop fetching, use what we have
+                    print(f"[MOMENTUM] CLOB REST rate limited after {fetched} fetches", flush=True)
+                    break
+            except Exception:
+                pass
+
+        if fetched > 0:
+            print(f"[MOMENTUM] CLOB REST: fetched {fetched}/{len(tokens_to_fetch)} prices", flush=True)
 
     def _check_5m_boundary(self) -> list[dict]:
         """Fast targeted discovery when a new 5m epoch starts.
@@ -1002,6 +1051,25 @@ class MomentumEngine:
         markets = self._cached_markets
         if not markets:
             return 0
+
+        # Fetch real-time CLOB prices for tokens missing WS data.
+        # This runs once per cycle (not per-token) to avoid rate limits.
+        self._fetch_clob_prices_batch(markets)
+
+        # Diagnostic: log price source stats every 30 scans (~30s)
+        if self.scans_completed % 30 == 1:
+            ws_count = 0
+            clob_count = len(self._clob_price_cache)
+            if self.ws:
+                for m in markets:
+                    for tid in m.get("token_ids", []):
+                        _, ask = self.ws.get_best_prices(tid)
+                        if ask is not None:
+                            ws_count += 1
+            total_tokens = sum(len(m.get("token_ids", [])) for m in markets)
+            gamma_count = total_tokens - ws_count - clob_count
+            print(f"[MOMENTUM] Price sources: ws={ws_count} clob_rest={clob_count} "
+                  f"gamma={max(0, gamma_count)} (total {total_tokens} tokens)", flush=True)
 
         entered = 0
 

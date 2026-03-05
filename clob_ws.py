@@ -140,20 +140,35 @@ class CLOBWebSocket:
             self._pending_subscribe.extend(new_tokens)
 
     def _send_subscribe(self, token_ids: list[str]):
-        """Send subscription message"""
+        """Send subscription message.
+
+        Polymarket CLOB WS requires 'auth' and 'markets' fields in the
+        subscription message even when empty.  Large batches can also
+        trigger "INVALID OPERATION", so we chunk into groups of 20.
+        """
         if not token_ids:
             return
 
-        msg = {
-            "assets_ids": token_ids,
-            "type": "market"
-        }
-        try:
-            self.ws.send(json.dumps(msg))
-            self._subscribed_tokens.update(token_ids)
-            print(f"[CLOB WS] Subscribed to {len(token_ids)} tokens (total: {len(self._subscribed_tokens)})", flush=True)
-        except Exception as e:
-            print(f"[CLOB WS] Subscribe error: {e}", flush=True)
+        CHUNK_SIZE = 20
+        total_sent = 0
+        for i in range(0, len(token_ids), CHUNK_SIZE):
+            chunk = token_ids[i:i + CHUNK_SIZE]
+            msg = {
+                "auth": {},
+                "markets": [],
+                "assets_ids": chunk,
+                "type": "market",
+            }
+            try:
+                self.ws.send(json.dumps(msg))
+                self._subscribed_tokens.update(chunk)
+                total_sent += len(chunk)
+            except Exception as e:
+                print(f"[CLOB WS] Subscribe error (chunk {i//CHUNK_SIZE}): {e}", flush=True)
+                break
+
+        print(f"[CLOB WS] Subscribed to {total_sent} tokens in {(total_sent + CHUNK_SIZE - 1) // CHUNK_SIZE} chunks "
+              f"(total: {len(self._subscribed_tokens)})", flush=True)
 
     def get_book(self, token_id: str) -> Optional[OrderBookState]:
         """Get current order book state for a token"""
@@ -198,7 +213,7 @@ class CLOBWebSocket:
         """Handle connection open"""
         self.connected = True
         self.reconnect_delay = self.RECONNECT_BASE_DELAY
-        print("[CLOB WS] Connected", flush=True)
+        print(f"[CLOB WS] Connected to {self.WS_URL}", flush=True)
 
         # Send pending subscriptions
         if self._pending_subscribe:
@@ -218,6 +233,11 @@ class CLOBWebSocket:
         """Handle incoming message"""
         self.messages_received += 1
         self.last_message_time = datetime.now()
+
+        # Log first 50 raw messages and then every 500th for diagnostics
+        if self.messages_received <= 50 or self.messages_received % 500 == 0:
+            preview = message[:200] if isinstance(message, str) else str(message)[:200]
+            print(f"[CLOB WS RAW #{self.messages_received}] {preview}", flush=True)
 
         try:
             data = json.loads(message)
