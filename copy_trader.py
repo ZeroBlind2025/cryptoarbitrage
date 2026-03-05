@@ -100,6 +100,26 @@ PROFILE_API = "https://gamma-api.polymarket.com"
 # Position tracking file
 POSITIONS_FILE = Path(__file__).parent / "copy_positions.json"
 
+# Persistent trade log — one JSON object per line, append-only
+TRADE_LOG = Path(__file__).parent / "copy_trades.jsonl"
+
+
+def _log_copy_trade(event_type: str, data: dict):
+    """Append a trade event to copy_trades.jsonl.
+
+    event_type: 'buy', 'sell', 'resolved', 'dry_run_buy', 'dry_run_sell', 'failed'
+    """
+    record = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "event": event_type,
+        **data,
+    }
+    try:
+        with open(TRADE_LOG, "a") as f:
+            f.write(json.dumps(record) + "\n")
+    except Exception:
+        pass
+
 
 # =============================================================================
 # POSITION TRACKING
@@ -1098,6 +1118,11 @@ class CopyTrader:
 
             # Record trade
             self.trade_history.append(trade_record)
+            _log_copy_trade(
+                "dry_run_buy" if trade_record["status"] == "dry_run" else
+                "buy" if trade_record["status"] == "filled" else "failed_buy",
+                {k: v for k, v in trade_record.items() if k != "id"}
+            )
 
             # Save position for tracking (if trade was successful or dry run)
             if trade_record["status"] in ["filled", "dry_run"]:
@@ -1304,6 +1329,11 @@ class CopyTrader:
                 print(f"       Position closed. PnL: ${pnl:+.2f} | Balance: ${self.positions['stats'].get('balance', 0):.2f}")
 
             self.trade_history.append(trade_record)
+            _log_copy_trade(
+                "dry_run_sell" if trade_record["status"] == "dry_run" else
+                "sell" if trade_record["status"] == "filled" else "failed_sell",
+                {k: v for k, v in trade_record.items() if k != "id"}
+            )
             if self.on_trade:
                 try:
                     self.on_trade(trade_record)
@@ -1508,6 +1538,24 @@ class CopyTrader:
                 self.positions["open"].remove(position)
                 self.positions["resolved"].append(position)
                 resolved_this_check += 1
+
+                _log_copy_trade("resolved", {
+                    "market": position.get("market", ""),
+                    "slug": position.get("slug", ""),
+                    "outcome": position.get("outcome", ""),
+                    "coin": detect_coin(position.get("slug", ""), position.get("market", "")),
+                    "amount": position.get("amount", 0),
+                    "entry_price": position.get("entry_price", 0),
+                    "result": position.get("result", "UNKNOWN"),
+                    "won": won,
+                    "pnl": position.get("pnl", 0),
+                    "winning_outcome": winning_outcome,
+                    "condition_id": position.get("condition_id", ""),
+                    "token_id": position.get("token_id", ""),
+                    "opened_at": position.get("timestamp", ""),
+                    "resolved_at": position["resolved_at"],
+                    "dry_run": position.get("dry_run", False),
+                })
 
                 # Call resolution callback
                 if self.on_resolution:
