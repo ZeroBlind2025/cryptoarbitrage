@@ -247,6 +247,10 @@ def _parse_market(raw: dict) -> Optional[dict]:
     if not coin or not interval:
         return None
 
+    # Only trade intervals we're configured for
+    if interval not in INTERVALS:
+        return None
+
     # Parse market close time so we can avoid entering after close
     end_date_str = raw.get("endDate") or raw.get("end_date_iso")
     minutes_until_close = None
@@ -376,76 +380,6 @@ def discover_active_markets() -> list[dict]:
                         pass
                     time.sleep(0.02)
 
-    # --- Hourly: human-readable ET date/time slug ---
-    # Format: {coin}-up-or-down-{month}-{day}-{hour}{am/pm}-et
-    # e.g. bitcoin-up-or-down-march-3-9pm-et
-    try:
-        from zoneinfo import ZoneInfo
-    except ImportError:
-        from backports.zoneinfo import ZoneInfo
-
-    et_tz = ZoneInfo("America/New_York")
-    now_et = datetime.now(et_tz)
-
-    _MONTH_NAMES = {
-        1: "january", 2: "february", 3: "march", 4: "april",
-        5: "may", 6: "june", 7: "july", 8: "august",
-        9: "september", 10: "october", 11: "november", 12: "december",
-    }
-
-    # Hourly coin names used in slugs (full names, not abbreviations)
-    hourly_coin_names = {
-        "btc": "bitcoin", "eth": "ethereum", "sol": "solana", "xrp": "xrp",
-    }
-
-    # Check next hour, current hour, and previous hour
-    for hour_offset in [1, 0, -1]:
-        target_et = now_et + timedelta(hours=hour_offset)
-        month_name = _MONTH_NAMES[target_et.month]
-        day = target_et.day
-        hour_24 = target_et.hour
-        if hour_24 == 0:
-            hour_str = "12am"
-        elif hour_24 < 12:
-            hour_str = f"{hour_24}am"
-        elif hour_24 == 12:
-            hour_str = "12pm"
-        else:
-            hour_str = f"{hour_24 - 12}pm"
-
-        for coin_abbr in event_slug_coins:
-            coin_name = hourly_coin_names.get(coin_abbr, coin_abbr)
-            # Try both slug formats seen on Polymarket
-            hourly_slugs = [
-                f"{coin_name}-up-or-down-{month_name}-{day}-{hour_str}-et",
-                f"{coin_abbr}-up-or-down-{month_name}-{day}-{hour_str}-et",
-            ]
-            if coin_abbr == coin_name:
-                hourly_slugs = hourly_slugs[:1]  # avoid duplicate for xrp
-
-            for event_slug in hourly_slugs:
-                try:
-                    resp = requests.get(
-                        f"{GAMMA_API}/events",
-                        params={"slug": event_slug},
-                        timeout=10,
-                    )
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        events_list = data if isinstance(data, list) else [data] if isinstance(data, dict) else []
-                        for event in events_list:
-                            if not isinstance(event, dict):
-                                continue
-                            for mkt in event.get("markets", []):
-                                if _add_market(mkt):
-                                    event_slug_found += 1
-                            if "conditionId" in event:
-                                if _add_market(event):
-                                    event_slug_found += 1
-                except Exception:
-                    pass
-                time.sleep(0.02)
-
     if event_slug_found > 0:
         print(f"[MOMENTUM] Event slugs: found {event_slug_found} markets "
               f"via computed slugs", flush=True)
@@ -543,8 +477,6 @@ def discover_active_markets() -> list[dict]:
         "updown-5m", "updown-15m",
         "btc-updown", "eth-updown", "sol-updown", "xrp-updown",
         "bitcoin-updown", "ethereum-updown", "solana-updown",
-        "up-or-down",
-        "bitcoin-up-or-down", "ethereum-up-or-down", "solana-up-or-down", "xrp-up-or-down",
     ]
     slug_contains_found = 0
     for search_term in slug_search_terms:
