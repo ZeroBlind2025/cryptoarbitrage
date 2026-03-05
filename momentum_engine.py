@@ -343,7 +343,9 @@ def discover_active_markets() -> list[dict]:
         coin_full = COIN_SLUG_NAMES.get(coin_abbr, coin_abbr)
         for tag, window_secs in ts_slug_configs:
             base_ts = (now_ts // window_secs) * window_secs
-            for ts in [base_ts, base_ts - window_secs]:
+            # Check next, current, and previous window
+            # Next window may already be listed on Polymarket ahead of time
+            for ts in [base_ts + window_secs, base_ts, base_ts - window_secs]:
                 slug_variants = [f"{coin_abbr}-updown-{tag}-{ts}"]
                 if coin_full != coin_abbr:
                     slug_variants.append(f"{coin_full}-updown-{tag}-{ts}")
@@ -393,8 +395,8 @@ def discover_active_markets() -> list[dict]:
         "btc": "bitcoin", "eth": "ethereum", "sol": "solana", "xrp": "xrp",
     }
 
-    # Check current hour and previous hour
-    for hour_offset in [0, -1]:
+    # Check next hour, current hour, and previous hour
+    for hour_offset in [1, 0, -1]:
         target_et = now_et + timedelta(hours=hour_offset)
         month_name = _MONTH_NAMES[target_et.month]
         day = target_et.day
@@ -501,9 +503,9 @@ def discover_active_markets() -> list[dict]:
     for coin_abbr in CRYPTO_COINS:
         coin_name = COIN_SLUG_NAMES.get(coin_abbr, coin_abbr)
         for tag, window_secs in interval_configs:
-            # Current window + previous window (covers edge-case timing)
+            # Next + current + previous window (next may already be listed)
             base_ts = (now_ts // window_secs) * window_secs
-            timestamps = [base_ts, base_ts - window_secs]
+            timestamps = [base_ts + window_secs, base_ts, base_ts - window_secs]
 
             for ts in timestamps:
                 # Try BOTH abbreviated and full coin names
@@ -535,14 +537,15 @@ def discover_active_markets() -> list[dict]:
             time.sleep(0.02)
 
     # Also search with slug_contains for partial matches
-    # Include both full and abbreviated coin names + all intervals
+    # Prioritise short-interval terms first (5m/15m most likely to be missed)
     slug_search_terms = [
         "updown-5m", "updown-15m",
+        "btc-updown", "eth-updown", "sol-updown", "xrp-updown",
+        "bitcoin-updown", "ethereum-updown", "solana-updown",
         "up-or-down",
-        "bitcoin-updown", "ethereum-updown", "solana-updown", "xrp-updown",
-        "btc-updown", "eth-updown", "sol-updown",
         "bitcoin-up-or-down", "ethereum-up-or-down", "solana-up-or-down", "xrp-up-or-down",
     ]
+    slug_contains_found = 0
     for search_term in slug_search_terms:
         try:
             resp = requests.get(
@@ -551,7 +554,7 @@ def discover_active_markets() -> list[dict]:
                     "slug_contains": search_term,
                     "active": "true",
                     "closed": "false",
-                    "limit": 50,
+                    "limit": 100,
                 },
                 timeout=10,
             )
@@ -559,7 +562,8 @@ def discover_active_markets() -> list[dict]:
                 data = resp.json()
                 if isinstance(data, list):
                     for raw in data:
-                        _add_market(raw)
+                        if _add_market(raw):
+                            slug_contains_found += 1
         except Exception:
             pass
         time.sleep(0.02)
@@ -590,8 +594,14 @@ def discover_active_markets() -> list[dict]:
     if markets:
         coins_found = set(m["coin"] for m in markets)
         intervals_found = set(m["interval"] for m in markets)
+        # Per-interval count for debugging discovery gaps
+        interval_counts = {}
+        for m in markets:
+            ivl = m["interval"]
+            interval_counts[ivl] = interval_counts.get(ivl, 0) + 1
+        ivl_str = ", ".join(f"{k}={v}" for k, v in sorted(interval_counts.items()))
         print(f"[MOMENTUM] Discovered {len(markets)} markets: "
-              f"coins={sorted(coins_found)}, intervals={sorted(intervals_found)}",
+              f"coins={sorted(coins_found)}, intervals=[{ivl_str}]",
               flush=True)
     else:
         print("[MOMENTUM] No active updown markets found", flush=True)
