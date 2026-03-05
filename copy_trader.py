@@ -721,6 +721,7 @@ class CopyTrader:
         self.trades_copied = 0
         self.trades_skipped = 0
         self.total_spent = 0.0
+        self.total_buys = 0
 
         # Trade history (for dashboard)
         self.trade_history: list = []
@@ -1178,6 +1179,7 @@ class CopyTrader:
                     print(f"[ALGO] Callback error: {e}")
 
             self.trades_copied += copied
+            self.total_buys += copied
 
         return copied
 
@@ -1789,10 +1791,16 @@ class CopyTrader:
                 "timestamp": pos.get("timestamp", ""),
             })
 
+        sells_early = sum(1 for p in resolved_positions if p.get("result") == "SOLD")
+        finished = len(resolved_positions) - sells_early
+
         return {
             "trades_copied": self.trades_copied,
             "trades_skipped": self.trades_skipped,
             "total_spent": self._safe_float(self.total_spent),
+            "total_buys": self.total_buys,
+            "total_sells_early": sells_early,
+            "total_finished": finished,
             "open_positions": len(open_positions),
             "resolved_positions": len(resolved_positions),
             "wins": wins,

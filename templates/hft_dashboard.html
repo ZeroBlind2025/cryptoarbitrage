@@ -23,7 +23,7 @@
 
     <script type="text/babel">
         const { useState, useEffect, useCallback } = React;
-        const { LineChart, Line, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, AreaChart, Area } = Recharts;
+        const { LineChart, Line, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, AreaChart, Area, Legend } = Recharts;
 
         // Icons
         const Zap = () => <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><polygon points="13,2 3,14 12,14 11,22 21,10 12,10 13,2"/></svg>;
@@ -115,6 +115,665 @@
             );
         };
 
+        // Algo Trade Row (for poly algo trades)
+        const CopyTradeRow = ({ trade, isNew }) => {
+            const time = new Date(trade.timestamp).toLocaleTimeString();
+            const isSell = trade.side === 'SELL';
+
+            return (
+                <div className={`bg-slate-800/30 rounded-lg p-3 border border-slate-700/50 hover:border-slate-600/50 transition-all ${isNew ? 'flash-green' : ''}`}>
+                    <div className="flex items-center justify-between mb-2">
+                        <div className="flex items-center gap-2">
+                            <span className="px-2 py-0.5 text-xs rounded border font-medium bg-cyan-500/20 text-cyan-400 border-cyan-500/30">
+                                ALGO
+                            </span>
+                            <span className={`px-2 py-0.5 text-xs rounded border font-medium ${
+                                isSell ? 'bg-orange-500/20 text-orange-400 border-orange-500/30'
+                                       : 'bg-emerald-500/20 text-emerald-400 border-emerald-500/30'
+                            }`}>
+                                {isSell ? 'SELL' : 'BUY'}
+                            </span>
+                            <span className={`px-2 py-0.5 text-xs rounded border ${
+                                trade.status === 'filled' ? 'bg-green-500/20 text-green-400 border-green-500/30' :
+                                trade.status === 'dry_run' ? 'bg-blue-500/20 text-blue-400 border-blue-500/30' :
+                                'bg-red-500/20 text-red-400 border-red-500/30'
+                            }`}>
+                                {trade.status?.toUpperCase()}
+                            </span>
+                        </div>
+                        <span className="text-xs text-slate-500">{time}</span>
+                    </div>
+                    <p className="text-sm text-white truncate mb-2" title={trade.market}>
+                        {trade.market || trade.slug}
+                    </p>
+                    <div className="grid grid-cols-4 gap-2 text-xs">
+                        <div>
+                            <p className="text-slate-500">Outcome</p>
+                            <p className="text-white font-mono">{trade.outcome}</p>
+                        </div>
+                        <div>
+                            <p className="text-slate-500">{isSell ? 'Shares' : 'Amount'}</p>
+                            <p className="text-white font-mono">
+                                {isSell ? `${trade.shares?.toFixed(2)} sh` : `$${trade.amount?.toFixed(2)}`}
+                            </p>
+                        </div>
+                        <div>
+                            <p className="text-slate-500">Price</p>
+                            <p className={`font-mono ${isSell ? 'text-orange-400' : 'text-cyan-400'}`}>
+                                {trade.price ? `${(trade.price * 100).toFixed(1)}¢` : '—'}
+                            </p>
+                        </div>
+                        <div>
+                            <p className="text-slate-500">{isSell ? 'PnL' : 'Following'}</p>
+                            {isSell ? (
+                                <p className={`font-mono ${(trade.pnl || 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                                    {trade.pnl != null ? `${trade.pnl >= 0 ? '+' : ''}$${trade.pnl.toFixed(2)}` : '—'}
+                                </p>
+                            ) : (
+                                <p className="text-yellow-400 font-mono truncate" title={trade.target_trader}>
+                                    {trade.target_trader?.slice(0, 10)}...
+                                </p>
+                            )}
+                        </div>
+                    </div>
+                </div>
+            );
+        };
+
+        // Performance Chart - 3 lines: Balance, PnL, Equity
+        const BalanceChart = ({ history }) => {
+            const [timeframe, setTimeframe] = useState('1d');
+
+            const timeframes = {
+                '1h': { label: '1H', ms: 60 * 60 * 1000 },
+                '6h': { label: '6H', ms: 6 * 60 * 60 * 1000 },
+                '1d': { label: '1D', ms: 24 * 60 * 60 * 1000 },
+                '1w': { label: '1W', ms: 7 * 24 * 60 * 60 * 1000 },
+                '1m': { label: '1M', ms: 30 * 24 * 60 * 60 * 1000 },
+            };
+
+            const filteredData = React.useMemo(() => {
+                if (!history || history.length === 0) return [];
+                const now = Date.now();
+                const cutoff = now - timeframes[timeframe].ms;
+                const filtered = history
+                    .filter(h => new Date(h.timestamp).getTime() >= cutoff)
+                    .map(h => ({
+                        time: new Date(h.timestamp).getTime(),
+                        balance: h.balance,
+                        pnl: h.pnl != null ? h.pnl : null,
+                        equity: h.equity != null ? h.equity : null,
+                        label: new Date(h.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+                        event: h.event,
+                        detail: h.detail || '',
+                    }));
+                if (filtered.length === 0) {
+                    return history.map(h => ({
+                        time: new Date(h.timestamp).getTime(),
+                        balance: h.balance,
+                        pnl: h.pnl != null ? h.pnl : null,
+                        equity: h.equity != null ? h.equity : null,
+                        label: new Date(h.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+                        event: h.event,
+                        detail: h.detail || '',
+                    }));
+                }
+                return filtered;
+            }, [history, timeframe]);
+
+            // Check if we have the new fields
+            const hasPnl = filteredData.some(d => d.pnl != null);
+            const hasEquity = filteredData.some(d => d.equity != null);
+
+            const CustomTooltip = ({ active, payload }) => {
+                if (active && payload && payload.length) {
+                    const d = payload[0].payload;
+                    return (
+                        <div className="bg-slate-800 border border-slate-600 rounded-lg px-3 py-2 text-xs">
+                            <p className="text-slate-400 mb-1">{new Date(d.time).toLocaleString()}</p>
+                            {hasEquity && d.equity != null && (
+                                <p className="font-mono" style={{ color: '#f59e0b' }}>
+                                    Equity: ${d.equity.toFixed(2)}
+                                </p>
+                            )}
+                            <p className="font-mono" style={{ color: '#06b6d4' }}>
+                                Balance: ${d.balance.toFixed(2)}
+                            </p>
+                            {hasPnl && d.pnl != null && (
+                                <p className="font-mono" style={{ color: '#22c55e' }}>
+                                    PnL: {d.pnl >= 0 ? '+' : ''}${d.pnl.toFixed(2)}
+                                </p>
+                            )}
+                            {d.event !== 'init' && d.event !== 'reset' && (
+                                <p className={`mt-1 ${d.event === 'win' ? 'text-green-400' : d.event === 'loss' ? 'text-red-400' : 'text-cyan-400'}`}>
+                                    {d.event.toUpperCase()}{d.detail ? `: ${d.detail}` : ''}
+                                </p>
+                            )}
+                        </div>
+                    );
+                }
+                return null;
+            };
+
+            const renderLegend = () => (
+                <div className="flex justify-center gap-4 mt-1 text-xs">
+                    {hasEquity && (
+                        <div className="flex items-center gap-1.5">
+                            <div className="w-3 h-0.5 rounded" style={{ backgroundColor: '#f59e0b' }} />
+                            <span className="text-slate-300">Equity</span>
+                        </div>
+                    )}
+                    <div className="flex items-center gap-1.5">
+                        <div className="w-3 h-0.5 rounded" style={{ backgroundColor: '#06b6d4' }} />
+                        <span className="text-slate-300">Balance</span>
+                    </div>
+                    {hasPnl && (
+                        <div className="flex items-center gap-1.5">
+                            <div className="w-3 h-0.5 rounded" style={{ backgroundColor: '#22c55e' }} />
+                            <span className="text-slate-300">PnL</span>
+                        </div>
+                    )}
+                </div>
+            );
+
+            if (!history || history.length === 0) {
+                return (
+                    <div className="text-slate-500 text-center py-4 text-sm">
+                        No balance history yet
+                    </div>
+                );
+            }
+
+            return (
+                <div>
+                    {/* Timeframe toggles */}
+                    <div className="flex gap-1 mb-3">
+                        {Object.entries(timeframes).map(([key, { label }]) => (
+                            <button
+                                key={key}
+                                onClick={() => setTimeframe(key)}
+                                className={`px-3 py-1 text-xs rounded-md font-medium transition-all ${
+                                    timeframe === key
+                                        ? 'bg-cyan-500/20 text-cyan-400 border border-cyan-500/40'
+                                        : 'text-slate-400 hover:text-slate-300 hover:bg-slate-700/50 border border-transparent'
+                                }`}
+                            >
+                                {label}
+                            </button>
+                        ))}
+                    </div>
+
+                    {/* Chart */}
+                    <div style={{ width: '100%', height: 220 }}>
+                        <ResponsiveContainer>
+                            <LineChart data={filteredData} margin={{ top: 5, right: 5, left: 5, bottom: 5 }}>
+                                <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
+                                <XAxis
+                                    dataKey="label"
+                                    stroke="#64748b"
+                                    tick={{ fontSize: 10 }}
+                                    interval="preserveStartEnd"
+                                />
+                                <YAxis
+                                    stroke="#64748b"
+                                    tick={{ fontSize: 10 }}
+                                    domain={['auto', 'auto']}
+                                    tickFormatter={(v) => `$${v}`}
+                                />
+                                <Tooltip content={<CustomTooltip />} />
+                                {/* Equity - gold/amber - the "true" picture */}
+                                {hasEquity && (
+                                    <Line
+                                        type="monotone"
+                                        dataKey="equity"
+                                        stroke="#f59e0b"
+                                        strokeWidth={2.5}
+                                        dot={false}
+                                        activeDot={{ r: 4, stroke: '#f59e0b', fill: '#0f172a' }}
+                                        connectNulls={true}
+                                    />
+                                )}
+                                {/* Balance - cyan */}
+                                <Line
+                                    type="monotone"
+                                    dataKey="balance"
+                                    stroke="#06b6d4"
+                                    strokeWidth={1.5}
+                                    dot={false}
+                                    activeDot={{ r: 3, stroke: '#06b6d4', fill: '#0f172a' }}
+                                />
+                                {/* PnL - green - cumulative realized profit */}
+                                {hasPnl && (
+                                    <Line
+                                        type="monotone"
+                                        dataKey="pnl"
+                                        stroke="#22c55e"
+                                        strokeWidth={1.5}
+                                        dot={false}
+                                        activeDot={{ r: 3, stroke: '#22c55e', fill: '#0f172a' }}
+                                        connectNulls={true}
+                                    />
+                                )}
+                            </LineChart>
+                        </ResponsiveContainer>
+                    </div>
+                    {renderLegend()}
+                </div>
+            );
+        };
+
+        // Modal Component
+        const Modal = ({ isOpen, onClose, title, children }) => {
+            if (!isOpen) return null;
+            return (
+                <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+                    <div className="absolute inset-0 bg-black/70" onClick={onClose}></div>
+                    <div className="relative bg-slate-800 rounded-xl border border-slate-700 shadow-2xl w-full max-w-4xl max-h-[80vh] overflow-hidden">
+                        <div className="flex items-center justify-between p-4 border-b border-slate-700">
+                            <h2 className="text-xl font-bold text-white">{title}</h2>
+                            <button onClick={onClose} className="text-slate-400 hover:text-white text-2xl">&times;</button>
+                        </div>
+                        <div className="p-4 overflow-y-auto max-h-[calc(80vh-80px)]">
+                            {children}
+                        </div>
+                    </div>
+                </div>
+            );
+        };
+
+        // Algo Settings Component - Per-coin lot size controls + dynamic lot sizing
+        const AlgoSettings = ({ copyTrader, fetchData, setError }) => {
+            const [isOpen, setIsOpen] = useState(false);
+            const COINS = ['btc', 'eth', 'sol', 'xrp'];
+            const [coinAmounts, setCoinAmounts] = useState({});
+            const [saving, setSaving] = useState(false);
+            const [saveMsg, setSaveMsg] = useState('');
+
+            const isDynamic = copyTrader.dynamic_lot_sizing_enabled || false;
+
+            // Sync inputs with live data when panel opens
+            useEffect(() => {
+                if (isOpen) {
+                    const current = copyTrader.coin_bet_amounts || {};
+                    const fallback = copyTrader.bet_amount || 5;
+                    const amounts = {};
+                    COINS.forEach(c => { amounts[c] = String(current[c] || fallback); });
+                    setCoinAmounts(amounts);
+                    setSaveMsg('');
+                }
+            }, [isOpen]);
+
+            const setCoinAmt = (coin, val) => {
+                setCoinAmounts(prev => ({ ...prev, [coin]: val }));
+            };
+
+            const toggleDynamicLots = async () => {
+                try {
+                    const resp = await fetch('/api/copy-trader/dynamic-lots', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ enabled: !isDynamic }),
+                    });
+                    const result = await resp.json();
+                    if (result.success) {
+                        setSaveMsg(result.message);
+                        fetchData();
+                    } else {
+                        setSaveMsg(result.error || 'Toggle failed');
+                    }
+                } catch (e) {
+                    setSaveMsg('Error: ' + e.message);
+                }
+            };
+
+            const handleSave = async () => {
+                setSaving(true);
+                setSaveMsg('');
+                try {
+                    const current = copyTrader.coin_bet_amounts || {};
+                    const coin_bet_amounts = {};
+                    let hasChanges = false;
+                    COINS.forEach(coin => {
+                        const amt = parseFloat(coinAmounts[coin]);
+                        if (!isNaN(amt) && amt > 0 && amt !== (current[coin] || copyTrader.bet_amount)) {
+                            coin_bet_amounts[coin] = amt;
+                            hasChanges = true;
+                        }
+                    });
+
+                    if (!hasChanges) {
+                        setSaveMsg('No changes to save.');
+                        setSaving(false);
+                        return;
+                    }
+
+                    const resp = await fetch('/api/copy-trader/settings', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ coin_bet_amounts }),
+                    });
+                    const result = await resp.json();
+                    if (result.success) {
+                        setSaveMsg('Saved! ' + result.changes.join(', '));
+                        fetchData();
+                    } else {
+                        setSaveMsg(result.error || 'Save failed');
+                    }
+                } catch (e) {
+                    setSaveMsg('Error: ' + e.message);
+                }
+                setSaving(false);
+            };
+
+            return (
+                <div className="mt-4 border-t border-slate-700 pt-4">
+                    <button
+                        onClick={() => setIsOpen(!isOpen)}
+                        className="flex items-center justify-between w-full text-sm text-slate-400 hover:text-slate-300"
+                    >
+                        <span className="font-medium">Lot Sizes</span>
+                        <span className="text-xs">{isOpen ? '\u25B2' : '\u25BC'}</span>
+                    </button>
+
+                    {isOpen && (
+                        <div className="mt-3 space-y-3">
+                            {/* Dynamic Lot Sizing Toggle */}
+                            <div className="flex items-center justify-between p-2 rounded-lg bg-slate-700/30 border border-slate-600/50">
+                                <div>
+                                    <p className="text-xs text-slate-300 font-medium">Auto-Scale Lots by Win Rate</p>
+                                    <p className="text-xs text-slate-500 mt-0.5">
+                                        {isDynamic
+                                            ? 'ON: lots auto-adjust based on coin win %'
+                                            : 'OFF: manual lot sizes only'}
+                                    </p>
+                                </div>
+                                <button
+                                    onClick={toggleDynamicLots}
+                                    disabled={!copyTrader.running}
+                                    className={`px-3 py-1 text-xs rounded border transition-all ${
+                                        !copyTrader.running
+                                            ? 'bg-slate-700 text-slate-500 cursor-not-allowed border-slate-600'
+                                            : isDynamic
+                                                ? 'bg-cyan-500/20 text-cyan-400 border-cyan-500/30 hover:bg-cyan-500/30'
+                                                : 'bg-slate-600/50 text-slate-400 border-slate-500/30 hover:bg-slate-500/30'
+                                    }`}
+                                >
+                                    {isDynamic ? 'ON' : 'OFF'}
+                                </button>
+                            </div>
+
+                            {/* Dynamic lot tier explanation */}
+                            {isDynamic && (
+                                <div className="text-xs text-slate-500 p-2 rounded bg-slate-700/20 border border-slate-600/30">
+                                    <p className="font-medium text-slate-400 mb-1">Auto-Scale Tiers:</p>
+                                    <div className="grid grid-cols-2 gap-x-3 gap-y-0.5 font-mono">
+                                        <span className="text-green-400">Win {'\u2265'} 90%</span><span>$20</span>
+                                        <span className="text-green-400/70">Win {'\u2264'} 80%</span><span>$10</span>
+                                        <span className="text-slate-400">Win {'\u2264'} 75%</span><span>$5</span>
+                                        <span className="text-red-400/70">Win {'\u2264'} 70%</span><span>$2</span>
+                                        <span className="text-red-400">Win {'\u2264'} 60%</span><span>$1</span>
+                                    </div>
+                                </div>
+                            )}
+
+                            {/* Per-coin lot size inputs (manual mode) */}
+                            {!isDynamic && (
+                                <div>
+                                    <label className="text-xs text-slate-400 block mb-2">
+                                        Per-Coin Lot Size ($)
+                                        <span className="text-slate-500 ml-1">- applies to new trades only</span>
+                                    </label>
+                                    <div className="grid grid-cols-4 gap-2">
+                                        {COINS.map(coin => (
+                                            <div key={coin}>
+                                                <label className="text-xs text-slate-500 block mb-1 uppercase font-medium">{coin}</label>
+                                                <input
+                                                    type="number"
+                                                    min="0.5"
+                                                    step="0.5"
+                                                    value={coinAmounts[coin] || ''}
+                                                    onChange={(e) => setCoinAmt(coin, e.target.value)}
+                                                    className="w-full bg-slate-700/50 border border-slate-600 rounded-lg px-2 py-1.5 text-sm text-white font-mono focus:outline-none focus:border-cyan-500 text-center"
+                                                    placeholder="5.00"
+                                                />
+                                            </div>
+                                        ))}
+                                    </div>
+                                </div>
+                            )}
+
+                            {/* Quick presets: apply to all coins (manual mode only) */}
+                            {copyTrader.running && !isDynamic && (
+                                <div className="flex gap-2">
+                                    <span className="text-xs text-slate-500 self-center">All:</span>
+                                    {[5, 10, 20, 30, 40, 50].map(amt => (
+                                        <button
+                                            key={amt}
+                                            onClick={() => {
+                                                const newAmounts = {};
+                                                COINS.forEach(c => { newAmounts[c] = String(amt); });
+                                                setCoinAmounts(newAmounts);
+                                            }}
+                                            className="px-2 py-1 text-xs rounded border transition-all bg-slate-700/50 text-slate-400 border-slate-600 hover:border-slate-500"
+                                        >
+                                            ${amt}
+                                        </button>
+                                    ))}
+                                </div>
+                            )}
+
+                            {/* Save button (manual mode only) */}
+                            {!isDynamic && (
+                                <button
+                                    onClick={handleSave}
+                                    disabled={saving || !copyTrader.running}
+                                    className={`w-full py-2 rounded-lg text-sm font-medium transition-all ${
+                                        !copyTrader.running
+                                            ? 'bg-slate-700 text-slate-500 cursor-not-allowed'
+                                            : saving
+                                                ? 'bg-cyan-500/20 text-cyan-300 cursor-wait'
+                                                : 'bg-cyan-500/20 text-cyan-400 border border-cyan-500/30 hover:bg-cyan-500/30'
+                                    }`}
+                                >
+                                    {!copyTrader.running ? 'Start Algo to change settings' : saving ? 'Saving...' : 'Save Lot Sizes'}
+                                </button>
+                            )}
+
+                            {/* Feedback message */}
+                            {saveMsg && (
+                                <p className={`text-xs ${saveMsg.startsWith('Saved') || saveMsg.startsWith('Dynamic') ? 'text-green-400' : 'text-yellow-400'}`}>
+                                    {saveMsg}
+                                </p>
+                            )}
+                        </div>
+                    )}
+                </div>
+            );
+        };
+
+        // Per-Coin ROI Component - Real-time coin performance tracker with pause buttons
+        // apiPrefix: '/api/copy-trader' (default) or '/api/momentum'
+        const CoinROI = ({ coinRoi, copyTrader, fetchData, apiPrefix = '/api/copy-trader' }) => {
+            if (!coinRoi || Object.keys(coinRoi).length === 0) return null;
+
+            const [expandedCoins, setExpandedCoins] = useState({});
+            const pausedCoins = new Set(copyTrader.paused_coins || []);
+            const openByCoin = copyTrader.open_by_coin || {};
+
+            const toggleExpand = (coin) => {
+                setExpandedCoins(prev => ({ ...prev, [coin]: !prev[coin] }));
+            };
+
+            // Sort: coins with trades first (by |pnl| desc), then coins with no data
+            const sortedCoins = Object.entries(coinRoi).sort((a, b) => {
+                const aTotal = a[1].wins + a[1].losses;
+                const bTotal = b[1].wins + b[1].losses;
+                if (aTotal === 0 && bTotal > 0) return 1;
+                if (bTotal === 0 && aTotal > 0) return -1;
+                return Math.abs(b[1].pnl) - Math.abs(a[1].pnl);
+            });
+
+            const toggleCoinPause = async (coin) => {
+                const isPaused = pausedCoins.has(coin);
+                const endpoint = isPaused
+                    ? `${apiPrefix}/resume-coin`
+                    : `${apiPrefix}/pause-coin`;
+                try {
+                    await fetch(endpoint, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ coin }),
+                    });
+                    fetchData();
+                } catch (e) { console.error(e); }
+            };
+
+            const getStreakDisplay = (s) => {
+                if (!s.streak || !s.streak_type) return null;
+                const isWin = s.streak_type === 'W';
+                return (
+                    <span className={`text-xs font-mono ${isWin ? 'text-green-400' : 'text-red-400'}`}>
+                        {s.streak}{s.streak_type}
+                    </span>
+                );
+            };
+
+            const getRoiColor = (roi) => {
+                if (roi > 5) return 'text-green-400';
+                if (roi > 0) return 'text-green-400/70';
+                if (roi > -5) return 'text-red-400/70';
+                return 'text-red-400';
+            };
+
+            const getHeatBg = (roi, isPaused) => {
+                if (isPaused) return 'bg-slate-700/30 border-slate-600/50 opacity-60';
+                if (roi > 5) return 'bg-green-500/10 border-green-500/20';
+                if (roi > 0) return 'bg-green-500/5 border-green-500/10';
+                if (roi > -5) return 'bg-red-500/5 border-red-500/10';
+                return 'bg-red-500/10 border-red-500/20';
+            };
+
+            const getLotDisplay = (coin) => {
+                const amt = copyTrader.coin_bet_amounts?.[coin];
+                return amt ? `$${Number(amt).toFixed(0)}` : '$2';
+            };
+
+            const formatTime = (ts) => {
+                if (!ts) return '';
+                try {
+                    const d = new Date(ts);
+                    const now = new Date();
+                    const diffMs = now - d;
+                    const diffMins = Math.floor(diffMs / 60000);
+                    if (diffMins < 60) return `${diffMins}m ago`;
+                    const diffHrs = Math.floor(diffMins / 60);
+                    if (diffHrs < 24) return `${diffHrs}h ago`;
+                    return `${Math.floor(diffHrs / 24)}d ago`;
+                } catch { return ''; }
+            };
+
+            return (
+                <div className="mt-4 border-t border-slate-700 pt-4">
+                    <p className="text-xs text-slate-400 font-medium mb-3 uppercase tracking-wide">Coin Performance</p>
+                    <div className="space-y-2">
+                        {sortedCoins.map(([coin, s]) => {
+                            const total = s.wins + s.losses;
+                            if (total === 0 && s.open === 0) return null;
+                            const isPaused = pausedCoins.has(coin);
+                            const isExpanded = expandedCoins[coin];
+                            const coinPositions = openByCoin[coin] || [];
+                            const hasPositions = coinPositions.length > 0;
+                            return (
+                                <div key={coin} className={`rounded-lg border ${getHeatBg(s.roi, isPaused)}`}>
+                                    <div
+                                        className={`px-3 py-2 ${hasPositions ? 'cursor-pointer' : ''}`}
+                                        onClick={() => hasPositions && toggleExpand(coin)}
+                                    >
+                                        <div className="flex items-center justify-between mb-1">
+                                            <div className="flex items-center gap-2">
+                                                <span className="text-xs font-bold uppercase text-white">{coin}</span>
+                                                {isPaused && (
+                                                    <span className="text-xs text-yellow-400 font-medium">PAUSED</span>
+                                                )}
+                                                {getStreakDisplay(s)}
+                                                {s.open > 0 && (
+                                                    <span className="text-xs text-yellow-400/70">
+                                                        {s.open} open {hasPositions ? (isExpanded ? '\u25B2' : '\u25BC') : ''}
+                                                    </span>
+                                                )}
+                                            </div>
+                                            <div className="flex items-center gap-2">
+                                                <span className="text-xs font-mono text-slate-400">{getLotDisplay(coin)}</span>
+                                                <span className={`text-sm font-mono font-bold ${getRoiColor(s.roi)}`}>
+                                                    {s.roi >= 0 ? '+' : ''}{s.roi.toFixed(1)}%
+                                                </span>
+                                                {copyTrader.running && (
+                                                    <button
+                                                        onClick={(e) => { e.stopPropagation(); toggleCoinPause(coin); }}
+                                                        className={`px-2 py-0.5 text-xs rounded border transition-all ${
+                                                            isPaused
+                                                                ? 'bg-green-500/20 text-green-400 border-green-500/30 hover:bg-green-500/30'
+                                                                : 'bg-yellow-500/20 text-yellow-400 border-yellow-500/30 hover:bg-yellow-500/30'
+                                                        }`}
+                                                        title={isPaused
+                                                            ? `Resume trading ${coin.toUpperCase()}`
+                                                            : `Pause ${coin.toUpperCase()} - stop new trades for this coin`}
+                                                    >
+                                                        {isPaused ? '\u25B6' : '\u23F8'}
+                                                    </button>
+                                                )}
+                                            </div>
+                                        </div>
+                                        <div className="flex items-center justify-between text-xs">
+                                            <span className="text-slate-400">
+                                                {s.wins}W/{s.losses}L
+                                                {total > 0 && <span className="text-slate-500 ml-1">({s.win_rate.toFixed(0)}%)</span>}
+                                            </span>
+                                            <span className={`font-mono ${s.pnl >= 0 ? 'text-green-400/80' : 'text-red-400/80'}`}>
+                                                {s.pnl >= 0 ? '+' : ''}${s.pnl.toFixed(2)}
+                                            </span>
+                                            <span className="text-slate-500 font-mono">
+                                                ${s.deployed.toFixed(0)} deployed
+                                            </span>
+                                        </div>
+                                    </div>
+                                    {isExpanded && hasPositions && (
+                                        <div className="border-t border-slate-600/30 px-3 py-2 space-y-1.5">
+                                            <div className="flex items-center justify-between mb-1">
+                                                <span className="text-xs text-slate-500 uppercase tracking-wide">Open Positions</span>
+                                                <button
+                                                    onClick={() => toggleExpand(coin)}
+                                                    className="text-xs text-slate-500 hover:text-slate-300 px-1.5 py-0.5 rounded border border-slate-600/30 hover:border-slate-500/50 transition-all"
+                                                >
+                                                    Collapse
+                                                </button>
+                                            </div>
+                                            {coinPositions.map((pos, i) => (
+                                                <div key={i} className="bg-slate-800/50 rounded px-2.5 py-1.5 text-xs">
+                                                    <div className="flex items-center justify-between">
+                                                        <span className="text-slate-300 truncate mr-2" style={{maxWidth: '60%'}}>
+                                                            {pos.market}
+                                                        </span>
+                                                        <span className="text-slate-500 whitespace-nowrap">{formatTime(pos.timestamp)}</span>
+                                                    </div>
+                                                    <div className="flex items-center justify-between mt-0.5">
+                                                        <span className="text-blue-400">{pos.outcome}</span>
+                                                        <span className="text-slate-400 font-mono">
+                                                            {(pos.entry_price * 100).toFixed(1)}\u00A2 \u00B7 ${pos.amount.toFixed(2)}
+                                                        </span>
+                                                    </div>
+                                                </div>
+                                            ))}
+                                        </div>
+                                    )}
+                                </div>
+                            );
+                        })}
+                    </div>
+                </div>
+            );
+        };
+
         // Main Dashboard
         function HFTDashboard() {
             const [data, setData] = useState(null);
@@ -122,28 +781,20 @@
             const [isRunning, setIsRunning] = useState(false);
             const [error, setError] = useState(null);
             const [newTradeIds, setNewTradeIds] = useState(new Set());
+            const [showMarketsModal, setShowMarketsModal] = useState(false);
 
-            // Fetch data — use ref to avoid stale closures in setInterval
-            const dataRef = React.useRef(null);
-            const fetchingRef = React.useRef(false);
-
+            // Fetch data
             const fetchData = useCallback(async () => {
-                // Skip if previous fetch is still in-flight (prevents stacking)
-                if (fetchingRef.current) return;
-                fetchingRef.current = true;
                 try {
-                    const controller = new AbortController();
-                    const timeout = setTimeout(() => controller.abort(), 5000);
-                    const response = await fetch('/api/data', { signal: controller.signal });
-                    clearTimeout(timeout);
+                    const response = await fetch('/api/data');
+                    if (!response.ok) throw new Error(`HTTP ${response.status}`);
                     const newData = await response.json();
 
                     // Track new trades for animation
-                    const prev = dataRef.current;
-                    if (prev) {
+                    if (data) {
                         const oldIds = new Set([
-                            ...(prev.trades?.demo || []).map(t => t.trade_id),
-                            ...(prev.trades?.live || []).map(t => t.trade_id),
+                            ...(data.trades?.demo || []).map(t => t.trade_id),
+                            ...(data.trades?.live || []).map(t => t.trade_id),
                         ]);
                         const currentIds = [
                             ...(newData.trades?.demo || []).map(t => t.trade_id),
@@ -156,24 +807,19 @@
                         }
                     }
 
-                    dataRef.current = newData;
                     setData(newData);
                     setIsRunning(newData.status?.is_running || false);
                     setError(null);
                 } catch (err) {
-                    if (err.name !== 'AbortError') {
-                        setError('Failed to fetch data');
-                    }
-                } finally {
-                    fetchingRef.current = false;
+                    setError('Failed to fetch data');
                 }
-            }, []);
+            }, [data]);
 
             useEffect(() => {
                 fetchData();
                 const interval = setInterval(fetchData, 1000);
                 return () => clearInterval(interval);
-            }, [fetchData]);
+            }, []);
 
             // Start/Stop scanner
             const toggleScanner = async () => {
@@ -211,8 +857,10 @@
 
             const status = data?.status || {};
             const scanner = data?.scanner || {};
-            const trades = data?.trades || { demo: [], live: [] };
-            const allTrades = [...(trades.demo || []), ...(trades.live || [])]
+            const trades = data?.trades || { demo: [], live: [], copy: [] };
+            const copyTrader = data?.copy_trader || {};
+            const momentum = data?.momentum || {};
+            const allTrades = [...(trades.demo || []), ...(trades.live || []), ...(trades.copy || []), ...(trades.momentum || [])]
                 .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
 
             return (
@@ -301,7 +949,7 @@
                                     </h2>
                                     <div className="flex gap-2">
                                         <span className="text-xs text-slate-400">
-                                            {trades.demo?.length || 0} demo / {trades.live?.length || 0} live
+                                            {trades.demo?.length || 0} demo / {trades.live?.length || 0} live / {trades.copy?.length || 0} algo / {trades.momentum?.length || 0} momentum
                                         </span>
                                     </div>
                                 </div>
@@ -309,11 +957,58 @@
                                 <div className="space-y-3 max-h-[500px] overflow-y-auto">
                                     {allTrades.length > 0 ? (
                                         allTrades.slice(0, 20).map((trade) => (
-                                            <TradeRow
-                                                key={trade.trade_id}
-                                                trade={trade}
-                                                isNew={newTradeIds.has(trade.trade_id)}
-                                            />
+                                            trade.source === 'copy_trader' ? (
+                                                <CopyTradeRow
+                                                    key={trade.id}
+                                                    trade={trade}
+                                                    isNew={newTradeIds.has(trade.id)}
+                                                />
+                                            ) : trade.source === 'momentum' ? (
+                                                <div key={trade.id} className={`bg-slate-800/30 rounded-lg p-3 border border-slate-700/50 hover:border-orange-500/30 transition-all ${newTradeIds.has(trade.id) ? 'flash-green' : ''}`}>
+                                                    <div className="flex items-center justify-between mb-2">
+                                                        <div className="flex items-center gap-2">
+                                                            <span className="px-2 py-0.5 text-xs rounded border font-medium bg-orange-500/20 text-orange-400 border-orange-500/30">
+                                                                MOMENTUM
+                                                            </span>
+                                                            <span className={`px-2 py-0.5 text-xs rounded border ${
+                                                                trade.status === 'filled' ? 'bg-green-500/20 text-green-400 border-green-500/30' :
+                                                                trade.status === 'dry_run' ? 'bg-blue-500/20 text-blue-400 border-blue-500/30' :
+                                                                'bg-red-500/20 text-red-400 border-red-500/30'
+                                                            }`}>
+                                                                {trade.status?.toUpperCase()}
+                                                            </span>
+                                                        </div>
+                                                        <span className="text-xs text-slate-500">{new Date(trade.timestamp).toLocaleTimeString()}</span>
+                                                    </div>
+                                                    <p className="text-sm text-white truncate mb-2" title={trade.market}>
+                                                        {trade.market || trade.slug}
+                                                    </p>
+                                                    <div className="grid grid-cols-4 gap-2 text-xs">
+                                                        <div>
+                                                            <p className="text-slate-500">Outcome</p>
+                                                            <p className="text-white font-mono">{trade.outcome}</p>
+                                                        </div>
+                                                        <div>
+                                                            <p className="text-slate-500">Amount</p>
+                                                            <p className="text-white font-mono">${trade.amount?.toFixed(2)}</p>
+                                                        </div>
+                                                        <div>
+                                                            <p className="text-slate-500">Price</p>
+                                                            <p className="text-orange-400 font-mono">{(trade.price * 100).toFixed(1)}¢</p>
+                                                        </div>
+                                                        <div>
+                                                            <p className="text-slate-500">Interval</p>
+                                                            <p className="text-yellow-400 font-mono">{trade.interval || '-'}</p>
+                                                        </div>
+                                                    </div>
+                                                </div>
+                                            ) : (
+                                                <TradeRow
+                                                    key={trade.trade_id}
+                                                    trade={trade}
+                                                    isNew={newTradeIds.has(trade.trade_id)}
+                                                />
+                                            )
                                         ))
                                     ) : (
                                         <p className="text-slate-500 text-center py-12">
@@ -321,6 +1016,411 @@
                                         </p>
                                     )}
                                 </div>
+                            </div>
+
+                            {/* Poly Algo Status */}
+                            <div className="bg-slate-800/50 backdrop-blur rounded-xl border border-slate-700/50 p-4">
+                                <div className="flex items-center justify-between mb-4">
+                                    <h2 className="text-lg font-semibold flex items-center gap-2">
+                                        <span className="text-cyan-400"><Zap /></span>
+                                        Poly Algo
+                                    </h2>
+                                    <div className="flex items-center gap-2">
+                                        <span className={`px-2 py-0.5 text-xs rounded border ${
+                                            copyTrader.paused
+                                                ? 'bg-yellow-500/20 text-yellow-400 border-yellow-500/30'
+                                                : copyTrader.running
+                                                    ? 'bg-green-500/20 text-green-400 border-green-500/30'
+                                                    : 'bg-slate-500/20 text-slate-400 border-slate-500/30'
+                                        }`}>
+                                            {copyTrader.paused ? 'PAUSED' : copyTrader.running ? 'RUNNING' : 'STOPPED'}
+                                        </span>
+                                        {copyTrader.running ? (
+                                            <React.Fragment>
+                                                {/* Pause / Resume button */}
+                                                <button
+                                                    onClick={async () => {
+                                                        try {
+                                                            const endpoint = copyTrader.paused
+                                                                ? '/api/copy-trader/resume'
+                                                                : '/api/copy-trader/pause';
+                                                            await fetch(endpoint, { method: 'POST' });
+                                                            fetchData();
+                                                        } catch (e) { console.error(e); }
+                                                    }}
+                                                    className={`px-3 py-1 text-xs rounded border ${
+                                                        copyTrader.paused
+                                                            ? 'bg-green-500/20 text-green-400 border-green-500/30 hover:bg-green-500/30'
+                                                            : 'bg-yellow-500/20 text-yellow-400 border-yellow-500/30 hover:bg-yellow-500/30'
+                                                    }`}
+                                                    title={copyTrader.paused
+                                                        ? 'Resume looking for new trades'
+                                                        : 'Stop new trades but keep resolving open positions'}
+                                                >
+                                                    {copyTrader.paused ? 'Resume' : 'Pause'}
+                                                </button>
+                                                {/* Stop button */}
+                                                <button
+                                                    onClick={async () => {
+                                                        try {
+                                                            await fetch('/api/copy-trader/stop', { method: 'POST' });
+                                                            fetchData();
+                                                        } catch (e) { console.error(e); }
+                                                    }}
+                                                    className="px-3 py-1 text-xs rounded bg-red-500/20 text-red-400 border border-red-500/30 hover:bg-red-500/30"
+                                                >
+                                                    Stop
+                                                </button>
+                                            </React.Fragment>
+                                        ) : (
+                                            <button
+                                                onClick={async () => {
+                                                    try {
+                                                        const res = await fetch('/api/copy-trader/start', {
+                                                            method: 'POST',
+                                                            headers: { 'Content-Type': 'application/json' },
+                                                            body: JSON.stringify({ crypto_only: true })
+                                                        });
+                                                        if (!res.ok) {
+                                                            const err = await res.json().catch(() => ({}));
+                                                            alert(`Start failed: ${err.error || res.statusText}`);
+                                                        }
+                                                        fetchData();
+                                                    } catch (e) { console.error(e); }
+                                                }}
+                                                className="px-3 py-1 text-xs rounded bg-green-500/20 text-green-400 border border-green-500/30 hover:bg-green-500/30"
+                                            >
+                                                Start
+                                            </button>
+                                        )}
+                                    </div>
+                                </div>
+
+                                {/* Paused banner */}
+                                {copyTrader.paused && (
+                                    <div className="mb-4 p-3 rounded-lg bg-yellow-500/10 border border-yellow-500/30 text-yellow-400 text-xs">
+                                        Paused - No new trades. Resolution engine still running for {copyTrader.open_positions || 0} open position(s).
+                                    </div>
+                                )}
+
+                                {/* Per-coin pause banner */}
+                                {!copyTrader.paused && copyTrader.paused_coins && copyTrader.paused_coins.length > 0 && (
+                                    <div className="mb-4 p-3 rounded-lg bg-yellow-500/5 border border-yellow-500/20 text-yellow-400/80 text-xs flex items-center justify-between">
+                                        <span>
+                                            Coins paused: {copyTrader.paused_coins.map(c => c.toUpperCase()).join(', ')}
+                                        </span>
+                                        <button
+                                            onClick={async () => {
+                                                for (const coin of copyTrader.paused_coins) {
+                                                    await fetch('/api/copy-trader/resume-coin', {
+                                                        method: 'POST',
+                                                        headers: { 'Content-Type': 'application/json' },
+                                                        body: JSON.stringify({ coin }),
+                                                    });
+                                                }
+                                                fetchData();
+                                            }}
+                                            className="px-2 py-0.5 text-xs rounded bg-green-500/20 text-green-400 border border-green-500/30 hover:bg-green-500/30"
+                                        >
+                                            Resume All
+                                        </button>
+                                    </div>
+                                )}
+
+                                {/* Balance Hero */}
+                                <div className="mb-4 p-4 rounded-xl bg-gradient-to-r from-cyan-900/30 to-blue-900/30 border border-cyan-500/20">
+                                    <div className="flex items-center justify-between">
+                                        <div>
+                                            <p className="text-xs text-slate-400 mb-1">Equity</p>
+                                            <p className="text-3xl font-bold font-mono" style={{ color: '#f59e0b' }}>
+                                                ${(copyTrader.equity || copyTrader.balance || 500).toFixed(2)}
+                                            </p>
+                                            <p className={`text-sm font-mono mt-1 ${(copyTrader.total_pnl || 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                                                {(copyTrader.total_pnl || 0) >= 0 ? '+' : ''}${(copyTrader.total_pnl || 0).toFixed(2)} PnL
+                                            </p>
+                                        </div>
+                                        <div className="text-right">
+                                            <p className="text-xs text-slate-400 mb-1">Balance</p>
+                                            <p className="text-xl font-bold font-mono text-cyan-400">
+                                                ${(copyTrader.balance || 500).toFixed(2)}
+                                            </p>
+                                            <p className="text-xs text-slate-400 mt-2">Lot Sizes</p>
+                                            {copyTrader.coin_bet_amounts ? (
+                                                <div className="flex gap-2 mt-1">
+                                                    {Object.entries(copyTrader.coin_bet_amounts).sort().map(([coin, amt]) => (
+                                                        <span key={coin} className="text-xs font-mono text-slate-300">
+                                                            <span className="text-slate-500">{coin.toUpperCase()}</span> ${Number(amt).toFixed(0)}
+                                                        </span>
+                                                    ))}
+                                                </div>
+                                            ) : (
+                                                <p className="text-lg font-bold font-mono text-slate-300">
+                                                    ${(copyTrader.bet_amount || 2).toFixed(2)}
+                                                </p>
+                                            )}
+                                        </div>
+                                    </div>
+                                </div>
+
+                                {/* Balance Chart */}
+                                <BalanceChart history={copyTrader.balance_history || []} />
+
+                                {/* Per-Coin ROI */}
+                                <CoinROI coinRoi={copyTrader.coin_roi} copyTrader={copyTrader} fetchData={fetchData} />
+
+                                {copyTrader.running ? (
+                                    <div className="space-y-2 text-sm mt-4">
+                                        <div className="flex justify-between">
+                                            <span className="text-slate-400">Following</span>
+                                            <span className="text-cyan-400 font-mono truncate max-w-[150px]" title={copyTrader.target_name}>
+                                                {copyTrader.target_name || copyTrader.target}
+                                            </span>
+                                        </div>
+                                        <div className="flex justify-between">
+                                            <span className="text-slate-400">Mode</span>
+                                            <span className={copyTrader.dry_run ? 'text-blue-400' : 'text-red-400'}>
+                                                {copyTrader.dry_run ? 'DRY RUN' : 'LIVE'}
+                                            </span>
+                                        </div>
+                                        <div className="flex justify-between">
+                                            <span className="text-slate-400">Open / Resolved</span>
+                                            <span className="text-white font-mono">
+                                                {copyTrader.open_positions || 0} / {copyTrader.resolved_positions || 0}
+                                            </span>
+                                        </div>
+                                        <div className="flex justify-between items-center">
+                                            <span className="text-slate-400">Trades</span>
+                                            <div className="flex gap-3 font-mono text-xs">
+                                                <span title="Positions bought" className="text-cyan-400">
+                                                    ↑{copyTrader.total_buys || 0} Bought
+                                                </span>
+                                                <span title="Positions sold early" className="text-orange-400">
+                                                    ↓{copyTrader.total_sells_early || 0} Sold
+                                                </span>
+                                                <span title="Held to resolution" className="text-slate-300">
+                                                    ✓{copyTrader.total_finished || 0} Finished
+                                                </span>
+                                            </div>
+                                        </div>
+                                        <div className="flex justify-between">
+                                            <span className="text-slate-400">Win Rate</span>
+                                            <span className="text-green-400 font-mono">
+                                                {copyTrader.wins || 0}W / {copyTrader.losses || 0}L ({(copyTrader.win_rate || 0).toFixed(1)}%)
+                                            </span>
+                                        </div>
+                                        <div className="flex justify-between items-center">
+                                            <span className="text-slate-400">Total PnL</span>
+                                            <div className="flex items-center gap-2">
+                                                <span className={`font-mono ${(copyTrader.total_pnl || 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                                                    ${(copyTrader.total_pnl || 0) >= 0 ? '+' : ''}{(copyTrader.total_pnl || 0).toFixed(2)}
+                                                </span>
+                                                <a
+                                                    href="/api/copy-trader/download"
+                                                    className="px-2 py-0.5 text-xs rounded bg-slate-600/50 text-slate-300 hover:bg-slate-500/50 border border-slate-500/30"
+                                                    title="Download resolved trades as CSV"
+                                                >
+                                                    CSV
+                                                </a>
+                                                <a
+                                                    href="/api/copy-trader/compare"
+                                                    className="px-2 py-0.5 text-xs rounded bg-purple-600/50 text-purple-300 hover:bg-purple-500/50 border border-purple-500/30"
+                                                    title="Download reconciliation CSV comparing target trader's trades to ours"
+                                                >
+                                                    Reconcile
+                                                </a>
+                                            </div>
+                                        </div>
+                                        {!copyTrader.dry_run && (
+                                            <div className="flex justify-between">
+                                                <span className="text-slate-400">Total Spent</span>
+                                                <span className="text-white font-mono">${copyTrader.total_spent?.toFixed(2) || '0.00'}</span>
+                                            </div>
+                                        )}
+                                        {/* Reset Stats */}
+                                        <div className="flex justify-between items-center pt-2 border-t border-slate-700 mt-2">
+                                            <span className="text-slate-400">Reset</span>
+                                            <div className="flex gap-2">
+                                                <button
+                                                    onClick={async () => {
+                                                        if (!window.confirm('Reset W/L/PnL stats? Open positions kept.')) return;
+                                                        try {
+                                                            await fetch('/api/copy-trader/reset-stats', {
+                                                                method: 'POST',
+                                                                headers: { 'Content-Type': 'application/json' },
+                                                                body: JSON.stringify({})
+                                                            });
+                                                            fetchData();
+                                                        } catch (e) { console.error(e); }
+                                                    }}
+                                                    className="px-2 py-0.5 text-xs rounded bg-yellow-500/10 text-yellow-400 border border-yellow-500/30 hover:bg-yellow-500/20"
+                                                >
+                                                    Stats
+                                                </button>
+                                                <button
+                                                    onClick={async () => {
+                                                        if (!window.confirm('Reset EVERYTHING? Stats + all open/resolved positions will be cleared.')) return;
+                                                        try {
+                                                            await fetch('/api/copy-trader/reset-stats', {
+                                                                method: 'POST',
+                                                                headers: { 'Content-Type': 'application/json' },
+                                                                body: JSON.stringify({ clear_all: true })
+                                                            });
+                                                            fetchData();
+                                                        } catch (e) { console.error(e); }
+                                                    }}
+                                                    className="px-2 py-0.5 text-xs rounded bg-red-500/10 text-red-400 border border-red-500/30 hover:bg-red-500/20"
+                                                >
+                                                    All
+                                                </button>
+                                            </div>
+                                        </div>
+                                    </div>
+                                ) : (
+                                    <p className="text-slate-500 text-sm mt-4">
+                                        Click Start to begin algo trading on crypto markets.
+                                    </p>
+                                )}
+
+                                {/* Settings Panel */}
+                                <AlgoSettings
+                                    copyTrader={copyTrader}
+                                    fetchData={fetchData}
+                                    setError={setError}
+                                />
+                            </div>
+
+                            {/* Momentum Engine */}
+                            <div className="bg-slate-800/50 backdrop-blur rounded-xl border border-slate-700/50 p-4">
+                                <div className="flex items-center justify-between mb-4">
+                                    <h2 className="text-lg font-semibold flex items-center gap-2">
+                                        <span className="text-orange-400"><TrendingUp /></span>
+                                        Momentum Engine
+                                    </h2>
+                                    <div className="flex items-center gap-2">
+                                        <span className={`px-2 py-0.5 text-xs rounded border ${
+                                            momentum.running
+                                                ? 'bg-orange-500/20 text-orange-400 border-orange-500/30'
+                                                : 'bg-slate-500/20 text-slate-400 border-slate-500/30'
+                                        }`}>
+                                            {momentum.running ? 'RUNNING' : 'OFF'}
+                                        </span>
+                                        {momentum.running ? (
+                                            <button
+                                                onClick={async () => {
+                                                    try {
+                                                        await fetch('/api/momentum/stop', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}) });
+                                                        fetchData();
+                                                    } catch (e) { console.error(e); }
+                                                }}
+                                                className="px-3 py-1 text-xs rounded bg-red-500/20 text-red-400 border border-red-500/30 hover:bg-red-500/30"
+                                            >
+                                                Stop
+                                            </button>
+                                        ) : (
+                                            <button
+                                                onClick={async () => {
+                                                    try {
+                                                        const res = await fetch('/api/momentum/start', {
+                                                            method: 'POST',
+                                                            headers: { 'Content-Type': 'application/json' },
+                                                            body: JSON.stringify({})
+                                                        });
+                                                        if (!res.ok) {
+                                                            const err = await res.json().catch(() => ({}));
+                                                            alert(`Start failed: ${err.error || res.statusText}`);
+                                                        }
+                                                        fetchData();
+                                                    } catch (e) { console.error(e); }
+                                                }}
+                                                className="px-3 py-1 text-xs rounded bg-orange-500/20 text-orange-400 border border-orange-500/30 hover:bg-orange-500/30"
+                                            >
+                                                Start
+                                            </button>
+                                        )}
+                                    </div>
+                                </div>
+
+                                <p className="text-xs text-slate-500 mb-3">
+                                    Independent price-momentum trader. Enters between {((momentum.min_entry_price || 0.65) * 100).toFixed(0)}¢ – {((momentum.max_entry_price || 0.989) * 100).toFixed(1)}¢, re-enters only on upward movement. {momentum.running && copyTrader.paused ? '(Copy trader auto-paused)' : ''}
+                                </p>
+
+                                {momentum.running && (
+                                    <div className="space-y-2 text-sm">
+                                        {/* P&L Hero */}
+                                        {(momentum.resolved_positions > 0 || momentum.total_pnl) && (
+                                            <div className="mb-2 p-3 rounded-lg bg-gradient-to-r from-orange-900/30 to-amber-900/30 border border-orange-500/20">
+                                                <div className="flex items-center justify-between">
+                                                    <div>
+                                                        <p className="text-xs text-slate-400 mb-0.5">Momentum P&L</p>
+                                                        <p className={`text-xl font-bold font-mono ${(momentum.total_pnl || 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                                                            {(momentum.total_pnl || 0) >= 0 ? '+' : ''}${(momentum.total_pnl || 0).toFixed(2)}
+                                                        </p>
+                                                    </div>
+                                                    <div className="text-right">
+                                                        <p className="text-xs text-slate-400 mb-0.5">Win Rate</p>
+                                                        <p className="text-lg font-bold font-mono text-orange-400">
+                                                            {momentum.wins || 0}W / {momentum.losses || 0}L
+                                                        </p>
+                                                        <p className="text-xs font-mono text-slate-400">
+                                                            {(momentum.win_rate || 0).toFixed(1)}%
+                                                        </p>
+                                                    </div>
+                                                </div>
+                                                {momentum.open_staked > 0 && (
+                                                    <p className="text-xs text-slate-500 mt-1">
+                                                        ${(momentum.open_staked || 0).toFixed(2)} staked in {momentum.open_positions || 0} open positions
+                                                    </p>
+                                                )}
+                                            </div>
+                                        )}
+                                        <div className="flex justify-between">
+                                            <span className="text-slate-400">Scans</span>
+                                            <span className="text-white font-mono">{momentum.scans_completed || 0}</span>
+                                        </div>
+                                        <div className="flex justify-between">
+                                            <span className="text-slate-400">Trades Entered</span>
+                                            <span className="text-orange-400 font-mono">{momentum.trades_entered || 0}</span>
+                                        </div>
+                                        <div className="flex justify-between">
+                                            <span className="text-slate-400">Open / Resolved</span>
+                                            <span className="text-white font-mono">
+                                                {momentum.open_positions || 0} / {momentum.resolved_positions || 0}
+                                            </span>
+                                        </div>
+                                        <div className="flex justify-between">
+                                            <span className="text-slate-400">Entry Range</span>
+                                            <span className="text-white font-mono">
+                                                {((momentum.min_entry_price || 0.65) * 100).toFixed(0)}¢ – {((momentum.max_entry_price || 0.95) * 100).toFixed(0)}¢
+                                            </span>
+                                        </div>
+                                        <div className="flex justify-between">
+                                            <span className="text-slate-400">Mode</span>
+                                            <span className={momentum.dry_run ? 'text-blue-400' : 'text-red-400'}>
+                                                {momentum.dry_run ? 'DRY RUN' : 'LIVE'}
+                                            </span>
+                                        </div>
+                                        {momentum.active_entries && Object.keys(momentum.active_entries).length > 0 && (
+                                            <div className="pt-2 border-t border-slate-700">
+                                                <p className="text-xs text-slate-500 mb-1">Active Entries ({Object.keys(momentum.active_entries).length} total, showing last 25)</p>
+                                                {Object.entries(momentum.active_entries).slice(-25).map(([key, price]) => (
+                                                    <div key={key} className="flex justify-between text-xs">
+                                                        <span className="text-slate-400 font-mono truncate max-w-[150px]">{key}</span>
+                                                        <span className="text-orange-400 font-mono">{price}</span>
+                                                    </div>
+                                                ))}
+                                            </div>
+                                        )}
+
+                                        {/* Per-Coin Performance for Momentum */}
+                                        <CoinROI coinRoi={momentum.coin_roi} copyTrader={momentum} fetchData={fetchData} apiPrefix="/api/momentum" />
+                                    </div>
+                                )}
+
+                                {!momentum.running && (
+                                    <p className="text-slate-500 text-sm">
+                                        Click Start to begin momentum trading. Copy trader will auto-pause.
+                                    </p>
+                                )}
                             </div>
 
                         </div>
@@ -358,28 +1458,37 @@
                                 </div>
                             </div>
 
-                            {/* Active Markets */}
-                            <div className="bg-slate-800/50 backdrop-blur rounded-xl border border-slate-700/50 p-4">
+                            {/* Active Markets - Clickable */}
+                            <div
+                                className="bg-slate-800/50 backdrop-blur rounded-xl border border-slate-700/50 p-4 cursor-pointer hover:border-purple-500/50 transition-colors"
+                                onClick={() => setShowMarketsModal(true)}
+                            >
                                 <h2 className="text-lg font-semibold mb-4 flex items-center gap-2">
                                     <span className="text-purple-400"><Target /></span>
                                     Active Markets
+                                    <span className="text-xs text-slate-500 ml-auto">Click to view all</span>
                                 </h2>
                                 <div className="space-y-2 max-h-[200px] overflow-y-auto">
                                     {(data?.markets || []).length > 0 ? (
-                                        data.markets.map((market, i) => (
+                                        data.markets.slice(0, 5).map((market, i) => (
                                             <div key={i} className="bg-slate-700/30 rounded-lg p-2">
                                                 <p className="text-sm text-white truncate" title={market.slug}>
                                                     {market.slug}
                                                 </p>
                                                 <div className="flex justify-between text-xs text-slate-400 mt-1">
                                                     <span>Sum: ${market.price_sum_indicative?.toFixed(3) || '-'}</span>
-                                                    <span>{market.minutes_until || '-'}m</span>
+                                                    <span>{market.minutes_until?.toFixed(1) || '-'}m</span>
                                                 </div>
                                             </div>
                                         ))
                                     ) : (
                                         <p className="text-slate-500 text-center py-4">
                                             Start scanner to discover markets
+                                        </p>
+                                    )}
+                                    {(data?.markets || []).length > 5 && (
+                                        <p className="text-center text-xs text-purple-400 mt-2">
+                                            + {data.markets.length - 5} more markets...
                                         </p>
                                     )}
                                 </div>
@@ -392,6 +1501,86 @@
                         <p>HFT Arbitrage System</p>
                         <p className="mt-1">Demo mode uses paper trading. Live mode executes real trades.</p>
                     </div>
+
+                    {/* Markets Modal */}
+                    <Modal
+                        isOpen={showMarketsModal}
+                        onClose={() => setShowMarketsModal(false)}
+                        title={`Active Markets (${(data?.markets || []).length})`}
+                    >
+                        <div className="space-y-4">
+                            {/* Category filters */}
+                            <div className="flex gap-4 mb-4">
+                                <div className="flex items-center gap-2 text-sm">
+                                    <span className="w-3 h-3 rounded-full bg-purple-500"></span>
+                                    <span className="text-slate-300">Crypto: {(data?.markets || []).filter(m => m.category === 'crypto').length}</span>
+                                </div>
+                                <div className="flex items-center gap-2 text-sm">
+                                    <span className="w-3 h-3 rounded-full bg-green-500"></span>
+                                    <span className="text-slate-300">Sports: {(data?.markets || []).filter(m => m.category === 'sports').length}</span>
+                                </div>
+                            </div>
+
+                            {/* Markets table */}
+                            <div className="overflow-x-auto">
+                                <table className="w-full text-sm">
+                                    <thead>
+                                        <tr className="text-left text-slate-400 border-b border-slate-700">
+                                            <th className="pb-2 pr-4">Market</th>
+                                            <th className="pb-2 pr-4">Category</th>
+                                            <th className="pb-2 pr-4">Price Sum</th>
+                                            <th className="pb-2 pr-4">Time</th>
+                                            <th className="pb-2">Volume 24h</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody className="text-slate-300">
+                                        {(data?.markets || []).map((market, i) => (
+                                            <tr key={i} className="border-b border-slate-700/50 hover:bg-slate-700/30">
+                                                <td className="py-2 pr-4">
+                                                    <div className="max-w-[300px]">
+                                                        <p className="font-medium text-white truncate" title={market.slug}>
+                                                            {market.slug}
+                                                        </p>
+                                                        {market.question && (
+                                                            <p className="text-xs text-slate-500 truncate" title={market.question}>
+                                                                {market.question}
+                                                            </p>
+                                                        )}
+                                                    </div>
+                                                </td>
+                                                <td className="py-2 pr-4">
+                                                    <span className={`px-2 py-0.5 text-xs rounded ${
+                                                        market.category === 'crypto'
+                                                            ? 'bg-purple-500/20 text-purple-400'
+                                                            : 'bg-green-500/20 text-green-400'
+                                                    }`}>
+                                                        {market.category || 'unknown'}
+                                                    </span>
+                                                </td>
+                                                <td className="py-2 pr-4 font-mono">
+                                                    <span className={market.price_sum_indicative < 1 ? 'text-green-400' : 'text-white'}>
+                                                        ${market.price_sum_indicative?.toFixed(3) || '-'}
+                                                    </span>
+                                                </td>
+                                                <td className="py-2 pr-4 font-mono">
+                                                    {market.minutes_until?.toFixed(1) || '-'}m
+                                                </td>
+                                                <td className="py-2 font-mono">
+                                                    ${market.volume_24h?.toLocaleString() || '-'}
+                                                </td>
+                                            </tr>
+                                        ))}
+                                    </tbody>
+                                </table>
+                            </div>
+
+                            {(data?.markets || []).length === 0 && (
+                                <p className="text-center text-slate-500 py-8">
+                                    No markets being monitored. Start the scanner to discover markets.
+                                </p>
+                            )}
+                        </div>
+                    </Modal>
                 </div>
             );
         }
