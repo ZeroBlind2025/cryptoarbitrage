@@ -281,6 +281,33 @@ def _parse_market(raw: dict) -> Optional[dict]:
     }
 
 
+def _fetch_clob_token_ids(condition_id: str) -> Optional[list[str]]:
+    """Fetch canonical CLOB token IDs for a market from the CLOB API.
+
+    The Gamma API returns clobTokenIds that may differ in format from
+    the actual CLOB order book token IDs. This queries the CLOB API
+    directly to get the exact IDs that the WebSocket uses.
+
+    Returns [token_id_0, token_id_1] or None on failure.
+    """
+    if not condition_id:
+        return None
+    try:
+        resp = requests.get(
+            f"{CLOB_API}/markets/{condition_id}",
+            timeout=3,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            tokens = data.get("tokens", [])
+            if len(tokens) >= 2:
+                return [str(tokens[0].get("token_id", "")),
+                        str(tokens[1].get("token_id", ""))]
+    except Exception:
+        pass
+    return None
+
+
 def _is_crypto_updown_event(title: str, slug: str) -> bool:
     """Check if an event is a crypto up-or-down event by title/slug."""
     combined = (title + " " + slug).lower()
@@ -598,10 +625,50 @@ def discover_active_markets() -> list[dict]:
     else:
         print("[MOMENTUM] No active updown markets found", flush=True)
 
-    # --- Log discovered markets to CSV (dedup by condition_id) ---
-    _log_discovered_markets(markets)
+    # --- Filter to only CURRENT + NEXT time window markets ---
+    # We only want ~8 active markets (4 coins × 2 intervals), not 32
+    # that include already-resolved and future windows.
+    now_ts = int(time.time())
+    active_markets = []
+    for m in markets:
+        minutes_left = m.get("minutes_until_close")
+        prices = m.get("prices", [])
+        # Skip resolved (0/1 prices)
+        if len(prices) == 2 and prices[0] in (0.0, 1.0) and prices[1] in (0.0, 1.0):
+            continue
+        # Skip markets that are already closed
+        if minutes_left is not None and minutes_left < 0:
+            continue
+        active_markets.append(m)
 
-    return markets
+    if len(active_markets) < len(markets):
+        print(f"[MOMENTUM] Filtered to {len(active_markets)} active markets "
+              f"(from {len(markets)} total)", flush=True)
+
+    # --- Enrich with canonical CLOB token IDs ---
+    # The Gamma API clobTokenIds may differ from the actual CLOB WS token IDs.
+    # Query CLOB API to get the exact IDs the WebSocket uses.
+    enriched = 0
+    for m in active_markets:
+        cid = m.get("condition_id", "")
+        clob_ids = _fetch_clob_token_ids(cid)
+        if clob_ids and len(clob_ids) == 2 and all(clob_ids):
+            gamma_ids = m["token_ids"]
+            if gamma_ids != clob_ids:
+                print(f"[MOMENTUM] Token ID FIX for {m['coin'].upper()}_{m['interval']}: "
+                      f"gamma={gamma_ids[0][:20]}... clob={clob_ids[0][:20]}...", flush=True)
+            m["token_ids"] = clob_ids
+            enriched += 1
+        time.sleep(0.02)
+
+    if enriched > 0:
+        print(f"[MOMENTUM] Enriched {enriched}/{len(active_markets)} markets "
+              f"with CLOB token IDs", flush=True)
+
+    # --- Log discovered markets to CSV (dedup by condition_id) ---
+    _log_discovered_markets(active_markets)
+
+    return active_markets
 
 
 # Path for the discovery log CSV
