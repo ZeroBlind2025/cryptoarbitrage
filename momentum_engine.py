@@ -731,6 +731,10 @@ class MomentumEngine:
         self._last_market_discovery = 0.0
         self._market_discovery_interval = 30  # re-discover every 30s
 
+        # Fast 5m boundary detection — track which 5m epochs we've already
+        # discovered so we can do targeted slug lookups right at boundaries
+        self._last_5m_epoch = 0
+
         # Resolution
         self.last_resolution_check = 0
         self.resolution_check_interval = 60
@@ -822,6 +826,77 @@ class MomentumEngine:
         _, best_ask = self.ws.get_best_prices(token_id)
         return best_ask
 
+    def _check_5m_boundary(self) -> list[dict]:
+        """Fast targeted discovery when a new 5m epoch starts.
+
+        Instead of waiting up to 30s for the next full discovery cycle,
+        this does ~8 REST calls (4 coins × 2 slug variants) to grab
+        the brand-new 5m markets right as they appear.
+        """
+        now_ts = int(time.time())
+        current_epoch = (now_ts // 300) * 300
+
+        if current_epoch <= self._last_5m_epoch:
+            return []  # same epoch, nothing new
+
+        self._last_5m_epoch = current_epoch
+        new_markets = []
+
+        for coin_abbr in CRYPTO_COINS:
+            coin_full = COIN_SLUG_NAMES.get(coin_abbr, coin_abbr)
+            # The new market uses the current epoch timestamp
+            slug_variants = [f"{coin_full}-updown-5m-{current_epoch}"]
+            if coin_abbr != coin_full:
+                slug_variants.append(f"{coin_abbr}-updown-5m-{current_epoch}")
+
+            for event_slug in slug_variants:
+                try:
+                    resp = requests.get(
+                        f"{GAMMA_API}/events",
+                        params={"slug": event_slug},
+                        timeout=10,
+                    )
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        events_list = data if isinstance(data, list) else [data] if isinstance(data, dict) else []
+                        for event in events_list:
+                            if not isinstance(event, dict):
+                                continue
+                            for mkt in event.get("markets", []):
+                                parsed = _parse_market(mkt)
+                                if parsed:
+                                    new_markets.append(parsed)
+                            if "conditionId" in event:
+                                parsed = _parse_market(event)
+                                if parsed:
+                                    new_markets.append(parsed)
+                except Exception:
+                    pass
+
+        if new_markets:
+            print(f"[MOMENTUM] 5m boundary: grabbed {len(new_markets)} new markets "
+                  f"at epoch {current_epoch}", flush=True)
+
+            # Merge into cache (dedup by condition_id)
+            existing_cids = {m["condition_id"] for m in self._cached_markets}
+            for m in new_markets:
+                if m["condition_id"] not in existing_cids:
+                    self._cached_markets.append(m)
+                    existing_cids.add(m["condition_id"])
+
+            # Subscribe new tokens to WebSocket
+            if self.ws:
+                new_token_ids = []
+                for m in new_markets:
+                    new_token_ids.extend(m.get("token_ids", []))
+                if new_token_ids:
+                    try:
+                        self.ws.subscribe(new_token_ids)
+                    except Exception:
+                        pass
+
+        return new_markets
+
     def stop(self):
         """Clean up."""
         if self.ws:
@@ -838,6 +913,10 @@ class MomentumEngine:
         """
         self.scans_completed += 1
         self._refresh_ws_tokens()
+
+        # Fast 5m boundary check — grab new markets immediately when
+        # a new 5-minute epoch starts (only ~8 REST calls)
+        self._check_5m_boundary()
 
         # Use cached markets for fast WS-driven price checks.
         # Only re-discover via REST every _market_discovery_interval seconds.
