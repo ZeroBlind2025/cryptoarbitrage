@@ -106,7 +106,7 @@ INTERVAL_PRICE_BRACKETS: dict[str, list[tuple[float, float]]] = {
 POLL_INTERVAL = int(os.getenv("MOMENTUM_POLL_INTERVAL", "10"))
 
 # Max entries per market (same as copy trader default)
-MAX_ENTRIES_PER_MARKET = int(os.getenv("MOMENTUM_MAX_ENTRIES", "2"))
+MAX_ENTRIES_PER_MARKET = int(os.getenv("COPY_MAX_ENTRIES_PER_MARKET", "2"))
 
 # Minimum minutes before market close to allow entry.
 # Prevents placing trades after (or right at) the close time.
