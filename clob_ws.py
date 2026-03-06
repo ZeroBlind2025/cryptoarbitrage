@@ -315,30 +315,31 @@ class CLOBWebSocket:
             self.on_price_change(asset_id, book.best_bid, book.best_ask)
 
     def _handle_price_change(self, data: dict):
-        """Handle price change event"""
-        asset_id = data.get("asset_id") or data.get("market")
-        if not asset_id:
-            return
+        """Handle price change event.
 
+        WS message format:
+          {"market": "0x...(condition_id)", "price_changes": [
+            {"asset_id": "12345...(token_id)", "best_bid": "0.79", "best_ask": "0.81"},
+            ...
+          ]}
+
+        CRITICAL: asset_id is INSIDE each price_change item, NOT at the
+        top level. The top-level "market" is the condition_id (hex), which
+        is NOT what we index books by. We must read asset_id from each
+        change item individually.
+        """
         self.price_changes += 1
 
-        # One-time diagnostic: compare WS asset_id format vs our subscribed token_ids
-        if self.price_changes <= 3 and self._subscribed_tokens:
-            sample_sub = next(iter(self._subscribed_tokens))
-            match = "MATCH" if asset_id in self._subscribed_tokens else "NO MATCH"
-            print(f"[CLOB WS DIAG] asset_id={asset_id[:60]}... "
-                  f"subscribed_sample={sample_sub[:60]}... → {match}",
-                  flush=True)
-            if match == "NO MATCH":
-                # Show full IDs to debug format mismatch
-                print(f"[CLOB WS DIAG] FULL asset_id  = {asset_id}", flush=True)
-                print(f"[CLOB WS DIAG] FULL subscribed= {sample_sub}", flush=True)
-
-        changes = data.get("price_changes", [data])  # Might be single or array
+        changes = data.get("price_changes", [data])
         if not isinstance(changes, list):
             changes = [changes]
 
         for change in changes:
+            # Read asset_id from the CHANGE item, not the top-level message
+            asset_id = change.get("asset_id") or data.get("asset_id") or data.get("market")
+            if not asset_id:
+                continue
+
             best_bid = change.get("best_bid")
             best_ask = change.get("best_ask")
 
