@@ -691,8 +691,8 @@ def _log_trade(event_type: str, data: dict):
     try:
         with open(TRADE_LOG, "a") as f:
             f.write(json.dumps(record) + "\n")
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[MOMENTUM] WARNING: Failed to write trade log: {e}", flush=True)
 
 # In-memory set of condition_ids already written (avoids re-reading CSV each scan)
 _logged_condition_ids: set = set()
@@ -1542,6 +1542,14 @@ class MomentumEngine:
                           f"(ours={our_outcome}, winner={winning_outcome}). Correcting to WIN.", flush=True)
                     won = True
 
+            # Priority 4: Live price fallback when API says resolved but no winner info
+            # This catches the case where Gamma returns resolved=True with no outcome data
+            if won is None and token_id:
+                live_price = self.get_live_price(token_id)
+                if live_price is not None and (live_price >= 0.95 or live_price <= 0.05):
+                    won = live_price >= 0.95
+                    print(f"[MOMENTUM] Resolved-but-no-winner fallback: price={live_price:.4f} → {'WIN' if won else 'LOSS'}", flush=True)
+
             if won is True:
                 if entry_price > 0:
                     payout = amount / entry_price
@@ -1561,7 +1569,9 @@ class MomentumEngine:
             else:
                 # Interval-aware retry: 60m markets need much longer to settle
                 # than 5m/15m. Use time-based threshold instead of fixed attempts.
-                first_check = position.get("_first_resolve_check", time.time())
+                if "_first_resolve_check" not in position:
+                    position["_first_resolve_check"] = time.time()
+                first_check = position["_first_resolve_check"]
                 elapsed_mins = (time.time() - first_check) / 60
                 # Max wait: 15 min for 5m, 30 min for 15m, 120 min for 60m
                 interval = position.get("interval", "")
