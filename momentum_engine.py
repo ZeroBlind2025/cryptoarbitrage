@@ -79,8 +79,8 @@ from copy_trader import (
 # CONFIGURATION
 # =============================================================================
 
-# Minimum price to enter a market (65 cents = 0.65)
-MIN_ENTRY_PRICE = float(os.getenv("MOMENTUM_MIN_ENTRY_PRICE", "0.65"))
+# Minimum price to enter a market (85 cents = 0.85)
+MIN_ENTRY_PRICE = float(os.getenv("MOMENTUM_MIN_ENTRY_PRICE", "0.85"))
 
 # Maximum price to enter — 98.9¢ cap filters out 99¢+ "last second" entries
 # that linger at market close and likely wouldn't fill in live trading
@@ -92,12 +92,12 @@ MAX_ENTRY_PRICE = float(os.getenv("MOMENTUM_MAX_ENTRY_PRICE", "0.989"))
 # at least ONE bracket to qualify.  Intervals not listed here use the global
 # MIN_ENTRY_PRICE / MAX_ENTRY_PRICE range.
 #
-# 5m  bracket: 80-<99¢ (upper exclusive — 99¢+ filtered out)
-# 15m bracket: 76-<99¢
+# 5m  bracket: 85-<98.9¢ (uber conservative)
+# 15m bracket: 85-<98.9¢
 # ---------------------------------------------------------------------------
 INTERVAL_PRICE_BRACKETS: dict[str, list[tuple[float, float]]] = {
-    "5m":  [(0.80, 0.99)],
-    "15m": [(0.76, 0.99)],
+    "5m":  [(0.85, 0.989)],
+    "15m": [(0.85, 0.989)],
 }
 
 # How often to poll prices (seconds)
