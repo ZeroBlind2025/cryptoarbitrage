@@ -691,8 +691,8 @@ def _log_trade(event_type: str, data: dict):
     try:
         with open(TRADE_LOG, "a") as f:
             f.write(json.dumps(record) + "\n")
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[MOMENTUM] WARNING: Failed to write trade log: {e}", flush=True)
 
 # In-memory set of condition_ids already written (avoids re-reading CSV each scan)
 _logged_condition_ids: set = set()

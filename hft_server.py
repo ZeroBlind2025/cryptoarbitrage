@@ -124,7 +124,7 @@ except Exception as e:
 momentum_engine: Optional["MomentumEngine"] = None
 momentum_thread: Optional[threading.Thread] = None
 stop_momentum = threading.Event()
-momentum_trades: deque = deque(maxlen=100)
+momentum_trades: deque = deque(maxlen=500)
 
 
 def on_copy_trade(trade_record: dict):
