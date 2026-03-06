@@ -834,7 +834,7 @@ class MomentumEngine:
         # CLOB REST price cache — populated every N seconds (not every scan)
         self._clob_price_cache: dict[str, float] = {}
         self._last_clob_fetch = 0.0
-        self._clob_fetch_interval = 10  # seconds between REST batch fetches
+        self._clob_fetch_interval = 3  # seconds between REST batch fetches (parallel)
 
         # WS live price cache — populated directly by WS callback.
         # Keyed by the EXACT asset_id the WS server sends back (which may
@@ -999,8 +999,8 @@ class MomentumEngine:
     def _fetch_clob_prices_batch(self, markets: list[dict]):
         """Fetch real-time best-ask prices for all active markets via CLOB REST.
 
-        Called every ~10s. Fetches /price endpoint (lighter than /book)
-        for tokens missing WS data. Prioritises non-resolved markets.
+        Uses parallel requests (ThreadPoolExecutor) to fetch all tokens
+        in ~1s instead of ~10s sequential. Called every 3s.
         """
         self._clob_price_cache = {}
         tokens_to_fetch = []
@@ -1025,11 +1025,8 @@ class MomentumEngine:
         if not tokens_to_fetch:
             return
 
-        fetched = 0
-        empty = 0
-        for token_id in tokens_to_fetch:
+        def _fetch_one(token_id):
             try:
-                # Use /price endpoint (lighter than /book, returns just the price)
                 resp = requests.get(
                     f"{CLOB_API}/price",
                     params={"token_id": token_id, "side": "buy"},
@@ -1037,22 +1034,33 @@ class MomentumEngine:
                 )
                 if resp.status_code == 200:
                     data = resp.json()
-                    # /price returns {"price": "0.935"} or similar
                     price_val = data.get("price")
                     if price_val is not None:
                         p = float(price_val)
                         if p > 0:
-                            self._clob_price_cache[token_id] = p
-                            fetched += 1
-                        else:
-                            empty += 1
-                    else:
-                        empty += 1
+                            return token_id, p, "ok"
+                        return token_id, None, "empty"
+                    return token_id, None, "empty"
                 elif resp.status_code == 429:
-                    print(f"[MOMENTUM] CLOB REST rate limited after {fetched} fetches", flush=True)
-                    break
+                    return token_id, None, "ratelimit"
             except Exception:
                 pass
+            return token_id, None, "error"
+
+        fetched = 0
+        empty = 0
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            futures = {pool.submit(_fetch_one, tid): tid for tid in tokens_to_fetch}
+            for fut in as_completed(futures):
+                tid, price, status = fut.result()
+                if status == "ok" and price is not None:
+                    self._clob_price_cache[tid] = price
+                    fetched += 1
+                elif status == "empty":
+                    empty += 1
+                elif status == "ratelimit":
+                    print(f"[MOMENTUM] CLOB REST rate limited after {fetched} fetches", flush=True)
 
         print(f"[MOMENTUM] CLOB REST: {fetched} prices, {empty} empty "
               f"({len(tokens_to_fetch)} tokens queried)", flush=True)
