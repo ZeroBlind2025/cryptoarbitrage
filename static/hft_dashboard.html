@@ -23,7 +23,7 @@
 
     <script type="text/babel">
         const { useState, useEffect, useCallback } = React;
-        const { LineChart, Line, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, AreaChart, Area, Legend } = Recharts;
+        const { LineChart, Line, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, AreaChart, Area, Legend, ReferenceLine } = Recharts;
 
         // Icons
         const Zap = () => <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><polygon points="13,2 3,14 12,14 11,22 21,10 12,10 13,2"/></svg>;
@@ -192,31 +192,36 @@
                 '1m': { label: '1M', ms: 30 * 24 * 60 * 60 * 1000 },
             };
 
+            // Format timestamp in PST with date when timeframe spans multiple days
+            const formatLabel = (ts, includeDate) => {
+                const d = new Date(ts);
+                const timePart = d.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', timeZone: 'America/Los_Angeles' });
+                if (!includeDate) return timePart;
+                const datePart = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'America/Los_Angeles' });
+                return `${datePart} ${timePart}`;
+            };
+
             const filteredData = React.useMemo(() => {
                 if (!history || history.length === 0) return [];
                 const now = Date.now();
                 const cutoff = now - timeframes[timeframe].ms;
+                // Show dates when timeframe is longer than 1 day
+                const showDate = timeframes[timeframe].ms > 24 * 60 * 60 * 1000;
+                const mapEntry = h => ({
+                    time: new Date(h.timestamp).getTime(),
+                    balance: h.balance,
+                    pnl: h.pnl != null ? h.pnl : null,
+                    equity: h.equity != null ? h.equity : null,
+                    label: formatLabel(h.timestamp, showDate),
+                    pstDate: new Date(h.timestamp).toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'America/Los_Angeles' }),
+                    event: h.event,
+                    detail: h.detail || '',
+                });
                 const filtered = history
                     .filter(h => new Date(h.timestamp).getTime() >= cutoff)
-                    .map(h => ({
-                        time: new Date(h.timestamp).getTime(),
-                        balance: h.balance,
-                        pnl: h.pnl != null ? h.pnl : null,
-                        equity: h.equity != null ? h.equity : null,
-                        label: new Date(h.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-                        event: h.event,
-                        detail: h.detail || '',
-                    }));
+                    .map(mapEntry);
                 if (filtered.length === 0) {
-                    return history.map(h => ({
-                        time: new Date(h.timestamp).getTime(),
-                        balance: h.balance,
-                        pnl: h.pnl != null ? h.pnl : null,
-                        equity: h.equity != null ? h.equity : null,
-                        label: new Date(h.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-                        event: h.event,
-                        detail: h.detail || '',
-                    }));
+                    return history.map(mapEntry);
                 }
                 return filtered;
             }, [history, timeframe]);
@@ -230,7 +235,7 @@
                     const d = payload[0].payload;
                     return (
                         <div className="bg-slate-800 border border-slate-600 rounded-lg px-3 py-2 text-xs">
-                            <p className="text-slate-400 mb-1">{new Date(d.time).toLocaleString()}</p>
+                            <p className="text-slate-400 mb-1">{new Date(d.time).toLocaleString('en-US', { timeZone: 'America/Los_Angeles' })} PST</p>
                             {hasEquity && d.equity != null && (
                                 <p className="font-mono" style={{ color: '#f59e0b' }}>
                                     Equity: ${d.equity.toFixed(2)}
@@ -314,6 +319,25 @@
                                     tick={{ fontSize: 10 }}
                                     interval="preserveStartEnd"
                                 />
+                                {/* Day separator reference lines (PST) */}
+                                {(() => {
+                                    const seenDates = new Set();
+                                    return filteredData
+                                        .filter(d => {
+                                            if (seenDates.has(d.pstDate)) return false;
+                                            seenDates.add(d.pstDate);
+                                            return seenDates.size > 1; // skip first day (no separator needed)
+                                        })
+                                        .map(d => (
+                                            <ReferenceLine
+                                                key={`day-${d.pstDate}`}
+                                                x={d.label}
+                                                stroke="#475569"
+                                                strokeDasharray="4 4"
+                                                label={{ value: d.pstDate, position: 'top', fill: '#94a3b8', fontSize: 9 }}
+                                            />
+                                        ));
+                                })()}
                                 <YAxis
                                     stroke="#64748b"
                                     tick={{ fontSize: 10 }}
