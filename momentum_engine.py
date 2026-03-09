@@ -63,6 +63,7 @@ from copy_trader import (
     GAMMA_API,
     COIN_BET_AMOUNTS,
     BET_AMOUNT,
+    PROBE_AMOUNT,
     PRICE_BUFFER_BPS,
     ALGO_STARTING_BALANCE,
     CRYPTO_SLUGS,
@@ -1332,13 +1333,16 @@ class MomentumEngine:
                           f"price {price*100:.1f}¢ > last buy {last_buy_price*100:.1f}¢ ({_price_src})", flush=True)
 
                 # --- ENTER THE TRADE ---
-                trade_amount = self.coin_bet_amounts.get(coin, self.bet_amount)
+                full_lot = self.coin_bet_amounts.get(coin, self.bet_amount)
+                is_first_entry = market_key not in self.entered_markets
+                trade_amount = PROBE_AMOUNT if is_first_entry else full_lot
                 title = (question or slug)[:50]
+                entry_type = "PROBE" if is_first_entry else "RE-ENTRY"
 
-                print(f"\n[MOMENTUM] ENTERING {coin.upper()} {outcome} @ {price*100:.1f}¢", flush=True)
+                print(f"\n[MOMENTUM] ENTERING {coin.upper()} {outcome} @ {price*100:.1f}¢ ({entry_type})", flush=True)
                 print(f"           Market: {title}", flush=True)
                 print(f"           Interval: {market['interval']}", flush=True)
-                print(f"           Amount: ${trade_amount:.2f}", flush=True)
+                print(f"           Amount: ${trade_amount:.2f} ({entry_type})", flush=True)
 
                 trade_record = {
                     "id": f"momentum_{condition_id[:12]}_{oi}_{int(time.time())}",

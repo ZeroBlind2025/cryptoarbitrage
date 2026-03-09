@@ -61,6 +61,7 @@ SIGNATURE_TYPE = int(os.getenv("POLYMARKET_SIGNATURE_TYPE", "0"))  # 0=EOA, 1=Em
 
 # Trading settings
 BET_AMOUNT = float(os.getenv("COPY_BET_AMOUNT", "5.0"))  # $ per copied bet
+PROBE_AMOUNT = float(os.getenv("PROBE_AMOUNT", "10.0"))   # $ for first (probe) entry into a new market
 POLL_INTERVAL = int(os.getenv("COPY_POLL_INTERVAL", "10"))  # seconds between checks
 ALGO_STARTING_BALANCE = float(os.getenv("ALGO_STARTING_BALANCE", "2300.0"))  # Starting balance for Poly Algo
 PRICE_BUFFER_BPS = int(os.getenv("COPY_PRICE_BUFFER_BPS", "50"))  # Max overbid vs target's price (50 bps = 0.5%)
@@ -1085,15 +1086,18 @@ class CopyTrader:
                     continue
                 self.copied_sizes.add(size_key)
 
-            # Resolve per-coin lot size
+            # Resolve per-coin lot size — probe on first entry, full lot on re-entry
             trade_coin = detect_coin(slug, title)
-            trade_amount = self.coin_bet_amounts.get(trade_coin, self.bet_amount) if trade_coin else self.bet_amount
+            full_lot = self.coin_bet_amounts.get(trade_coin, self.bet_amount) if trade_coin else self.bet_amount
+            is_first_entry = condition_id and market_key not in self.entered_markets
+            trade_amount = PROBE_AMOUNT if is_first_entry else full_lot
 
             # Copy the trade!
-            print(f"\n[ALGO] NEW TRADE DETECTED!")
+            entry_type = "PROBE" if is_first_entry else "RE-ENTRY"
+            print(f"\n[ALGO] NEW TRADE DETECTED! ({entry_type})")
             print(f"       Market: {title}")
             print(f"       Target bought: {size:.1f} {outcome} @ {price*100:.1f}¢")
-            print(f"       Copying: ${trade_amount:.2f} of {outcome} ({trade_coin.upper() or '?'} lot)")
+            print(f"       Copying: ${trade_amount:.2f} of {outcome} ({trade_coin.upper() or '?'} lot | {entry_type})")
 
             # Build trade record for dashboard
             trade_record = {
