@@ -778,19 +778,21 @@ class HFTClient:
             # Note: py-clob-client may need specific FOK handling
             # This is a simplified implementation
 
-            order_a = self._clob_client.create_order(
+            from py_clob_client.clob_types import OrderArgs
+
+            order_a = self._clob_client.create_order(OrderArgs(
                 token_id=opp.token_a_id,
                 price=price_a,
                 size=trade.size,
                 side=BUY,
-            )
+            ))
 
-            order_b = self._clob_client.create_order(
+            order_b = self._clob_client.create_order(OrderArgs(
                 token_id=opp.token_b_id,
                 price=price_b,
                 size=trade.size,
                 side=BUY,
-            )
+            ))
 
             # Submit both orders
             result_a = self._clob_client.post_order(order_a)
@@ -952,18 +954,20 @@ class HFTClient:
                 price_a = min((market.token_a_ask or 0) * (1 + buffer), 0.99)
                 price_b = min((market.token_b_ask or 0) * (1 + buffer), 0.99)
 
-                order_a = self._clob_client.create_order(
+                from py_clob_client.clob_types import OrderArgs
+
+                order_a = self._clob_client.create_order(OrderArgs(
                     token_id=market.token_a_id,
                     price=price_a,
                     size=trade.size,
                     side=BUY,
-                )
-                order_b = self._clob_client.create_order(
+                ))
+                order_b = self._clob_client.create_order(OrderArgs(
                     token_id=market.token_b_id,
                     price=price_b,
                     size=trade.size,
                     side=BUY,
-                )
+                ))
 
                 result_a = self._clob_client.post_order(order_a)
                 result_b = self._clob_client.post_order(order_b)
@@ -984,12 +988,14 @@ class HFTClient:
                 token_id = signal.target_token
                 price = min((signal.target_price or 0) * (1 + buffer), 0.99)
 
-                order = self._clob_client.create_order(
+                from py_clob_client.clob_types import OrderArgs
+
+                order = self._clob_client.create_order(OrderArgs(
                     token_id=token_id,
                     price=price,
                     size=trade.size,
                     side=BUY,
-                )
+                ))
 
                 result = self._clob_client.post_order(order)
                 success = result.get("success") or result.get("status") == "matched"
