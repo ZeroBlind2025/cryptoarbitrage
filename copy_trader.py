@@ -605,29 +605,31 @@ def get_clob_client() -> Optional["ClobClient"]:
         print("[ALGO] CLOB client FAILED: POLYGON_PRIVATE_KEY not set in environment", flush=True)
         return None
 
-    if not FUNDER_ADDRESS:
-        print("[ALGO] CLOB client FAILED: POLYMARKET_FUNDER_ADDRESS (or POLYGON_ADDRESS) not set in environment", flush=True)
-        return None
-
-    print(f"[ALGO] Initializing CLOB client: key={PRIVATE_KEY[:6]}...{PRIVATE_KEY[-4:]}, "
-          f"funder={FUNDER_ADDRESS[:6]}...{FUNDER_ADDRESS[-4:]}, sig_type={SIGNATURE_TYPE}", flush=True)
+    print(f"[ALGO] Initializing CLOB client: key={PRIVATE_KEY[:6]}...{PRIVATE_KEY[-4:]}", flush=True)
+    if FUNDER_ADDRESS:
+        print(f"[ALGO]   funder={FUNDER_ADDRESS[:6]}...{FUNDER_ADDRESS[-4:]}, sig_type={SIGNATURE_TYPE}", flush=True)
 
     try:
-        # For signature_type=0 (EOA), funder is not needed
-        funder = FUNDER_ADDRESS if SIGNATURE_TYPE != 0 else None
-        if SIGNATURE_TYPE == 0 and FUNDER_ADDRESS:
-            print(f"[ALGO] NOTE: signature_type=0 (EOA) ignores funder address", flush=True)
+        # Minimal client setup - just key + chain_id
+        # Then layer on signature_type + funder only if funder is provided
+        if FUNDER_ADDRESS:
+            client = ClobClient(
+                CLOB_API,
+                key=PRIVATE_KEY,
+                chain_id=137,
+                signature_type=SIGNATURE_TYPE,
+                funder=FUNDER_ADDRESS,
+            )
+        else:
+            client = ClobClient(
+                CLOB_API,
+                key=PRIVATE_KEY,
+                chain_id=137,
+            )
 
-        client = ClobClient(
-            CLOB_API,
-            key=PRIVATE_KEY,
-            chain_id=137,
-            signature_type=SIGNATURE_TYPE,
-            funder=funder,
-        )
         creds = client.create_or_derive_api_creds()
         client.set_api_creds(creds)
-        print(f"[ALGO] CLOB client initialized successfully", flush=True)
+        print(f"[ALGO] CLOB client initialized successfully (api_key={creds.api_key[:8]}...)", flush=True)
         return client
     except Exception as e:
         print(f"[ALGO] CLOB client FAILED during init: {e}", flush=True)
