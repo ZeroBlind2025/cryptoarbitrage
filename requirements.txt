@@ -14,9 +14,9 @@ aiohttp>=3.9.0
 websockets>=12.0
 websocket-client>=1.6.0  # For Polymarket Sports WebSocket
 
-# Blockchain/Trading (install when ready for live trading)
-# py-clob-client  # Polymarket's official client
-# web3>=6.0.0     # Polygon interaction
+# Blockchain/Trading
+py-clob-client
+web3>=6.0.0
 
 # Analysis (for white paper)
 pandas>=2.0.0
