@@ -489,11 +489,8 @@
                                 </div>
                                 <button
                                     onClick={toggleDynamicLots}
-                                    disabled={!copyTrader.running}
                                     className={`px-3 py-1 text-xs rounded border transition-all ${
-                                        !copyTrader.running
-                                            ? 'bg-slate-700 text-slate-500 cursor-not-allowed border-slate-600'
-                                            : isDynamic
+                                        isDynamic
                                                 ? 'bg-cyan-500/20 text-cyan-400 border-cyan-500/30 hover:bg-cyan-500/30'
                                                 : 'bg-slate-600/50 text-slate-400 border-slate-500/30 hover:bg-slate-500/30'
                                     }`}
@@ -543,7 +540,7 @@
                             )}
 
                             {/* Quick presets: apply to all coins (manual mode only) */}
-                            {copyTrader.running && !isDynamic && (
+                            {!isDynamic && (
                                 <div className="flex gap-2">
                                     <span className="text-xs text-slate-500 self-center">All:</span>
                                     {[5, 10, 20, 30, 40, 50].map(amt => (
@@ -566,16 +563,14 @@
                             {!isDynamic && (
                                 <button
                                     onClick={handleSave}
-                                    disabled={saving || !copyTrader.running}
+                                    disabled={saving}
                                     className={`w-full py-2 rounded-lg text-sm font-medium transition-all ${
-                                        !copyTrader.running
-                                            ? 'bg-slate-700 text-slate-500 cursor-not-allowed'
-                                            : saving
-                                                ? 'bg-cyan-500/20 text-cyan-300 cursor-wait'
-                                                : 'bg-cyan-500/20 text-cyan-400 border border-cyan-500/30 hover:bg-cyan-500/30'
+                                        saving
+                                            ? 'bg-cyan-500/20 text-cyan-300 cursor-wait'
+                                            : 'bg-cyan-500/20 text-cyan-400 border border-cyan-500/30 hover:bg-cyan-500/30'
                                     }`}
                                 >
-                                    {!copyTrader.running ? 'Start Algo to change settings' : saving ? 'Saving...' : 'Save Lot Sizes'}
+                                    {saving ? 'Saving...' : 'Save Lot Sizes'}
                                 </button>
                             )}
 
