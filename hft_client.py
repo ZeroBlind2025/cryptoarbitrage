@@ -778,21 +778,17 @@ class HFTClient:
             # Note: py-clob-client may need specific FOK handling
             # This is a simplified implementation
 
-            from py_clob_client.clob_types import OrderArgs
+            from py_clob_client.clob_types import OrderArgs, PartialCreateOrderOptions
 
-            order_a = self._clob_client.create_order(OrderArgs(
-                token_id=opp.token_a_id,
-                price=price_a,
-                size=trade.size,
-                side=BUY,
-            ))
+            order_a = self._clob_client.create_order(
+                OrderArgs(token_id=opp.token_a_id, price=price_a, size=trade.size, side=BUY),
+                options=PartialCreateOrderOptions(tick_size="0.01"),
+            )
 
-            order_b = self._clob_client.create_order(OrderArgs(
-                token_id=opp.token_b_id,
-                price=price_b,
-                size=trade.size,
-                side=BUY,
-            ))
+            order_b = self._clob_client.create_order(
+                OrderArgs(token_id=opp.token_b_id, price=price_b, size=trade.size, side=BUY),
+                options=PartialCreateOrderOptions(tick_size="0.01"),
+            )
 
             # Submit both orders
             result_a = self._clob_client.post_order(order_a)
@@ -954,20 +950,16 @@ class HFTClient:
                 price_a = min((market.token_a_ask or 0) * (1 + buffer), 0.99)
                 price_b = min((market.token_b_ask or 0) * (1 + buffer), 0.99)
 
-                from py_clob_client.clob_types import OrderArgs
+                from py_clob_client.clob_types import OrderArgs, PartialCreateOrderOptions
 
-                order_a = self._clob_client.create_order(OrderArgs(
-                    token_id=market.token_a_id,
-                    price=price_a,
-                    size=trade.size,
-                    side=BUY,
-                ))
-                order_b = self._clob_client.create_order(OrderArgs(
-                    token_id=market.token_b_id,
-                    price=price_b,
-                    size=trade.size,
-                    side=BUY,
-                ))
+                order_a = self._clob_client.create_order(
+                    OrderArgs(token_id=market.token_a_id, price=price_a, size=trade.size, side=BUY),
+                    options=PartialCreateOrderOptions(tick_size="0.01"),
+                )
+                order_b = self._clob_client.create_order(
+                    OrderArgs(token_id=market.token_b_id, price=price_b, size=trade.size, side=BUY),
+                    options=PartialCreateOrderOptions(tick_size="0.01"),
+                )
 
                 result_a = self._clob_client.post_order(order_a)
                 result_b = self._clob_client.post_order(order_b)
@@ -988,14 +980,12 @@ class HFTClient:
                 token_id = signal.target_token
                 price = min((signal.target_price or 0) * (1 + buffer), 0.99)
 
-                from py_clob_client.clob_types import OrderArgs
+                from py_clob_client.clob_types import OrderArgs, PartialCreateOrderOptions
 
-                order = self._clob_client.create_order(OrderArgs(
-                    token_id=token_id,
-                    price=price,
-                    size=trade.size,
-                    side=BUY,
-                ))
+                order = self._clob_client.create_order(
+                    OrderArgs(token_id=token_id, price=price, size=trade.size, side=BUY),
+                    options=PartialCreateOrderOptions(tick_size="0.01"),
+                )
 
                 result = self._clob_client.post_order(order)
                 success = result.get("success") or result.get("status") == "matched"
