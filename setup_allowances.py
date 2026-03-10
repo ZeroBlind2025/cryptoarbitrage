@@ -39,11 +39,32 @@ def main():
     if not private_key.startswith("0x"):
         private_key = "0x" + private_key
 
-    rpc_url = os.getenv("POLYGON_RPC_URL", "https://polygon-rpc.com")
+    rpc_fallbacks = [
+        "https://polygon-bor-rpc.publicnode.com",
+        "https://polygon.llamarpc.com",
+        "https://rpc.ankr.com/polygon",
+        "https://polygon-rpc.com",
+    ]
+    rpc_urls = []
+    user_rpc = os.getenv("POLYGON_RPC_URL", "")
+    if user_rpc:
+        rpc_urls.append(user_rpc)
+    rpc_urls.extend(rpc_fallbacks)
     chain_id = 137
 
-    web3 = Web3(Web3.HTTPProvider(rpc_url))
-    web3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
+    web3 = None
+    for rpc_url in rpc_urls:
+        try:
+            web3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 10}))
+            web3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
+            if web3.is_connected():
+                print(f"Connected via {rpc_url}")
+                break
+        except Exception:
+            continue
+    if not web3 or not web3.is_connected():
+        print("[ERROR] Could not connect to any Polygon RPC endpoint")
+        sys.exit(1)
 
     account = web3.eth.account.from_key(private_key)
     pub_key = account.address
