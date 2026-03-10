@@ -1590,13 +1590,14 @@ def api_copy_trader_settings_update():
     if not changes:
         return jsonify({"error": "No settings provided. Send bet_amount or coin_bet_amounts."}), 400
 
+    active = momentum_engine or copy_trader
     return jsonify({
         "success": True,
         "changes": changes,
         "current": {
-            "bet_amount": copy_trader.bet_amount,
-            "coin_bet_amounts": copy_trader.coin_bet_amounts,
-            "balance": copy_trader.positions["stats"]["balance"],
+            "bet_amount": active.bet_amount,
+            "coin_bet_amounts": active.coin_bet_amounts,
+            "balance": active.positions["stats"]["balance"] if hasattr(active, 'positions') and "stats" in active.positions else 0,
         }
     })
 
