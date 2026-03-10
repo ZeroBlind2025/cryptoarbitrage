@@ -498,7 +498,7 @@ def _check_neg_risk(condition_id: str) -> bool:
     return False
 
 
-def redeem_winning_position(condition_id: str, token_id: str = "", dry_run: bool = False) -> bool:
+def redeem_winning_position(condition_id: str, token_id: str = "", dry_run: bool = False):
     """Redeem winning conditional tokens on-chain for USDC.
 
     After a market resolves, winning shares must be redeemed via the
@@ -510,7 +510,7 @@ def redeem_winning_position(condition_id: str, token_id: str = "", dry_run: bool
         dry_run: If True, log but don't submit the transaction.
 
     Returns:
-        True if redemption succeeded (or was a no-op), False on error.
+        True if redemption succeeded, None if no-op (balance=0), False on error.
     """
     if not HAS_WEB3:
         print("[REDEEM] web3 not installed — skipping on-chain redemption")
@@ -563,7 +563,7 @@ def redeem_winning_position(condition_id: str, token_id: str = "", dry_run: bool
             balance = ctf_token.functions.balanceOf(wallet, tid_int).call()
             if balance == 0:
                 print(f"[REDEEM] No tokens to redeem (balance=0 for token {token_id[:20]}...)")
-                return True  # Nothing to redeem — not an error
+                return None  # Nothing to redeem — not an error, but not a real redemption
             print(f"[REDEEM] Token balance: {balance / 1e6:.2f} shares")
         except Exception as e:
             print(f"[REDEEM] Could not check balance (proceeding anyway): {e}")
@@ -1772,9 +1772,14 @@ class CopyTrader:
         if not open_positions:
             return
 
+        # Only check non-momentum positions (momentum has its own check_resolutions)
+        copy_positions = [p for p in open_positions if p.get("source") != "momentum"]
+        if not copy_positions:
+            return
+
         resolved_this_check = 0
 
-        for position in open_positions[:]:  # Copy list to allow modification
+        for position in copy_positions[:]:  # Copy list to allow modification
             condition_id = position.get("condition_id", "")
             slug = position.get("slug", "")
             token_id = position.get("token_id", "")
@@ -1860,17 +1865,19 @@ class CopyTrader:
                             token_id=token_id,
                             dry_run=self.dry_run,
                         )
-                        position["redeemed"] = redeemed
+                        position["redeemed"] = bool(redeemed)
                         _log_copy_trade("redeem", {
                             "market": position.get("market", ""),
                             "condition_id": condition_id,
                             "token_id": token_id,
-                            "redeemed": redeemed,
+                            "redeemed": bool(redeemed),
                             "dry_run": self.dry_run,
                             "pnl": position.get("pnl", 0),
                         })
-                        if redeemed:
+                        if redeemed is True:
                             print(f"[ALGO] Auto-redeemed: {position['market'][:30]}")
+                        elif redeemed is None:
+                            pass  # No-op: balance was 0, already logged by redeem function
                         else:
                             print(f"[ALGO] Redemption failed for {position['market'][:30]} — redeem manually")
                     except Exception as e:
