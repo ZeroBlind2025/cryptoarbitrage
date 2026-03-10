@@ -273,8 +273,10 @@ def check_target_position(token_id: str) -> Optional[dict]:
                         else:
                             return {"resolved": True, "won": False}
                     elif cur_price <= 0.01 or cur_price >= 0.99:
-                        # Not redeemable yet but price extreme = effectively resolved
-                        return {"resolved": True, "won": cur_price >= 0.99}
+                        # Price extreme but not redeemable yet — oracle hasn't settled.
+                        # Don't mark resolved; keep checking so we redeem when ready.
+                        print(f"[ALGO] Price extreme ({cur_price}) but not redeemable yet — waiting for oracle")
+                        return None
         return None
     except Exception as e:
         print(f"[ALGO] Target position check error: {e}")
