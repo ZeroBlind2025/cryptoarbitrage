@@ -902,17 +902,22 @@ def place_bet(client: "ClobClient", token_id: str, amount: float, max_price: flo
         return {}
     try:
         if max_price and max_price > 0:
-            # Price-protected FOK limit order: fills immediately or cancels
-            limit_price = min(round(max_price, 4), 0.99)
-            size = amount / limit_price  # shares to buy at this price
+            # Price-protected FOK limit order: fills immediately or cancels.
+            # FOK precision rules: price must match tick_size (2 decimals for 0.01),
+            # size max 2 decimals, and price*size (taker amount) max 4 decimals.
+            import math
+            limit_price = min(round(max_price, 2), 0.99)
+            if limit_price < 0.01:
+                limit_price = 0.01
+            size = math.floor(amount / limit_price * 100) / 100  # floor to 2 decimals
 
             from py_clob_client.clob_types import OrderArgs, PartialCreateOrderOptions
-            print(f"[ALGO] FOK limit order: {size:.2f} shares @ {limit_price:.4f} (max ${amount:.2f})")
+            print(f"[ALGO] FOK limit order: {size:.2f} shares @ {limit_price:.2f} (max ${amount:.2f})")
             order = client.create_order(
                 OrderArgs(
                     token_id=token_id,
                     price=limit_price,
-                    size=round(size, 2),
+                    size=size,
                     side=BUY,
                 ),
                 options=PartialCreateOrderOptions(tick_size="0.01"),
@@ -968,14 +973,16 @@ def place_sell(client: "ClobClient", token_id: str, size: float, min_price: floa
     """
     try:
         if min_price and min_price > 0:
-            limit_price = max(round(min_price, 4), 0.01)
+            import math
+            limit_price = max(round(min_price, 2), 0.01)
+            size = math.floor(size * 100) / 100  # floor to 2 decimals
             from py_clob_client.clob_types import OrderArgs, PartialCreateOrderOptions
-            print(f"[ALGO] Sell FOK: {size:.2f} shares @ min {limit_price:.4f}")
+            print(f"[ALGO] Sell FOK: {size:.2f} shares @ min {limit_price:.2f}")
             order = client.create_order(
                 OrderArgs(
                     token_id=token_id,
                     price=limit_price,
-                    size=round(size, 2),
+                    size=size,
                     side=SELL,
                 ),
                 options=PartialCreateOrderOptions(tick_size="0.01"),
