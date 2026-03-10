@@ -450,14 +450,39 @@ ERC1155_BALANCE_ABI = json.loads("""[
 ]""")
 
 
+POLYGON_RPC_FALLBACKS = [
+    "https://polygon-mainnet.g.alchemy.com/v2/S3PJkQkcYoIJiE9iaUxFc",
+    "https://polygon-bor-rpc.publicnode.com",
+    "https://polygon.llamarpc.com",
+    "https://rpc.ankr.com/polygon",
+    "https://polygon-rpc.com",
+]
+
+
 def _get_web3():
-    """Lazy-initialize a Web3 connection to Polygon."""
+    """Lazy-initialize a Web3 connection to Polygon with fallback RPCs."""
     if not HAS_WEB3:
         return None
-    rpc_url = os.getenv("POLYGON_RPC_URL", "https://polygon-rpc.com")
-    w3 = Web3(Web3.HTTPProvider(rpc_url))
-    w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
-    return w3
+
+    # Try user-configured RPC first, then fallbacks
+    rpc_urls = []
+    user_rpc = os.getenv("POLYGON_RPC_URL", "")
+    if user_rpc:
+        rpc_urls.append(user_rpc)
+    rpc_urls.extend(POLYGON_RPC_FALLBACKS)
+
+    for rpc_url in rpc_urls:
+        try:
+            w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 10}))
+            w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
+            if w3.is_connected():
+                print(f"[RPC] Connected via {rpc_url[:40]}...")
+                return w3
+        except Exception:
+            continue
+
+    print("[RPC] All Polygon RPC endpoints failed")
+    return None
 
 
 def _check_neg_risk(condition_id: str) -> bool:
@@ -505,9 +530,19 @@ def redeem_winning_position(condition_id: str, token_id: str = "", dry_run: bool
         print(f"[REDEEM] Invalid condition_id format: {condition_id[:30]}")
         return False
 
-    w3 = _get_web3()
-    if not w3 or not w3.is_connected():
-        print("[REDEEM] Cannot connect to Polygon RPC")
+    w3 = None
+    for _rpc_attempt in range(3):
+        w3 = _get_web3()
+        if w3 and w3.is_connected():
+            break
+        wait = 2 ** (_rpc_attempt + 1)
+        print(f"[REDEEM] RPC connect failed, retrying in {wait}s...")
+        import time as _time
+        _time.sleep(wait)
+        w3 = None
+
+    if not w3:
+        print("[REDEEM] Cannot connect to Polygon RPC after retries")
         return False
 
     account = w3.eth.account.from_key(PRIVATE_KEY)
