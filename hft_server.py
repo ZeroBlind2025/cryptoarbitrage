@@ -1325,8 +1325,18 @@ def copy_trader_loop():
             # Paused = no new trades, but open positions still resolve
             copy_trader.check_resolutions()
 
-            # Heartbeat every ~5 min
+            # Auto-sweep unredeemed winnings every ~5 min (piggyback on heartbeat)
             heartbeat_every = max(1, 300 // poll_s)
+            if loop_count % heartbeat_every == 0:
+                try:
+                    from copy_trader import sweep_unredeemed
+                    sweep_stats = sweep_unredeemed(dry_run=copy_trader.dry_run)
+                    if sweep_stats.get("redeemed", 0) > 0:
+                        print(f"[SWEEP] Auto-sweep claimed {sweep_stats['redeemed']} position(s)", flush=True)
+                except Exception as e:
+                    print(f"[SWEEP] Auto-sweep error: {e}", flush=True)
+
+            # Heartbeat every ~5 min
             if loop_count % heartbeat_every == 0:
                 stats = copy_trader.positions.get("stats", {})
                 open_count = len(copy_trader.positions.get("open", []))
@@ -2141,6 +2151,25 @@ def api_momentum_trades():
     trades = list(momentum_trades)[-limit:]
     trades.reverse()
     return jsonify(trades)
+
+
+@app.route('/api/sweep', methods=['POST'])
+def api_sweep():
+    """Sweep all unredeemed winning positions from our Polymarket wallet.
+
+    This catches any winnings the bot missed — e.g. from before it was running,
+    or from failed auto-redemption attempts.  Returns redemption stats.
+    """
+    try:
+        from copy_trader import sweep_unredeemed
+    except ImportError:
+        return jsonify({"error": "sweep_unredeemed not available"}), 500
+
+    data = request.get_json() or {}
+    dry_run = data.get("dry_run", False)
+
+    stats = sweep_unredeemed(dry_run=dry_run)
+    return jsonify({"success": True, "dry_run": dry_run, **stats})
 
 
 @app.route('/api/trades/demo')
