@@ -1342,57 +1342,12 @@ def copy_trader_loop():
 
 @app.route('/api/copy-trader/start', methods=['POST'])
 def api_copy_trader_start():
-    """Start copy trading"""
-    global copy_trader, copy_trader_thread, stop_copy_trader, copy_trader_paused
-
-    if not HAS_COPY_TRADER:
-        return jsonify({"error": "Poly Algo module not available"}), 400
-
-    if copy_trader_thread and copy_trader_thread.is_alive():
-        return jsonify({"error": "Poly Algo already running"}), 400
-
-    data = request.get_json() or {}
-    live_mode = data.get('live', False)
-    crypto_only = data.get('crypto_only', True)
-    bet_amount = data.get('bet_amount')
-    coin_bet_amounts = data.get('coin_bet_amounts')  # e.g. {"btc": 1.0, "eth": 2.0, "sol": 1.0}
-
-    # Require confirmation for live mode
-    if live_mode and not data.get('confirm_live'):
-        return jsonify({
-            "error": "Live mode requires confirmation",
-            "message": "Set confirm_live=true to enable live algo trading"
-        }), 403
-
-    # Create copy trader with dashboard callback
-    # Opening balance is set via ALGO_STARTING_BALANCE env var on Railway
-    try:
-        copy_trader = CopyTrader(
-            dry_run=not live_mode,
-            crypto_only=crypto_only,
-            on_trade=on_copy_trade,
-            bet_amount=bet_amount,
-            coin_bet_amounts=coin_bet_amounts,
-        )
-        copy_trader.start()
-    except Exception as e:
-        print(f"[SERVER] Failed to start Poly Algo: {e}")
-        import traceback; traceback.print_exc()
-        copy_trader = None
-        return jsonify({"error": f"Failed to start: {e}"}), 500
-
-    # Start background thread
-    stop_copy_trader.clear()
-    copy_trader_paused.clear()  # Start in active (not paused) state
-    copy_trader_thread = threading.Thread(target=copy_trader_loop, daemon=True)
-    copy_trader_thread.start()
-
-    mode_str = "LIVE" if live_mode else "DRY RUN"
+    """Start copy trading — DISABLED: copy trader is disabled to prevent
+    uncontrolled trading. Use momentum engine instead."""
     return jsonify({
-        "success": True,
-        "message": f"Poly Algo started in {mode_str} mode, following {copy_trader.target_name}",
-        "target": TARGET_ADDRESS,
-    })
+        "error": "Copy trader is disabled",
+        "message": "Copy trader has been disabled on the backend. Use the momentum engine instead."
+    }), 403
 
 
 @app.route('/api/copy-trader/stop', methods=['POST'])
@@ -1556,13 +1511,16 @@ def api_copy_trader_dynamic_lots():
 
 @app.route('/api/copy-trader/settings', methods=['GET'])
 def api_copy_trader_settings_get():
-    """Get current copy trader settings"""
+    """Get current trading settings (works with momentum engine when copy trader is disabled)"""
     from copy_trader import BET_AMOUNT as DEFAULT_BET_AMOUNT, ALGO_STARTING_BALANCE, COIN_BET_AMOUNTS as DEFAULT_COIN_BETS
 
-    current_bet_amount = copy_trader.bet_amount if copy_trader else DEFAULT_BET_AMOUNT
-    current_coin_bets = copy_trader.coin_bet_amounts if copy_trader else dict(DEFAULT_COIN_BETS)
+    active = copy_trader or momentum_engine
+    current_bet_amount = active.bet_amount if active else DEFAULT_BET_AMOUNT
+    current_coin_bets = active.coin_bet_amounts if active else dict(DEFAULT_COIN_BETS)
     current_balance = (copy_trader.positions.get("stats", {}).get("balance", ALGO_STARTING_BALANCE)
-                       if copy_trader else ALGO_STARTING_BALANCE)
+                       if copy_trader else
+                       momentum_engine.positions.get("stats", {}).get("balance", ALGO_STARTING_BALANCE)
+                       if momentum_engine else ALGO_STARTING_BALANCE)
 
     return jsonify({
         "bet_amount": current_bet_amount,
@@ -1581,11 +1539,12 @@ def api_copy_trader_settings_get():
 
 @app.route('/api/copy-trader/settings', methods=['POST'])
 def api_copy_trader_settings_update():
-    """Update copy trader settings at runtime.
-    Changes take effect immediately - new trades will use the new bet amount.
-    Opening balance resets the balance tracking."""
-    if not copy_trader:
-        return jsonify({"error": "Poly Algo not running. Start it first."}), 400
+    """Update trading settings at runtime (lot sizes, bet amounts).
+    Works with momentum engine even when copy trader is disabled.
+    Changes take effect immediately - new trades will use the new bet amount."""
+    # Allow settings changes as long as at least one engine is available
+    if not copy_trader and not momentum_engine:
+        return jsonify({"error": "No trading engine running. Start momentum engine first."}), 400
 
     data = request.get_json() or {}
     changes = []
@@ -1595,29 +1554,34 @@ def api_copy_trader_settings_update():
         new_amount = float(data['bet_amount'])
         if new_amount <= 0:
             return jsonify({"error": "Bet amount must be positive"}), 400
-        old_amount = copy_trader.bet_amount
-        copy_trader.bet_amount = new_amount
+        # Get old amount from whichever engine is running
+        active = momentum_engine or copy_trader
+        old_amount = active.bet_amount
+        if copy_trader:
+            copy_trader.bet_amount = new_amount
         if momentum_engine:
             momentum_engine.bet_amount = new_amount
         changes.append(f"Bet amount: ${old_amount:.2f} -> ${new_amount:.2f}")
-        print(f"[ALGO] Bet amount changed: ${old_amount:.2f} -> ${new_amount:.2f} (copy+momentum)", flush=True)
+        print(f"[ALGO] Bet amount changed: ${old_amount:.2f} -> ${new_amount:.2f}", flush=True)
 
     # Update per-coin lot sizes (e.g. {"btc": 1.0, "eth": 2.0, "sol": 1.0})
-    # Applies to BOTH copy trader and momentum engine
+    # Applies to BOTH copy trader and momentum engine (whichever is running)
     if 'coin_bet_amounts' in data:
         new_coin_bets = data['coin_bet_amounts']
         if not isinstance(new_coin_bets, dict):
             return jsonify({"error": "coin_bet_amounts must be an object like {\"btc\": 1.0, \"eth\": 2.0}"}), 400
+        active = momentum_engine or copy_trader
         for coin, amt in new_coin_bets.items():
             amt = float(amt)
             if amt <= 0:
                 return jsonify({"error": f"Lot size for {coin} must be positive"}), 400
-            old_amt = copy_trader.coin_bet_amounts.get(coin, copy_trader.bet_amount)
-            copy_trader.coin_bet_amounts[coin] = amt
+            old_amt = active.coin_bet_amounts.get(coin, active.bet_amount)
+            if copy_trader:
+                copy_trader.coin_bet_amounts[coin] = amt
             if momentum_engine:
                 momentum_engine.coin_bet_amounts[coin] = amt
             changes.append(f"{coin.upper()} lot: ${old_amt:.2f} -> ${amt:.2f}")
-            print(f"[ALGO] {coin.upper()} lot size changed: ${old_amt:.2f} -> ${amt:.2f} (copy+momentum)", flush=True)
+            print(f"[ALGO] {coin.upper()} lot size changed: ${old_amt:.2f} -> ${amt:.2f}", flush=True)
 
     # Opening balance is now set via ALGO_STARTING_BALANCE env var on Railway
     if 'starting_balance' in data:
