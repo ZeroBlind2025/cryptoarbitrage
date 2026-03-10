@@ -46,6 +46,13 @@ try:
 except ImportError:
     HAS_CLOB_WS = False
 
+try:
+    from web3 import Web3
+    from web3.middleware import ExtraDataToPOAMiddleware
+    HAS_WEB3 = True
+except ImportError:
+    HAS_WEB3 = False
+
 
 # =============================================================================
 # CONFIGURATION
@@ -57,7 +64,7 @@ TARGET_ADDRESS = os.getenv("COPY_TARGET_ADDRESS", "0xd0d6053c3c37e727402d84c1406
 # Your credentials (from environment)
 FUNDER_ADDRESS = os.getenv("POLYMARKET_FUNDER_ADDRESS", os.getenv("POLYGON_ADDRESS", ""))
 PRIVATE_KEY = os.getenv("POLYGON_PRIVATE_KEY", "")
-SIGNATURE_TYPE = int(os.getenv("POLYMARKET_SIGNATURE_TYPE", "1"))  # 0=EOA, 1=Poly proxy, 2=Browser/Privy
+SIGNATURE_TYPE = int(os.getenv("POLYMARKET_SIGNATURE_TYPE", "2"))  # 0=EOA, 1=Poly proxy, 2=Gnosis Safe (most common)
 
 # Builder credentials (from polymarket.com/settings?tab=builder)
 # IMPORTANT: These are BUILDER creds, NOT CLOB API creds. Get them from polymarket.com/settings?tab=builder
@@ -386,6 +393,248 @@ def get_market_resolution(condition_id: str = "", slug: str = "", token_id: str 
 
 
 # =============================================================================
+# ON-CHAIN REDEMPTION
+# =============================================================================
+
+# Conditional Tokens Framework contract — holds all outcome tokens
+CTF_CONTRACT_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
+NEG_RISK_ADAPTER_ADDRESS = "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296"
+# Polymarket uses native USDC as collateral
+USDC_ADDRESS = "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"
+# Bridged USDC.e (legacy — some older markets use this)
+USDC_E_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+HASH_ZERO = b"\x00" * 32
+
+# Minimal ABI for CTF redeemPositions
+CTF_REDEEM_ABI = json.loads("""[
+    {
+        "inputs": [
+            {"name": "collateralToken", "type": "address"},
+            {"name": "parentCollectionId", "type": "bytes32"},
+            {"name": "conditionId", "type": "bytes32"},
+            {"name": "indexSets", "type": "uint256[]"}
+        ],
+        "name": "redeemPositions",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function"
+    }
+]""")
+
+# Minimal ABI for NegRiskAdapter redeemPositions (different signature)
+NEG_RISK_REDEEM_ABI = json.loads("""[
+    {
+        "inputs": [
+            {"name": "conditionId", "type": "bytes32"},
+            {"name": "amounts", "type": "uint256[]"}
+        ],
+        "name": "redeemPositions",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function"
+    }
+]""")
+
+# Minimal ABI for ERC1155 balanceOf (to check token holdings before redeeming)
+ERC1155_BALANCE_ABI = json.loads("""[
+    {
+        "inputs": [
+            {"name": "account", "type": "address"},
+            {"name": "id", "type": "uint256"}
+        ],
+        "name": "balanceOf",
+        "outputs": [{"name": "", "type": "uint256"}],
+        "stateMutability": "view",
+        "type": "function"
+    }
+]""")
+
+
+def _get_web3():
+    """Lazy-initialize a Web3 connection to Polygon."""
+    if not HAS_WEB3:
+        return None
+    rpc_url = os.getenv("POLYGON_RPC_URL", "https://polygon-rpc.com")
+    w3 = Web3(Web3.HTTPProvider(rpc_url))
+    w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
+    return w3
+
+
+def _check_neg_risk(condition_id: str) -> bool:
+    """Check if a market is neg_risk by querying the CLOB API."""
+    try:
+        resp = requests.get(f"{CLOB_API}/markets/{condition_id}", timeout=10)
+        if resp.status_code == 200:
+            return resp.json().get("neg_risk", False)
+    except Exception:
+        pass
+    return False
+
+
+def redeem_winning_position(condition_id: str, token_id: str = "", dry_run: bool = False) -> bool:
+    """Redeem winning conditional tokens on-chain for USDC.
+
+    After a market resolves, winning shares must be redeemed via the
+    Conditional Tokens Framework (CTF) contract to convert them back to USDC.
+
+    Args:
+        condition_id: The market's condition ID (hex string, 0x-prefixed or not).
+        token_id: The specific token_id we hold (used to check balance).
+        dry_run: If True, log but don't submit the transaction.
+
+    Returns:
+        True if redemption succeeded (or was a no-op), False on error.
+    """
+    if not HAS_WEB3:
+        print("[REDEEM] web3 not installed — skipping on-chain redemption")
+        return False
+
+    if not PRIVATE_KEY:
+        print("[REDEEM] No POLYGON_PRIVATE_KEY — skipping redemption")
+        return False
+
+    if not condition_id:
+        print("[REDEEM] No condition_id — cannot redeem")
+        return False
+
+    # Ensure condition_id is 0x-prefixed and 32 bytes
+    cid = condition_id if condition_id.startswith("0x") else "0x" + condition_id
+    try:
+        condition_bytes = bytes.fromhex(cid[2:].zfill(64))
+    except ValueError:
+        print(f"[REDEEM] Invalid condition_id format: {condition_id[:30]}")
+        return False
+
+    w3 = _get_web3()
+    if not w3 or not w3.is_connected():
+        print("[REDEEM] Cannot connect to Polygon RPC")
+        return False
+
+    account = w3.eth.account.from_key(PRIVATE_KEY)
+    wallet = account.address
+    print(f"[REDEEM] Wallet: {wallet[:8]}...{wallet[-4:]}")
+
+    # Check if we actually hold tokens to redeem
+    if token_id:
+        try:
+            ctf_token = w3.eth.contract(
+                address=w3.to_checksum_address(CTF_CONTRACT_ADDRESS),
+                abi=ERC1155_BALANCE_ABI,
+            )
+            # token_id is a large int encoded as hex
+            tid_int = int(token_id, 16) if token_id.startswith("0x") else int(token_id)
+            balance = ctf_token.functions.balanceOf(wallet, tid_int).call()
+            if balance == 0:
+                print(f"[REDEEM] No tokens to redeem (balance=0 for token {token_id[:20]}...)")
+                return True  # Nothing to redeem — not an error
+            print(f"[REDEEM] Token balance: {balance / 1e6:.2f} shares")
+        except Exception as e:
+            print(f"[REDEEM] Could not check balance (proceeding anyway): {e}")
+
+    # Determine if neg_risk market
+    is_neg_risk = _check_neg_risk(condition_id)
+
+    if dry_run:
+        print(f"[REDEEM] DRY RUN: would redeem condition={cid[:20]}... neg_risk={is_neg_risk}")
+        return True
+
+    try:
+        nonce = w3.eth.get_transaction_count(wallet)
+        chain_id = 137  # Polygon
+
+        if is_neg_risk:
+            # NegRisk markets: call NegRiskAdapter.redeemPositions(conditionId, amounts)
+            # For neg_risk, we redeem all tokens we hold
+            contract = w3.eth.contract(
+                address=w3.to_checksum_address(NEG_RISK_ADAPTER_ADDRESS),
+                abi=NEG_RISK_REDEEM_ABI,
+            )
+            # Check balance for the specific token to determine amount
+            amount = 0
+            if token_id:
+                try:
+                    ctf_token = w3.eth.contract(
+                        address=w3.to_checksum_address(CTF_CONTRACT_ADDRESS),
+                        abi=ERC1155_BALANCE_ABI,
+                    )
+                    tid_int = int(token_id, 16) if token_id.startswith("0x") else int(token_id)
+                    amount = ctf_token.functions.balanceOf(wallet, tid_int).call()
+                except Exception:
+                    pass
+
+            if amount == 0:
+                print(f"[REDEEM] NegRisk: no token balance found, skipping")
+                return True
+
+            print(f"[REDEEM] NegRisk redemption: condition={cid[:20]}... amount={amount}")
+            tx = contract.functions.redeemPositions(
+                condition_bytes,
+                [amount],
+            ).build_transaction({
+                "chainId": chain_id,
+                "from": wallet,
+                "nonce": nonce,
+            })
+        else:
+            # Standard binary market: call CTF.redeemPositions(collateral, parent, conditionId, indexSets)
+            # Try native USDC first, then bridged USDC.e
+            contract = w3.eth.contract(
+                address=w3.to_checksum_address(CTF_CONTRACT_ADDRESS),
+                abi=CTF_REDEEM_ABI,
+            )
+
+            print(f"[REDEEM] Standard redemption: condition={cid[:20]}... indexSets=[1,2]")
+            tx = contract.functions.redeemPositions(
+                w3.to_checksum_address(USDC_ADDRESS),
+                HASH_ZERO,
+                condition_bytes,
+                [1, 2],  # Both outcome indices for binary market
+            ).build_transaction({
+                "chainId": chain_id,
+                "from": wallet,
+                "nonce": nonce,
+            })
+
+        # Sign and send
+        signed = w3.eth.account.sign_transaction(tx, private_key=PRIVATE_KEY)
+        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+        print(f"[REDEEM] Tx sent: {tx_hash.hex()}")
+
+        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+        if receipt.status == 1:
+            print(f"[REDEEM] SUCCESS: redeemed condition={cid[:20]}... tx={tx_hash.hex()}")
+            return True
+        else:
+            # Transaction reverted — might be USDC.e collateral instead
+            if not is_neg_risk:
+                print(f"[REDEEM] Native USDC failed, trying bridged USDC.e...")
+                nonce = w3.eth.get_transaction_count(wallet)
+                tx = contract.functions.redeemPositions(
+                    w3.to_checksum_address(USDC_E_ADDRESS),
+                    HASH_ZERO,
+                    condition_bytes,
+                    [1, 2],
+                ).build_transaction({
+                    "chainId": chain_id,
+                    "from": wallet,
+                    "nonce": nonce,
+                })
+                signed = w3.eth.account.sign_transaction(tx, private_key=PRIVATE_KEY)
+                tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+                receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+                if receipt.status == 1:
+                    print(f"[REDEEM] SUCCESS (USDC.e): tx={tx_hash.hex()}")
+                    return True
+
+            print(f"[REDEEM] FAILED: transaction reverted")
+            return False
+
+    except Exception as e:
+        print(f"[REDEEM] Error: {e}")
+        return False
+
+
+# =============================================================================
 # API FUNCTIONS
 # =============================================================================
 
@@ -640,11 +889,11 @@ def get_clob_client() -> Optional["ClobClient"]:
 _balance_error_until = 0.0  # Timestamp until which we skip orders due to balance/allowance errors
 
 def place_bet(client: "ClobClient", token_id: str, amount: float, max_price: float = 0) -> dict:
-    """Place a price-protected limit order. Returns fill details or empty dict on failure.
+    """Place a price-protected FOK limit order. Returns fill details or empty dict on failure.
 
-    Uses a GTC limit order at max_price (target's entry + buffer) so the order
-    won't fill at absurd prices if the market has moved. Falls back to FOK market
-    order only if no max_price is provided.
+    Uses a FOK (Fill-or-Kill) limit order at max_price so the order either fills
+    immediately or is cancelled — never sits on the book. Falls back to FOK market
+    order if no max_price is provided.
     """
     global _balance_error_until
     if time.time() < _balance_error_until:
@@ -653,12 +902,12 @@ def place_bet(client: "ClobClient", token_id: str, amount: float, max_price: flo
         return {}
     try:
         if max_price and max_price > 0:
-            # Price-protected limit order: won't pay more than max_price
+            # Price-protected FOK limit order: fills immediately or cancels
             limit_price = min(round(max_price, 4), 0.99)
             size = amount / limit_price  # shares to buy at this price
 
             from py_clob_client.clob_types import OrderArgs, PartialCreateOrderOptions
-            print(f"[ALGO] Limit order: {size:.2f} shares @ {limit_price:.4f} (max ${amount:.2f})")
+            print(f"[ALGO] FOK limit order: {size:.2f} shares @ {limit_price:.4f} (max ${amount:.2f})")
             order = client.create_order(
                 OrderArgs(
                     token_id=token_id,
@@ -668,7 +917,7 @@ def place_bet(client: "ClobClient", token_id: str, amount: float, max_price: flo
                 ),
                 options=PartialCreateOrderOptions(tick_size="0.01"),
             )
-            result = client.post_order(order)
+            result = client.post_order(order, orderType=OrderType.FOK)
         else:
             # Fallback: FOK market order (no price protection)
             print(f"[ALGO] WARNING: No max_price, using FOK market order")
@@ -711,16 +960,17 @@ def place_bet(client: "ClobClient", token_id: str, amount: float, max_price: flo
 
 
 def place_sell(client: "ClobClient", token_id: str, size: float, min_price: float = 0) -> dict:
-    """Place a sell order for `size` shares of token_id.
+    """Place a FOK sell order for `size` shares of token_id.
 
-    Uses a GTC limit order at min_price so we don't sell for less than the
-    current market value. Falls back to FOK market sell if no min_price given.
+    Uses a FOK limit order at min_price so the order either fills immediately
+    or is cancelled — never sits on the book. Falls back to FOK market sell
+    if no min_price given.
     """
     try:
         if min_price and min_price > 0:
             limit_price = max(round(min_price, 4), 0.01)
             from py_clob_client.clob_types import OrderArgs, PartialCreateOrderOptions
-            print(f"[ALGO] Sell limit: {size:.2f} shares @ min {limit_price:.4f}")
+            print(f"[ALGO] Sell FOK: {size:.2f} shares @ min {limit_price:.4f}")
             order = client.create_order(
                 OrderArgs(
                     token_id=token_id,
@@ -730,7 +980,7 @@ def place_sell(client: "ClobClient", token_id: str, size: float, min_price: floa
                 ),
                 options=PartialCreateOrderOptions(tick_size="0.01"),
             )
-            result = client.post_order(order)
+            result = client.post_order(order, orderType=OrderType.FOK)
         else:
             print(f"[ALGO] WARNING: No min_price, using FOK market sell")
             order = MarketOrderArgs(
@@ -1589,6 +1839,23 @@ class CopyTrader:
                     position["result"] = "WIN"
                     position["pnl"] = pnl
                     self.positions["stats"]["wins"] = self.positions["stats"].get("wins", 0) + 1
+
+                    # Auto-redeem winning shares on-chain → converts back to USDC
+                    try:
+                        redeemed = redeem_winning_position(
+                            condition_id=condition_id,
+                            token_id=token_id,
+                            dry_run=self.dry_run,
+                        )
+                        position["redeemed"] = redeemed
+                        if redeemed:
+                            print(f"[ALGO] Auto-redeemed: {position['market'][:30]}")
+                        else:
+                            print(f"[ALGO] Redemption failed for {position['market'][:30]} — redeem manually")
+                    except Exception as e:
+                        position["redeemed"] = False
+                        print(f"[ALGO] Redemption error: {e}")
+
                 elif won is False:
                     pnl = -amount
                     position["result"] = "LOSS"
