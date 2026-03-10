@@ -57,7 +57,7 @@ TARGET_ADDRESS = os.getenv("COPY_TARGET_ADDRESS", "0xd0d6053c3c37e727402d84c1406
 # Your credentials (from environment)
 FUNDER_ADDRESS = os.getenv("POLYMARKET_FUNDER_ADDRESS", os.getenv("POLYGON_ADDRESS", ""))
 PRIVATE_KEY = os.getenv("POLYGON_PRIVATE_KEY", "")
-SIGNATURE_TYPE = int(os.getenv("POLYMARKET_SIGNATURE_TYPE", "1"))  # 0=EOA, 1=Poly proxy, 2=Browser/Privy
+SIGNATURE_TYPE = int(os.getenv("POLYMARKET_SIGNATURE_TYPE", "2"))  # 0=EOA, 1=Poly proxy, 2=Gnosis Safe (most common)
 
 # Builder credentials (from polymarket.com/settings?tab=builder)
 # IMPORTANT: These are BUILDER creds, NOT CLOB API creds. Get them from polymarket.com/settings?tab=builder
