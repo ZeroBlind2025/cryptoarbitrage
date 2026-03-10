@@ -451,6 +451,53 @@ ERC1155_BALANCE_ABI = json.loads("""[
     }
 ]""")
 
+# Gnosis Safe minimal ABI — needed to execute redemptions through the proxy wallet
+GNOSIS_SAFE_ABI = json.loads("""[
+    {
+        "inputs": [
+            {"name": "to", "type": "address"},
+            {"name": "value", "type": "uint256"},
+            {"name": "data", "type": "bytes"},
+            {"name": "operation", "type": "uint8"},
+            {"name": "safeTxGas", "type": "uint256"},
+            {"name": "baseGas", "type": "uint256"},
+            {"name": "gasPrice", "type": "uint256"},
+            {"name": "gasToken", "type": "address"},
+            {"name": "refundReceiver", "type": "address"},
+            {"name": "signatures", "type": "bytes"}
+        ],
+        "name": "execTransaction",
+        "outputs": [{"name": "success", "type": "bool"}],
+        "stateMutability": "nonpayable",
+        "type": "function"
+    },
+    {
+        "inputs": [],
+        "name": "nonce",
+        "outputs": [{"name": "", "type": "uint256"}],
+        "stateMutability": "view",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {"name": "to", "type": "address"},
+            {"name": "value", "type": "uint256"},
+            {"name": "data", "type": "bytes"},
+            {"name": "operation", "type": "uint8"},
+            {"name": "safeTxGas", "type": "uint256"},
+            {"name": "baseGas", "type": "uint256"},
+            {"name": "gasPrice", "type": "uint256"},
+            {"name": "gasToken", "type": "address"},
+            {"name": "refundReceiver", "type": "address"},
+            {"name": "_nonce", "type": "uint256"}
+        ],
+        "name": "getTransactionHash",
+        "outputs": [{"name": "", "type": "bytes32"}],
+        "stateMutability": "view",
+        "type": "function"
+    }
+]""")
+
 
 POLYGON_RPC_FALLBACKS = [
     "https://polygon-mainnet.g.alchemy.com/v2/S3PJkQkcYoIJiE9iaUxFc",
@@ -498,11 +545,79 @@ def _check_neg_risk(condition_id: str) -> bool:
     return False
 
 
+def _exec_via_safe(w3, safe_address: str, to: str, call_data: bytes, account) -> str:
+    """Execute a transaction through a Gnosis Safe proxy wallet.
+
+    The EOA (account) is the owner of the Safe.  We compute the Safe tx hash,
+    sign it, and call execTransaction so the Safe executes the inner call.
+
+    Returns the transaction hash hex string, or raises on failure.
+    """
+    safe = w3.eth.contract(
+        address=w3.to_checksum_address(safe_address),
+        abi=GNOSIS_SAFE_ABI,
+    )
+    zero_addr = "0x" + "00" * 20
+
+    safe_nonce = safe.functions.nonce().call()
+    safe_tx_hash = safe.functions.getTransactionHash(
+        w3.to_checksum_address(to),  # to
+        0,                           # value
+        call_data,                   # data
+        0,                           # operation (Call)
+        0,                           # safeTxGas
+        0,                           # baseGas
+        0,                           # gasPrice
+        w3.to_checksum_address(zero_addr),  # gasToken
+        w3.to_checksum_address(zero_addr),  # refundReceiver
+        safe_nonce,                  # _nonce
+    ).call()
+
+    # Sign the Safe tx hash with the EOA key
+    sig = account.unsafe_sign_hash(safe_tx_hash)
+    # Pack signature as (r, s, v) — 32 + 32 + 1 = 65 bytes
+    signature_bytes = (
+        sig.r.to_bytes(32, "big") +
+        sig.s.to_bytes(32, "big") +
+        sig.v.to_bytes(1, "big")
+    )
+
+    # Build the outer transaction (EOA calls Safe.execTransaction)
+    eoa_nonce = w3.eth.get_transaction_count(account.address)
+    tx = safe.functions.execTransaction(
+        w3.to_checksum_address(to),
+        0,
+        call_data,
+        0,               # operation = Call
+        0, 0, 0,         # safeTxGas, baseGas, gasPrice
+        w3.to_checksum_address(zero_addr),
+        w3.to_checksum_address(zero_addr),
+        signature_bytes,
+    ).build_transaction({
+        "chainId": 137,
+        "from": account.address,
+        "nonce": eoa_nonce,
+    })
+
+    signed = w3.eth.account.sign_transaction(tx, private_key=PRIVATE_KEY)
+    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+    print(f"[REDEEM] Safe tx sent: {tx_hash.hex()}")
+
+    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+    if receipt.status != 1:
+        raise RuntimeError(f"Safe execTransaction reverted (tx={tx_hash.hex()})")
+    return tx_hash.hex()
+
+
 def redeem_winning_position(condition_id: str, token_id: str = "", dry_run: bool = False):
     """Redeem winning conditional tokens on-chain for USDC.
 
     After a market resolves, winning shares must be redeemed via the
     Conditional Tokens Framework (CTF) contract to convert them back to USDC.
+
+    For proxy wallets (SIGNATURE_TYPE >= 1), the redemption call is routed
+    through the Gnosis Safe's execTransaction so the proxy wallet (which
+    holds the tokens) is the msg.sender.
 
     Args:
         condition_id: The market's condition ID (hex string, 0x-prefixed or not).
@@ -523,6 +638,10 @@ def redeem_winning_position(condition_id: str, token_id: str = "", dry_run: bool
     if not condition_id:
         print("[REDEEM] No condition_id — cannot redeem")
         return False
+
+    # Determine which wallet holds the tokens
+    use_proxy = SIGNATURE_TYPE >= 1 and FUNDER_ADDRESS
+    token_holder = FUNDER_ADDRESS if use_proxy else None
 
     # Ensure condition_id is 0x-prefixed and 32 bytes
     cid = condition_id if condition_id.startswith("0x") else "0x" + condition_id
@@ -548,23 +667,27 @@ def redeem_winning_position(condition_id: str, token_id: str = "", dry_run: bool
         return False
 
     account = w3.eth.account.from_key(PRIVATE_KEY)
-    wallet = account.address
-    print(f"[REDEEM] Wallet: {wallet[:8]}...{wallet[-4:]}")
+    eoa_address = account.address
+    # Check balance on the wallet that actually holds the tokens
+    balance_wallet = w3.to_checksum_address(token_holder) if token_holder else eoa_address
+    print(f"[REDEEM] EOA: {eoa_address[:8]}...{eoa_address[-4:]} | "
+          f"Token holder: {balance_wallet[:8]}...{balance_wallet[-4:]}"
+          f"{' (proxy)' if use_proxy else ' (EOA)'}")
 
     # Check if we actually hold tokens to redeem
+    token_balance = 0
     if token_id:
         try:
             ctf_token = w3.eth.contract(
                 address=w3.to_checksum_address(CTF_CONTRACT_ADDRESS),
                 abi=ERC1155_BALANCE_ABI,
             )
-            # token_id is a large int encoded as hex
             tid_int = int(token_id, 16) if token_id.startswith("0x") else int(token_id)
-            balance = ctf_token.functions.balanceOf(wallet, tid_int).call()
-            if balance == 0:
+            token_balance = ctf_token.functions.balanceOf(balance_wallet, tid_int).call()
+            if token_balance == 0:
                 print(f"[REDEEM] No tokens to redeem (balance=0 for token {token_id[:20]}...)")
                 return None  # Nothing to redeem — not an error, but not a real redemption
-            print(f"[REDEEM] Token balance: {balance / 1e6:.2f} shares")
+            print(f"[REDEEM] Token balance: {token_balance / 1e6:.2f} shares")
         except Exception as e:
             print(f"[REDEEM] Could not check balance (proceeding anyway): {e}")
 
@@ -572,88 +695,90 @@ def redeem_winning_position(condition_id: str, token_id: str = "", dry_run: bool
     is_neg_risk = _check_neg_risk(condition_id)
 
     if dry_run:
-        print(f"[REDEEM] DRY RUN: would redeem condition={cid[:20]}... neg_risk={is_neg_risk}")
+        print(f"[REDEEM] DRY RUN: would redeem condition={cid[:20]}... neg_risk={is_neg_risk} proxy={use_proxy}")
         return True
 
     try:
-        nonce = w3.eth.get_transaction_count(wallet)
-        chain_id = 137  # Polygon
-
         if is_neg_risk:
-            # NegRisk markets: call NegRiskAdapter.redeemPositions(conditionId, amounts)
-            # For neg_risk, we redeem all tokens we hold
+            # NegRisk: call NegRiskAdapter.redeemPositions(conditionId, amounts)
+            contract_addr = NEG_RISK_ADAPTER_ADDRESS
             contract = w3.eth.contract(
-                address=w3.to_checksum_address(NEG_RISK_ADAPTER_ADDRESS),
+                address=w3.to_checksum_address(contract_addr),
                 abi=NEG_RISK_REDEEM_ABI,
             )
-            # Check balance for the specific token to determine amount
-            amount = 0
-            if token_id:
+            amount = token_balance
+            if amount == 0 and token_id:
                 try:
                     ctf_token = w3.eth.contract(
                         address=w3.to_checksum_address(CTF_CONTRACT_ADDRESS),
                         abi=ERC1155_BALANCE_ABI,
                     )
                     tid_int = int(token_id, 16) if token_id.startswith("0x") else int(token_id)
-                    amount = ctf_token.functions.balanceOf(wallet, tid_int).call()
+                    amount = ctf_token.functions.balanceOf(balance_wallet, tid_int).call()
                 except Exception:
                     pass
 
             if amount == 0:
                 print(f"[REDEEM] NegRisk: no token balance found, skipping")
-                return True
+                return None
 
             print(f"[REDEEM] NegRisk redemption: condition={cid[:20]}... amount={amount}")
-            tx = contract.functions.redeemPositions(
-                condition_bytes,
-                [amount],
-            ).build_transaction({
-                "chainId": chain_id,
-                "from": wallet,
-                "nonce": nonce,
-            })
+            call_data = contract.encode_abi("redeemPositions", [condition_bytes, [amount]])
         else:
-            # Standard binary market: call CTF.redeemPositions(collateral, parent, conditionId, indexSets)
-            # Try native USDC first, then bridged USDC.e
+            # Standard binary: CTF.redeemPositions(collateral, parent, conditionId, indexSets)
+            contract_addr = CTF_CONTRACT_ADDRESS
             contract = w3.eth.contract(
-                address=w3.to_checksum_address(CTF_CONTRACT_ADDRESS),
+                address=w3.to_checksum_address(contract_addr),
                 abi=CTF_REDEEM_ABI,
             )
-
             print(f"[REDEEM] Standard redemption: condition={cid[:20]}... indexSets=[1,2]")
-            tx = contract.functions.redeemPositions(
+            call_data = contract.encode_abi("redeemPositions", [
                 w3.to_checksum_address(USDC_ADDRESS),
                 HASH_ZERO,
                 condition_bytes,
-                [1, 2],  # Both outcome indices for binary market
-            ).build_transaction({
-                "chainId": chain_id,
-                "from": wallet,
-                "nonce": nonce,
-            })
+                [1, 2],
+            ])
 
-        # Sign and send
-        signed = w3.eth.account.sign_transaction(tx, private_key=PRIVATE_KEY)
-        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-        print(f"[REDEEM] Tx sent: {tx_hash.hex()}")
-
-        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
-        if receipt.status == 1:
-            print(f"[REDEEM] SUCCESS: redeemed condition={cid[:20]}... tx={tx_hash.hex()}")
+        if use_proxy:
+            # Route through Gnosis Safe so the proxy wallet is msg.sender
+            tx_hex = _exec_via_safe(w3, token_holder, contract_addr, bytes.fromhex(call_data[2:]), account)
+            print(f"[REDEEM] SUCCESS (via proxy): condition={cid[:20]}... tx={tx_hex}")
             return True
         else:
-            # Transaction reverted — might be USDC.e collateral instead
+            # Direct EOA call
+            nonce = w3.eth.get_transaction_count(eoa_address)
+            tx = contract.functions.redeemPositions(
+                *([condition_bytes, [token_balance]] if is_neg_risk else [
+                    w3.to_checksum_address(USDC_ADDRESS),
+                    HASH_ZERO,
+                    condition_bytes,
+                    [1, 2],
+                ])
+            ).build_transaction({
+                "chainId": 137,
+                "from": eoa_address,
+                "nonce": nonce,
+            })
+            signed = w3.eth.account.sign_transaction(tx, private_key=PRIVATE_KEY)
+            tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+            print(f"[REDEEM] Tx sent: {tx_hash.hex()}")
+            receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+            if receipt.status == 1:
+                print(f"[REDEEM] SUCCESS: condition={cid[:20]}... tx={tx_hash.hex()}")
+                return True
+
+            # Transaction reverted — try bridged USDC.e for standard markets
             if not is_neg_risk:
                 print(f"[REDEEM] Native USDC failed, trying bridged USDC.e...")
-                nonce = w3.eth.get_transaction_count(wallet)
+                nonce = w3.eth.get_transaction_count(eoa_address)
                 tx = contract.functions.redeemPositions(
                     w3.to_checksum_address(USDC_E_ADDRESS),
                     HASH_ZERO,
                     condition_bytes,
                     [1, 2],
                 ).build_transaction({
-                    "chainId": chain_id,
-                    "from": wallet,
+                    "chainId": 137,
+                    "from": eoa_address,
                     "nonce": nonce,
                 })
                 signed = w3.eth.account.sign_transaction(tx, private_key=PRIVATE_KEY)
@@ -667,6 +792,26 @@ def redeem_winning_position(condition_id: str, token_id: str = "", dry_run: bool
             return False
 
     except Exception as e:
+        # If proxy call failed for standard market, try USDC.e through proxy
+        if use_proxy and not is_neg_risk and "reverted" in str(e).lower():
+            try:
+                print(f"[REDEEM] Proxy USDC failed, trying USDC.e via proxy...")
+                contract = w3.eth.contract(
+                    address=w3.to_checksum_address(CTF_CONTRACT_ADDRESS),
+                    abi=CTF_REDEEM_ABI,
+                )
+                call_data = contract.encode_abi("redeemPositions", [
+                    w3.to_checksum_address(USDC_E_ADDRESS),
+                    HASH_ZERO,
+                    condition_bytes,
+                    [1, 2],
+                ])
+                tx_hex = _exec_via_safe(w3, token_holder, CTF_CONTRACT_ADDRESS, bytes.fromhex(call_data[2:]), account)
+                print(f"[REDEEM] SUCCESS (USDC.e via proxy): tx={tx_hex}")
+                return True
+            except Exception as e2:
+                print(f"[REDEEM] USDC.e proxy also failed: {e2}")
+                return False
         print(f"[REDEEM] Error: {e}")
         return False
 
