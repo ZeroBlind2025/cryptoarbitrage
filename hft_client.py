@@ -791,8 +791,8 @@ class HFTClient:
             )
 
             # Submit both orders as FOK — fill immediately or cancel
-            result_a = self._clob_client.post_order(order_a, orderType=OrderType.FOK)
-            result_b = self._clob_client.post_order(order_b, orderType=OrderType.FOK)
+            result_a = self._clob_client.post_order(order_a, orderType=OrderType.FAK)
+            result_b = self._clob_client.post_order(order_b, orderType=OrderType.FAK)
 
             # Check results
             success_a = result_a.get("success") or result_a.get("status") == "matched"
@@ -987,7 +987,7 @@ class HFTClient:
                     options=PartialCreateOrderOptions(tick_size="0.01"),
                 )
 
-                result = self._clob_client.post_order(order, orderType=OrderType.FOK)
+                result = self._clob_client.post_order(order, orderType=OrderType.FAK)
                 success = result.get("success") or result.get("status") == "matched"
 
                 if success:

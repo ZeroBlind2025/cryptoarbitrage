@@ -912,10 +912,10 @@ def place_bet(client: "ClobClient", token_id: str, amount: float, max_price: flo
             amount=round(amount, 2),
             price=price,
             side=BUY,
-            order_type=OrderType.FOK,
+            order_type=OrderType.FAK,
         )
         signed_order = client.create_market_order(order)
-        result = client.post_order(signed_order, OrderType.FOK)
+        result = client.post_order(signed_order, OrderType.FAK)
 
         # Extract fill details from CLOB response
         fill_info = {"success": True}
@@ -963,10 +963,10 @@ def place_sell(client: "ClobClient", token_id: str, size: float, min_price: floa
             amount=sell_size,
             price=price,
             side=SELL,
-            order_type=OrderType.FOK,
+            order_type=OrderType.FAK,
         )
         signed_order = client.create_market_order(order)
-        result = client.post_order(signed_order, OrderType.FOK)
+        result = client.post_order(signed_order, OrderType.FAK)
 
         fill_info = {"success": True}
         if isinstance(result, dict):

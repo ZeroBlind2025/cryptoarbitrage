@@ -534,8 +534,8 @@ class CLOBClient:
                 options=PartialCreateOrderOptions(tick_size="0.01"),
             )
 
-            # Submit as FOK — fill immediately or cancel, never sit on book
-            result = self._clob_client.post_order(clob_order, orderType=OrderType.FOK)
+            # Submit as FAK — fill what's available immediately, cancel the rest
+            result = self._clob_client.post_order(clob_order, orderType=OrderType.FAK)
             
             # Parse result
             order.order_id = result.get("orderID") or result.get("id")
