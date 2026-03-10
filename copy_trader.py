@@ -60,9 +60,10 @@ PRIVATE_KEY = os.getenv("POLYGON_PRIVATE_KEY", "")
 SIGNATURE_TYPE = int(os.getenv("POLYMARKET_SIGNATURE_TYPE", "0"))  # 0=EOA, 1=Email/Magic, 2=Browser
 
 # Builder credentials (from polymarket.com/settings?tab=builder)
-BUILDER_API_KEY = os.getenv("POLYMARKET_BUILDER_API_KEY", "")
-BUILDER_API_SECRET = os.getenv("POLYMARKET_BUILDER_API_SECRET", "")
-BUILDER_API_PASSPHRASE = os.getenv("POLYMARKET_BUILDER_API_PASSPHRASE", "")
+# Uses POLYMARKET_API_KEY/SECRET/PASSPHRASE for builder auth
+BUILDER_API_KEY = os.getenv("POLYMARKET_API_KEY", "")
+BUILDER_API_SECRET = os.getenv("POLYMARKET_API_SECRET", "")
+BUILDER_API_PASSPHRASE = os.getenv("POLYMARKET_API_PASSPHRASE", "")
 
 # Trading settings
 BET_AMOUNT = float(os.getenv("COPY_BET_AMOUNT", "5.0"))  # $ per copied bet
