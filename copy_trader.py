@@ -59,6 +59,12 @@ FUNDER_ADDRESS = os.getenv("POLYMARKET_FUNDER_ADDRESS", os.getenv("POLYGON_ADDRE
 PRIVATE_KEY = os.getenv("POLYGON_PRIVATE_KEY", "")
 SIGNATURE_TYPE = int(os.getenv("POLYMARKET_SIGNATURE_TYPE", "0"))  # 0=EOA, 1=Email/Magic, 2=Browser
 
+# Builder credentials (from polymarket.com/settings?tab=builder)
+# Uses POLYMARKET_API_KEY/SECRET/PASSPHRASE for builder auth
+BUILDER_API_KEY = os.getenv("POLYMARKET_API_KEY", "")
+BUILDER_API_SECRET = os.getenv("POLYMARKET_API_SECRET", "")
+BUILDER_API_PASSPHRASE = os.getenv("POLYMARKET_API_PASSPHRASE", "")
+
 # Trading settings
 BET_AMOUNT = float(os.getenv("COPY_BET_AMOUNT", "5.0"))  # $ per copied bet
 PROBE_AMOUNT = float(os.getenv("PROBE_AMOUNT", "10.0"))   # $ for first (probe) entry into a new market
@@ -605,12 +611,28 @@ def get_clob_client() -> Optional["ClobClient"]:
           f"funder={FUNDER_ADDRESS[:6]}...{FUNDER_ADDRESS[-4:]}, sig_type={SIGNATURE_TYPE}", flush=True)
 
     try:
+        # Build builder config if credentials are provided
+        builder_config = None
+        if BUILDER_API_KEY and BUILDER_API_SECRET and BUILDER_API_PASSPHRASE:
+            from py_builder_signing_sdk.config import BuilderConfig, BuilderApiKeyCreds
+            builder_config = BuilderConfig(
+                local_builder_creds=BuilderApiKeyCreds(
+                    key=BUILDER_API_KEY,
+                    secret=BUILDER_API_SECRET,
+                    passphrase=BUILDER_API_PASSPHRASE,
+                )
+            )
+            print(f"[ALGO] Builder config loaded (key={BUILDER_API_KEY[:8]}...)", flush=True)
+        else:
+            print(f"[ALGO] No builder credentials set (POLYMARKET_BUILDER_API_KEY/SECRET/PASSPHRASE)", flush=True)
+
         client = ClobClient(
             CLOB_API,
             key=PRIVATE_KEY,
             chain_id=137,
             signature_type=SIGNATURE_TYPE,
-            funder=FUNDER_ADDRESS
+            funder=FUNDER_ADDRESS,
+            builder_config=builder_config,
         )
         creds = client.derive_api_key()
         client.set_api_creds(creds)
