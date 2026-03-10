@@ -889,11 +889,11 @@ def get_clob_client() -> Optional["ClobClient"]:
 _balance_error_until = 0.0  # Timestamp until which we skip orders due to balance/allowance errors
 
 def place_bet(client: "ClobClient", token_id: str, amount: float, max_price: float = 0) -> dict:
-    """Place a price-protected FOK limit order. Returns fill details or empty dict on failure.
+    """Place a FOK market buy order. Returns fill details or empty dict on failure.
 
-    Uses a FOK (Fill-or-Kill) limit order at max_price so the order either fills
-    immediately or is cancelled — never sits on the book. Falls back to FOK market
-    order if no max_price is provided.
+    Uses create_market_order (FOK) which has the correct precision handling:
+    maker_amount (USDC) rounded to 2 decimals, taker_amount (shares) to 4.
+    The price parameter caps the worst fill price.
     """
     global _balance_error_until
     if time.time() < _balance_error_until:
@@ -901,39 +901,21 @@ def place_bet(client: "ClobClient", token_id: str, amount: float, max_price: flo
         print(f"[ALGO] Skipping order — insufficient balance/allowance (retry in {remaining}s)")
         return {}
     try:
-        if max_price and max_price > 0:
-            # Price-protected FOK limit order: fills immediately or cancels.
-            # FOK precision rules: price must match tick_size (2 decimals for 0.01),
-            # size max 2 decimals, and price*size (taker amount) max 4 decimals.
-            import math
-            limit_price = min(round(max_price, 2), 0.99)
-            if limit_price < 0.01:
-                limit_price = 0.01
-            size = math.floor(amount / limit_price * 100) / 100  # floor to 2 decimals
+        # Use the price cap if provided, otherwise let the library calculate
+        price = min(round(max_price, 2), 0.99) if max_price and max_price > 0 else 0
+        if max_price and price < 0.01:
+            price = 0.01
 
-            from py_clob_client.clob_types import OrderArgs, PartialCreateOrderOptions
-            print(f"[ALGO] FOK limit order: {size:.2f} shares @ {limit_price:.2f} (max ${amount:.2f})")
-            order = client.create_order(
-                OrderArgs(
-                    token_id=token_id,
-                    price=limit_price,
-                    size=size,
-                    side=BUY,
-                ),
-                options=PartialCreateOrderOptions(tick_size="0.01"),
-            )
-            result = client.post_order(order, orderType=OrderType.FOK)
-        else:
-            # Fallback: FOK market order (no price protection)
-            print(f"[ALGO] WARNING: No max_price, using FOK market order")
-            order = MarketOrderArgs(
-                token_id=token_id,
-                amount=amount,
-                side=BUY,
-                order_type=OrderType.FOK
-            )
-            signed_order = client.create_market_order(order)
-            result = client.post_order(signed_order, OrderType.FOK)
+        print(f"[ALGO] FOK buy: ${amount:.2f} @ max {price:.2f}" if price else f"[ALGO] FOK buy: ${amount:.2f} (market)")
+        order = MarketOrderArgs(
+            token_id=token_id,
+            amount=round(amount, 2),
+            price=price,
+            side=BUY,
+            order_type=OrderType.FOK,
+        )
+        signed_order = client.create_market_order(order)
+        result = client.post_order(signed_order, OrderType.FOK)
 
         # Extract fill details from CLOB response
         fill_info = {"success": True}
@@ -965,39 +947,26 @@ def place_bet(client: "ClobClient", token_id: str, amount: float, max_price: flo
 
 
 def place_sell(client: "ClobClient", token_id: str, size: float, min_price: float = 0) -> dict:
-    """Place a FOK sell order for `size` shares of token_id.
+    """Place a FOK market sell order for `size` shares of token_id.
 
-    Uses a FOK limit order at min_price so the order either fills immediately
-    or is cancelled — never sits on the book. Falls back to FOK market sell
-    if no min_price given.
+    Uses create_market_order (FOK) which has the correct precision handling.
+    The price parameter sets the minimum acceptable sell price.
     """
     try:
-        if min_price and min_price > 0:
-            import math
-            limit_price = max(round(min_price, 2), 0.01)
-            size = math.floor(size * 100) / 100  # floor to 2 decimals
-            from py_clob_client.clob_types import OrderArgs, PartialCreateOrderOptions
-            print(f"[ALGO] Sell FOK: {size:.2f} shares @ min {limit_price:.2f}")
-            order = client.create_order(
-                OrderArgs(
-                    token_id=token_id,
-                    price=limit_price,
-                    size=size,
-                    side=SELL,
-                ),
-                options=PartialCreateOrderOptions(tick_size="0.01"),
-            )
-            result = client.post_order(order, orderType=OrderType.FOK)
-        else:
-            print(f"[ALGO] WARNING: No min_price, using FOK market sell")
-            order = MarketOrderArgs(
-                token_id=token_id,
-                amount=size,
-                side=SELL,
-                order_type=OrderType.FOK
-            )
-            signed_order = client.create_market_order(order)
-            result = client.post_order(signed_order, OrderType.FOK)
+        import math
+        price = max(round(min_price, 2), 0.01) if min_price and min_price > 0 else 0
+        sell_size = math.floor(size * 100) / 100  # floor to 2 decimals
+
+        print(f"[ALGO] FOK sell: {sell_size:.2f} shares @ min {price:.2f}" if price else f"[ALGO] FOK sell: {sell_size:.2f} shares (market)")
+        order = MarketOrderArgs(
+            token_id=token_id,
+            amount=sell_size,
+            price=price,
+            side=SELL,
+            order_type=OrderType.FOK,
+        )
+        signed_order = client.create_market_order(order)
+        result = client.post_order(signed_order, OrderType.FOK)
 
         fill_info = {"success": True}
         if isinstance(result, dict):
