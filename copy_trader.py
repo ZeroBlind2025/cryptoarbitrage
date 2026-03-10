@@ -1824,12 +1824,26 @@ class CopyTrader:
                             dry_run=self.dry_run,
                         )
                         position["redeemed"] = redeemed
+                        _log_copy_trade("redeem", {
+                            "market": position.get("market", ""),
+                            "condition_id": condition_id,
+                            "token_id": token_id,
+                            "redeemed": redeemed,
+                            "dry_run": self.dry_run,
+                            "pnl": position.get("pnl", 0),
+                        })
                         if redeemed:
                             print(f"[ALGO] Auto-redeemed: {position['market'][:30]}")
                         else:
                             print(f"[ALGO] Redemption failed for {position['market'][:30]} — redeem manually")
                     except Exception as e:
                         position["redeemed"] = False
+                        _log_copy_trade("redeem_error", {
+                            "market": position.get("market", ""),
+                            "condition_id": condition_id,
+                            "token_id": token_id,
+                            "error": str(e),
+                        })
                         print(f"[ALGO] Redemption error: {e}")
 
                 elif won is False:
@@ -1906,6 +1920,7 @@ class CopyTrader:
                     "token_id": position.get("token_id", ""),
                     "opened_at": position.get("timestamp", ""),
                     "resolved_at": position["resolved_at"],
+                    "redeemed": position.get("redeemed"),
                     "dry_run": position.get("dry_run", False),
                 })
 
