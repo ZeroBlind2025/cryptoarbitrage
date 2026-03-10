@@ -637,6 +637,8 @@ def get_clob_client() -> Optional["ClobClient"]:
         return None
 
 
+_balance_error_until = 0.0  # Timestamp until which we skip orders due to balance/allowance errors
+
 def place_bet(client: "ClobClient", token_id: str, amount: float, max_price: float = 0) -> dict:
     """Place a price-protected limit order. Returns fill details or empty dict on failure.
 
@@ -644,6 +646,11 @@ def place_bet(client: "ClobClient", token_id: str, amount: float, max_price: flo
     won't fill at absurd prices if the market has moved. Falls back to FOK market
     order only if no max_price is provided.
     """
+    global _balance_error_until
+    if time.time() < _balance_error_until:
+        remaining = int(_balance_error_until - time.time())
+        print(f"[ALGO] Skipping order — insufficient balance/allowance (retry in {remaining}s)")
+        return {}
     try:
         if max_price and max_price > 0:
             # Price-protected limit order: won't pay more than max_price
@@ -692,8 +699,14 @@ def place_bet(client: "ClobClient", token_id: str, amount: float, max_price: flo
             print(f"[ALGO] Fill details: {result}")
         return fill_info
     except Exception as e:
-        print(f"[ALGO] Order error: {e}")
-        import traceback; traceback.print_exc()
+        error_str = str(e).lower()
+        if "balance" in error_str or "allowance" in error_str:
+            _balance_error_until = time.time() + 300  # Pause orders for 5 minutes
+            print(f"[ALGO] Order error (BALANCE/ALLOWANCE): {e}")
+            print(f"[ALGO] *** Pausing all orders for 5 minutes — deposit USDC or run setup_allowances.py ***")
+        else:
+            print(f"[ALGO] Order error: {e}")
+            import traceback; traceback.print_exc()
         return {}
 
 

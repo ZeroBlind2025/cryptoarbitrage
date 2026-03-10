@@ -53,10 +53,14 @@ def main():
     erc20_abi = '[{"constant":false,"inputs":[{"name":"_spender","type":"address"},{"name":"_value","type":"uint256"}],"name":"approve","outputs":[{"name":"","type":"bool"}],"payable":false,"stateMutability":"nonpayable","type":"function"}]'
     erc1155_abi = '[{"inputs":[{"internalType":"address","name":"operator","type":"address"},{"internalType":"bool","name":"approved","type":"bool"}],"name":"setApprovalForAll","outputs":[],"stateMutability":"nonpayable","type":"function"}]'
 
-    usdc_address = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+    # Native USDC on Polygon (what Polymarket actually uses)
+    usdc_native_address = "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"
+    # Bridged USDC.e (legacy, approve just in case)
+    usdc_bridged_address = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
     ctf_address = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
 
-    usdc = web3.eth.contract(address=web3.to_checksum_address(usdc_address), abi=erc20_abi)
+    usdc_native = web3.eth.contract(address=web3.to_checksum_address(usdc_native_address), abi=erc20_abi)
+    usdc_bridged = web3.eth.contract(address=web3.to_checksum_address(usdc_bridged_address), abi=erc20_abi)
     ctf = web3.eth.contract(address=web3.to_checksum_address(ctf_address), abi=erc1155_abi)
 
     targets = {
@@ -70,15 +74,26 @@ def main():
     for name, target in targets.items():
         print(f"\n--- {name} ({target}) ---")
 
-        # Approve USDC spending
-        print(f"  Approving USDC...")
-        tx = usdc.functions.approve(target, int(MAX_INT, 0)).build_transaction({
+        # Approve native USDC spending (what Polymarket uses)
+        print(f"  Approving native USDC (0x3c49...)...")
+        tx = usdc_native.functions.approve(target, int(MAX_INT, 0)).build_transaction({
             "chainId": chain_id, "from": pub_key, "nonce": nonce,
         })
         signed = web3.eth.account.sign_transaction(tx, private_key=private_key)
         tx_hash = web3.eth.send_raw_transaction(signed.raw_transaction)
         receipt = web3.eth.wait_for_transaction_receipt(tx_hash, 600)
-        print(f"  USDC approved: {receipt.transactionHash.hex()}")
+        print(f"  Native USDC approved: {receipt.transactionHash.hex()}")
+        nonce += 1
+
+        # Approve bridged USDC.e spending (legacy fallback)
+        print(f"  Approving bridged USDC.e (0x2791...)...")
+        tx = usdc_bridged.functions.approve(target, int(MAX_INT, 0)).build_transaction({
+            "chainId": chain_id, "from": pub_key, "nonce": nonce,
+        })
+        signed = web3.eth.account.sign_transaction(tx, private_key=private_key)
+        tx_hash = web3.eth.send_raw_transaction(signed.raw_transaction)
+        receipt = web3.eth.wait_for_transaction_receipt(tx_hash, 600)
+        print(f"  Bridged USDC.e approved: {receipt.transactionHash.hex()}")
         nonce += 1
 
         # Approve CTF token transfers
@@ -92,7 +107,7 @@ def main():
         print(f"  CTF approved: {receipt.transactionHash.hex()}")
         nonce += 1
 
-    print("\n[SUCCESS] All allowances set! You can now place orders via the CLOB API.")
+    print("\n[SUCCESS] All allowances set for native USDC + USDC.e + CTF! You can now place orders via the CLOB API.")
 
 
 if __name__ == "__main__":
