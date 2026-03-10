@@ -1573,17 +1573,19 @@ class MomentumEngine:
                         token_id=token_id,
                         dry_run=self.dry_run,
                     )
-                    position["redeemed"] = redeemed
+                    position["redeemed"] = bool(redeemed)
                     _log_copy_trade("momentum_redeem", {
                         "market": position.get("market", ""),
                         "condition_id": condition_id,
                         "token_id": token_id,
-                        "redeemed": redeemed,
+                        "redeemed": bool(redeemed),
                         "dry_run": self.dry_run,
                         "pnl": pnl,
                     })
-                    if redeemed:
+                    if redeemed is True:
                         print(f"[MOMENTUM] Auto-redeemed: {position['market'][:30]}", flush=True)
+                    elif redeemed is None:
+                        pass  # No-op: balance was 0, already logged by redeem function
                     else:
                         print(f"[MOMENTUM] Redemption failed for {position['market'][:30]} — redeem manually", flush=True)
                 except Exception as e:
