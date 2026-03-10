@@ -1469,6 +1469,10 @@ class MomentumEngine:
 
         resolved_count = 0
 
+        # Cache resolution results by condition_id to avoid duplicate API calls
+        # when multiple position entries exist for the same market (e.g. re-entries).
+        _resolution_cache = {}
+
         for position in momentum_positions[:]:
             condition_id = position.get("condition_id", "")
             slug = position.get("slug", "")
@@ -1478,12 +1482,18 @@ class MomentumEngine:
             if not token_id and not condition_id and not slug:
                 continue
 
-            result = get_market_resolution(
-                condition_id=condition_id,
-                slug=slug,
-                token_id=token_id,
-                our_outcome=our_outcome,
-            )
+            # Use cached result if we already checked this condition_id this cycle
+            cache_key = condition_id or slug or token_id
+            if cache_key in _resolution_cache:
+                result = _resolution_cache[cache_key]
+            else:
+                result = get_market_resolution(
+                    condition_id=condition_id,
+                    slug=slug,
+                    token_id=token_id,
+                    our_outcome=our_outcome,
+                )
+                _resolution_cache[cache_key] = result
 
             if not result or not result.get("resolved"):
                 # Fallback: use live WebSocket price for resolution

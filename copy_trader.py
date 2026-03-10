@@ -671,6 +671,90 @@ def redeem_winning_position(condition_id: str, token_id: str = "", dry_run: bool
         return False
 
 
+def sweep_unredeemed(dry_run: bool = False) -> dict:
+    """Sweep all unredeemed winning positions from our Polymarket wallet.
+
+    Queries the data API for our positions, finds any marked redeemable,
+    and redeems them on-chain.  This catches winnings that the bot missed
+    (e.g. from before it was running, or failed redemption attempts).
+
+    Returns dict with counts: {"found": N, "redeemed": N, "failed": N, "skipped": N}
+    """
+    wallet = FUNDER_ADDRESS
+    if not wallet:
+        print("[SWEEP] No FUNDER_ADDRESS configured — cannot sweep")
+        return {"found": 0, "redeemed": 0, "failed": 0, "skipped": 0, "error": "no wallet"}
+
+    print(f"[SWEEP] Scanning positions for {wallet[:8]}...{wallet[-4:]}", flush=True)
+
+    try:
+        response = requests.get(
+            f"{DATA_API}/positions",
+            params={"user": wallet, "sizeThreshold": 0, "redeemable": True},
+            timeout=15,
+        )
+        response.raise_for_status()
+        positions = response.json()
+    except Exception as e:
+        print(f"[SWEEP] Error fetching positions: {e}")
+        return {"found": 0, "redeemed": 0, "failed": 0, "skipped": 0, "error": str(e)}
+
+    # Filter to redeemable positions
+    redeemable = [p for p in positions if p.get("redeemable")]
+    print(f"[SWEEP] Found {len(redeemable)} redeemable position(s) out of {len(positions)} total", flush=True)
+
+    if not redeemable:
+        return {"found": 0, "redeemed": 0, "failed": 0, "skipped": 0}
+
+    stats = {"found": len(redeemable), "redeemed": 0, "failed": 0, "skipped": 0}
+
+    # Group by condition_id to avoid duplicate redemption calls
+    seen_conditions = set()
+    for pos in redeemable:
+        condition_id = pos.get("conditionId", "") or pos.get("condition_id", "")
+        token_id = str(pos.get("asset", "") or pos.get("token_id", ""))
+        size = float(pos.get("size", 0))
+        title = pos.get("title", pos.get("market", ""))[:40]
+
+        if not condition_id:
+            print(f"[SWEEP] Skipping position with no condition_id: {title}")
+            stats["skipped"] += 1
+            continue
+
+        if condition_id in seen_conditions:
+            print(f"[SWEEP] Already redeemed condition {condition_id[:20]}... — skipping duplicate")
+            stats["skipped"] += 1
+            continue
+        seen_conditions.add(condition_id)
+
+        print(f"[SWEEP] Redeeming: {title} | size={size:.2f} | cid={condition_id[:20]}...", flush=True)
+
+        result = redeem_winning_position(
+            condition_id=condition_id,
+            token_id=token_id,
+            dry_run=dry_run,
+        )
+
+        if result is True:
+            stats["redeemed"] += 1
+            print(f"[SWEEP] OK: {title}", flush=True)
+            _log_copy_trade("sweep_redeem", {
+                "condition_id": condition_id,
+                "token_id": token_id,
+                "size": size,
+                "title": title,
+            })
+        elif result is None:
+            stats["skipped"] += 1  # balance was 0
+        else:
+            stats["failed"] += 1
+            print(f"[SWEEP] FAILED: {title}", flush=True)
+
+    print(f"[SWEEP] Done: {stats['redeemed']} redeemed, {stats['failed']} failed, "
+          f"{stats['skipped']} skipped", flush=True)
+    return stats
+
+
 # =============================================================================
 # API FUNCTIONS
 # =============================================================================
@@ -1779,6 +1863,10 @@ class CopyTrader:
 
         resolved_this_check = 0
 
+        # Cache resolution results by condition_id to avoid duplicate API calls
+        # when multiple position entries exist for the same market (e.g. re-entries).
+        _resolution_cache = {}
+
         for position in copy_positions[:]:  # Copy list to allow modification
             condition_id = position.get("condition_id", "")
             slug = position.get("slug", "")
@@ -1789,12 +1877,18 @@ class CopyTrader:
             if not token_id and not condition_id and not slug:
                 continue
 
-            result = get_market_resolution(
-                condition_id=condition_id,
-                slug=slug,
-                token_id=token_id,
-                our_outcome=our_outcome
-            )
+            # Use cached result if we already checked this condition_id this cycle
+            cache_key = condition_id or slug or token_id
+            if cache_key in _resolution_cache:
+                result = _resolution_cache[cache_key]
+            else:
+                result = get_market_resolution(
+                    condition_id=condition_id,
+                    slug=slug,
+                    token_id=token_id,
+                    our_outcome=our_outcome
+                )
+                _resolution_cache[cache_key] = result
 
             if result.get("resolved"):
                 # Position resolved!
