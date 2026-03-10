@@ -589,13 +589,15 @@ def _sign_safe_tx(account, safe_contract, to: str, call_data: str, nonce: int, w
 def _get_relay_headers(body_dict: dict) -> dict:
     """Get signed headers for the Polymarket relay.
 
-    Uses builder credentials if available, otherwise falls back to the
-    shared signing server.
+    Priority:
+    1. Builder credentials (env vars) — highest rate limits
+    2. Derive CLOB API creds from private key — same as trading, no extra config
+    3. Shared signing server — last resort, rate-limited
     """
     import json as _json
 
+    # --- Method 1: Explicit builder credentials ---
     if BUILDER_ENABLED and BUILDER_API_KEY and BUILDER_API_SECRET and BUILDER_API_PASSPHRASE:
-        # Use our own builder creds — higher rate limits
         try:
             from py_clob_client.signer import Signer
             from py_clob_client.headers.headers import create_level_2_headers
@@ -615,13 +617,46 @@ def _get_relay_headers(body_dict: dict) -> dict:
                     request_path="/submit",
                     body=body_dict,
                 ),
-                builder=True,
             )
             return headers
         except Exception as e:
-            print(f"[REDEEM] Builder creds failed ({e}), falling back to shared signer")
+            print(f"[REDEEM] Builder creds failed ({e}), trying derived creds...")
 
-    # Fall back to shared signing server
+    # --- Method 2: Derive API creds from private key (same as trading) ---
+    if HAS_CLOB_CLIENT and PRIVATE_KEY:
+        try:
+            from py_clob_client.client import ClobClient
+            from py_clob_client.signer import Signer
+            from py_clob_client.headers.headers import create_level_2_headers
+            from py_clob_client.clob_types import RequestArgs
+
+            # Create a minimal client just to derive creds
+            if FUNDER_ADDRESS:
+                client = ClobClient(
+                    CLOB_API, key=PRIVATE_KEY, chain_id=137,
+                    signature_type=SIGNATURE_TYPE, funder=FUNDER_ADDRESS,
+                )
+            else:
+                client = ClobClient(CLOB_API, key=PRIVATE_KEY, chain_id=137)
+
+            creds = client.derive_api_key()
+            if creds and creds.api_key:
+                signer = Signer(private_key=PRIVATE_KEY, chain_id=137)
+                headers = create_level_2_headers(
+                    signer=signer,
+                    creds=creds,
+                    request_args=RequestArgs(
+                        method="POST",
+                        request_path="/submit",
+                        body=body_dict,
+                    ),
+                )
+                print(f"[REDEEM] Using derived CLOB API creds (key={creds.api_key[:8]}...)")
+                return headers
+        except Exception as e:
+            print(f"[REDEEM] Derived creds failed ({e}), falling back to shared signer...")
+
+    # --- Method 3: Shared signing server (rate-limited) ---
     payload = {
         "method": "POST",
         "path": "/submit",
