@@ -517,16 +517,18 @@ class CLOBClient:
         
         try:
             from py_clob_client.order_builder.constants import BUY, SELL
-            
+            from py_clob_client.clob_types import OrderArgs
+
             side = BUY if order.side == OrderSide.BUY else SELL
-            
+
             # Create and sign order
-            clob_order = self._clob_client.create_order(
+            order_args = OrderArgs(
                 token_id=order.token_id,
                 price=order.price,
                 size=order.size,
                 side=side,
             )
+            clob_order = self._clob_client.create_order(order_args)
             
             # Submit
             result = self._clob_client.post_order(clob_order)
