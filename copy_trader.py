@@ -545,53 +545,209 @@ def _check_neg_risk(condition_id: str) -> bool:
     return False
 
 
-def _exec_via_safe(w3, safe_address: str, to: str, call_data: bytes, account) -> str:
-    """Execute a transaction through a Gnosis Safe proxy wallet.
+# Polymarket gasless relay — pays gas so the EOA doesn't need MATIC
+RELAY_URL = "https://relayer-v2.polymarket.com"
+RELAY_SIGN_URL = "https://builder-signing-server.vercel.app/sign"
+ADDRESS_ZERO = "0x" + "00" * 20
 
-    The EOA (account) is the owner of the Safe.  We compute the Safe tx hash,
-    sign it, and call execTransaction so the Safe executes the inner call.
+
+def _sign_safe_tx(account, safe_contract, to: str, call_data: str, nonce: int, w3):
+    """Sign a Gnosis Safe transaction hash using EIP-191 personal sign.
+
+    Returns the hex signature with v-value adjusted for the Polymarket relay
+    (v 0x00→0x1f, 0x01→0x20, 0x1b→0x1f, 0x1c→0x20).
+    """
+    from eth_account.messages import encode_defunct
+
+    tx_hash_bytes = safe_contract.functions.getTransactionHash(
+        w3.to_checksum_address(to),
+        0,                                    # value
+        call_data,                            # data (hex string)
+        0,                                    # operation (Call)
+        0, 0, 0,                              # safeTxGas, baseGas, gasPrice
+        w3.to_checksum_address(ADDRESS_ZERO), # gasToken
+        w3.to_checksum_address(ADDRESS_ZERO), # refundReceiver
+        nonce,
+    ).call()
+
+    # Sign the hash as an EIP-191 personal message (eth_sign style)
+    tx_hash_hex = tx_hash_bytes.hex()
+    message = encode_defunct(hexstr=tx_hash_hex)
+    signed = account.sign_message(message)
+
+    # Adjust v for Gnosis Safe eth_sign verification
+    sig_hex = signed.signature.hex()
+    v_byte = sig_hex[-2:]
+    if v_byte in ("00", "1b"):
+        sig_hex = sig_hex[:-2] + "1f"
+    elif v_byte in ("01", "1c"):
+        sig_hex = sig_hex[:-2] + "20"
+
+    return sig_hex
+
+
+def _get_relay_headers(body_dict: dict) -> dict:
+    """Get signed headers for the Polymarket relay.
+
+    Uses builder credentials if available, otherwise falls back to the
+    shared signing server.
+    """
+    import json as _json
+
+    if BUILDER_ENABLED and BUILDER_API_KEY and BUILDER_API_SECRET and BUILDER_API_PASSPHRASE:
+        # Use our own builder creds — higher rate limits
+        try:
+            from py_clob_client.signer import Signer
+            from py_clob_client.headers.headers import create_level_2_headers
+            from py_clob_client.clob_types import RequestArgs, ApiCreds
+
+            signer = Signer(private_key=PRIVATE_KEY, chain_id=137)
+            creds = ApiCreds(
+                api_key=BUILDER_API_KEY,
+                api_secret=BUILDER_API_SECRET,
+                api_passphrase=BUILDER_API_PASSPHRASE,
+            )
+            headers = create_level_2_headers(
+                signer=signer,
+                creds=creds,
+                request_args=RequestArgs(
+                    method="POST",
+                    request_path="/submit",
+                    body=body_dict,
+                ),
+                builder=True,
+            )
+            return headers
+        except Exception as e:
+            print(f"[REDEEM] Builder creds failed ({e}), falling back to shared signer")
+
+    # Fall back to shared signing server
+    payload = {
+        "method": "POST",
+        "path": "/submit",
+        "body": _json.dumps(body_dict),
+    }
+    resp = requests.post(RELAY_SIGN_URL, json=payload, timeout=15)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _redeem_via_relay(w3, account, safe_contract, proxy_address: str,
+                      target_contract: str, call_data_hex: str) -> str:
+    """Submit a redemption through Polymarket's gasless relay.
+
+    The relay pays gas, so the EOA doesn't need MATIC.
+    Returns the transaction hash hex string.
+    """
+    import json as _json
+
+    eoa = account.address
+
+    # Get nonce from relay
+    nonce_resp = requests.get(
+        f"{RELAY_URL}/nonce",
+        params={"address": eoa, "type": "SAFE"},
+        timeout=10,
+    )
+    nonce_resp.raise_for_status()
+    safe_nonce = int(nonce_resp.json()["nonce"])
+    print(f"[REDEEM] Relay safe nonce: {safe_nonce}")
+
+    # Sign the Safe transaction
+    sig_hex = _sign_safe_tx(
+        account, safe_contract, target_contract, call_data_hex, safe_nonce, w3
+    )
+
+    body = {
+        "data": call_data_hex,
+        "from": eoa,
+        "metadata": "redeem",
+        "nonce": str(safe_nonce),
+        "proxyWallet": proxy_address,
+        "signature": "0x" + sig_hex if not sig_hex.startswith("0x") else sig_hex,
+        "signatureParams": {
+            "baseGas": "0",
+            "gasPrice": "0",
+            "gasToken": ADDRESS_ZERO,
+            "operation": "0",
+            "refundReceiver": ADDRESS_ZERO,
+            "safeTxnGas": "0",
+        },
+        "to": w3.to_checksum_address(target_contract),
+        "type": "SAFE",
+    }
+
+    headers = _get_relay_headers(body)
+
+    resp = requests.post(
+        f"{RELAY_URL}/submit",
+        headers=headers,
+        data=_json.dumps(body).encode("utf-8"),
+        timeout=30,
+    )
+    resp.raise_for_status()
+    result = resp.json()
+
+    tx_hash = result.get("transactionHash")
+    print(f"[REDEEM] Relay tx: {tx_hash} | state: {result.get('state', 'N/A')}")
+
+    if tx_hash:
+        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+        if receipt.status != 1:
+            raise RuntimeError(f"Relay tx reverted: {tx_hash}")
+        return tx_hash
+
+    raise RuntimeError(f"No tx hash from relay: {result}")
+
+
+def _exec_via_safe(w3, safe_address: str, to: str, call_data: bytes, account) -> str:
+    """Execute a transaction through a Gnosis Safe proxy wallet (direct, needs MATIC).
+
+    Fallback for when the gasless relay is unavailable.  The EOA must hold
+    MATIC to pay gas.
 
     Returns the transaction hash hex string, or raises on failure.
     """
+    from eth_account.messages import encode_defunct
+
     safe = w3.eth.contract(
         address=w3.to_checksum_address(safe_address),
         abi=GNOSIS_SAFE_ABI,
     )
-    zero_addr = "0x" + "00" * 20
 
     safe_nonce = safe.functions.nonce().call()
-    safe_tx_hash = safe.functions.getTransactionHash(
-        w3.to_checksum_address(to),  # to
-        0,                           # value
-        call_data,                   # data
-        0,                           # operation (Call)
-        0,                           # safeTxGas
-        0,                           # baseGas
-        0,                           # gasPrice
-        w3.to_checksum_address(zero_addr),  # gasToken
-        w3.to_checksum_address(zero_addr),  # refundReceiver
-        safe_nonce,                  # _nonce
+    call_data_hex = "0x" + call_data.hex()
+
+    tx_hash_bytes = safe.functions.getTransactionHash(
+        w3.to_checksum_address(to),
+        0, call_data_hex, 0,
+        0, 0, 0,
+        w3.to_checksum_address(ADDRESS_ZERO),
+        w3.to_checksum_address(ADDRESS_ZERO),
+        safe_nonce,
     ).call()
 
-    # Sign the Safe tx hash with the EOA key
-    sig = account.unsafe_sign_hash(safe_tx_hash)
-    # Pack signature as (r, s, v) — 32 + 32 + 1 = 65 bytes
-    signature_bytes = (
-        sig.r.to_bytes(32, "big") +
-        sig.s.to_bytes(32, "big") +
-        sig.v.to_bytes(1, "big")
-    )
+    # EIP-191 personal sign + v adjustment for Gnosis Safe
+    message = encode_defunct(hexstr=tx_hash_bytes.hex())
+    signed = account.sign_message(message)
 
-    # Build the outer transaction (EOA calls Safe.execTransaction)
+    r = signed.r.to_bytes(32, "big")
+    s = signed.s.to_bytes(32, "big")
+    v = signed.v
+    # Adjust v for eth_sign: +4 for 27/28, +31 for 0/1
+    if v in (0, 1):
+        v += 31
+    elif v in (27, 28):
+        v += 4
+    signature_bytes = r + s + v.to_bytes(1, "big")
+
     eoa_nonce = w3.eth.get_transaction_count(account.address)
     tx = safe.functions.execTransaction(
         w3.to_checksum_address(to),
-        0,
-        call_data,
-        0,               # operation = Call
-        0, 0, 0,         # safeTxGas, baseGas, gasPrice
-        w3.to_checksum_address(zero_addr),
-        w3.to_checksum_address(zero_addr),
+        0, call_data_hex,
+        0, 0, 0, 0,
+        w3.to_checksum_address(ADDRESS_ZERO),
+        w3.to_checksum_address(ADDRESS_ZERO),
         signature_bytes,
     ).build_transaction({
         "chainId": 137,
@@ -599,8 +755,8 @@ def _exec_via_safe(w3, safe_address: str, to: str, call_data: bytes, account) ->
         "nonce": eoa_nonce,
     })
 
-    signed = w3.eth.account.sign_transaction(tx, private_key=PRIVATE_KEY)
-    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+    signed_tx = w3.eth.account.sign_transaction(tx, private_key=PRIVATE_KEY)
+    tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
     print(f"[REDEEM] Safe tx sent: {tx_hash.hex()}")
 
     receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
@@ -740,10 +896,26 @@ def redeem_winning_position(condition_id: str, token_id: str = "", dry_run: bool
             ])
 
         if use_proxy:
-            # Route through Gnosis Safe so the proxy wallet is msg.sender
-            tx_hex = _exec_via_safe(w3, token_holder, contract_addr, bytes.fromhex(call_data[2:]), account)
-            print(f"[REDEEM] SUCCESS (via proxy): condition={cid[:20]}... tx={tx_hex}")
-            return True
+            # Route through Polymarket's gasless relay (no MATIC needed on EOA)
+            safe_contract = w3.eth.contract(
+                address=w3.to_checksum_address(token_holder),
+                abi=GNOSIS_SAFE_ABI,
+            )
+            try:
+                tx_hex = _redeem_via_relay(
+                    w3, account, safe_contract, token_holder,
+                    contract_addr, call_data,
+                )
+                print(f"[REDEEM] SUCCESS (gasless relay): condition={cid[:20]}... tx={tx_hex}")
+                return True
+            except Exception as relay_err:
+                print(f"[REDEEM] Gasless relay failed ({relay_err}), trying direct Safe tx...")
+                try:
+                    tx_hex = _exec_via_safe(w3, token_holder, contract_addr, bytes.fromhex(call_data[2:]), account)
+                    print(f"[REDEEM] SUCCESS (direct proxy): condition={cid[:20]}... tx={tx_hex}")
+                    return True
+                except Exception as direct_err:
+                    raise RuntimeError(f"Both relay ({relay_err}) and direct ({direct_err}) failed") from direct_err
         else:
             # Direct EOA call
             nonce = w3.eth.get_transaction_count(eoa_address)
@@ -795,18 +967,28 @@ def redeem_winning_position(condition_id: str, token_id: str = "", dry_run: bool
         # If proxy call failed for standard market, try USDC.e through proxy
         if use_proxy and not is_neg_risk and "reverted" in str(e).lower():
             try:
-                print(f"[REDEEM] Proxy USDC failed, trying USDC.e via proxy...")
+                print(f"[REDEEM] USDC failed, trying USDC.e via relay...")
                 contract = w3.eth.contract(
                     address=w3.to_checksum_address(CTF_CONTRACT_ADDRESS),
                     abi=CTF_REDEEM_ABI,
                 )
-                call_data = contract.encode_abi("redeemPositions", [
+                call_data_e = contract.encode_abi("redeemPositions", [
                     w3.to_checksum_address(USDC_E_ADDRESS),
                     HASH_ZERO,
                     condition_bytes,
                     [1, 2],
                 ])
-                tx_hex = _exec_via_safe(w3, token_holder, CTF_CONTRACT_ADDRESS, bytes.fromhex(call_data[2:]), account)
+                safe_contract = w3.eth.contract(
+                    address=w3.to_checksum_address(token_holder),
+                    abi=GNOSIS_SAFE_ABI,
+                )
+                try:
+                    tx_hex = _redeem_via_relay(
+                        w3, account, safe_contract, token_holder,
+                        CTF_CONTRACT_ADDRESS, call_data_e,
+                    )
+                except Exception:
+                    tx_hex = _exec_via_safe(w3, token_holder, CTF_CONTRACT_ADDRESS, bytes.fromhex(call_data_e[2:]), account)
                 print(f"[REDEEM] SUCCESS (USDC.e via proxy): tx={tx_hex}")
                 return True
             except Exception as e2:
