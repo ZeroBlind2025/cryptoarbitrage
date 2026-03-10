@@ -341,14 +341,17 @@ def discover_markets() -> list[dict]:
         print(f"[HFT] Crypto 15m markets found: {crypto_found}", flush=True)
 
         # ============================================================
-        # FETCH LIVE SPORTS MARKETS
-        # Query ALL events, filter by sports slug prefix + today's date + not ended
+        # SPORTS MARKETS DISABLED — momentum engine only uses crypto
+        # All sports querying (tag search, date search, NBA search,
+        # Liga MX search, fallback search) removed to reduce API load.
         # ============================================================
-        print("[HFT] Fetching live sports events...", flush=True)
+        print("[HFT] Sports market discovery DISABLED (momentum-only mode)", flush=True)
 
-        # Check if we have real-time data from Sports WebSocket
-        if live_sports_data:
-            print(f"[HFT] Sports WebSocket has {len(live_sports_data)} live events tracked", flush=True)
+        print(f"[HFT] Total: {crypto_found} crypto, 0 sports = {len(markets)} markets", flush=True)
+        return markets
+
+        # === SPORTS CODE BELOW IS DISABLED ===
+        # To re-enable sports, remove this early return and uncomment below.
 
         import re
         from zoneinfo import ZoneInfo

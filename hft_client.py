@@ -1419,19 +1419,21 @@ class HFTWebSocketScanner:
                         self._run_full_signal_check(market, book_a, book_b)
                         return
 
-                # Quick tail-end check (high probability)
-                yes_prob = (yes_bid + yes_ask) / 2 if yes_bid and yes_ask else yes_ask
-                no_prob = (no_bid + no_ask) / 2 if no_bid and no_ask else no_ask
-
-                if yes_prob and yes_prob >= 0.90:
-                    print(f"[HFT-WS] HIGH PROB DETECTED: {slug[:30]} YES={yes_prob*100:.1f}%")
-                    self._run_full_signal_check(market, book_a, book_b)
-                    return
-
-                if no_prob and no_prob >= 0.90:
-                    print(f"[HFT-WS] HIGH PROB DETECTED: {slug[:30]} NO={no_prob*100:.1f}%")
-                    self._run_full_signal_check(market, book_a, book_b)
-                    return
+                # Quick tail-end check (high probability) — DISABLED to reduce noise
+                # Only sum-to-one signals are actionable; high-prob detection
+                # spams logs on crypto markets near resolution without trading.
+                # To re-enable, uncomment the block below.
+                #
+                # yes_prob = (yes_bid + yes_ask) / 2 if yes_bid and yes_ask else yes_ask
+                # no_prob = (no_bid + no_ask) / 2 if no_bid and no_ask else no_ask
+                # if yes_prob and yes_prob >= 0.90:
+                #     print(f"[HFT-WS] HIGH PROB DETECTED: {slug[:30]} YES={yes_prob*100:.1f}%")
+                #     self._run_full_signal_check(market, book_a, book_b)
+                #     return
+                # if no_prob and no_prob >= 0.90:
+                #     print(f"[HFT-WS] HIGH PROB DETECTED: {slug[:30]} NO={no_prob*100:.1f}%")
+                #     self._run_full_signal_check(market, book_a, book_b)
+                #     return
 
     def _run_full_signal_check(self, market: dict, book_a: OrderBookState, book_b: OrderBookState):
         """Run full signal detection through engine manager"""
