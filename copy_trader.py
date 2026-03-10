@@ -57,7 +57,7 @@ TARGET_ADDRESS = os.getenv("COPY_TARGET_ADDRESS", "0xd0d6053c3c37e727402d84c1406
 # Your credentials (from environment)
 FUNDER_ADDRESS = os.getenv("POLYMARKET_FUNDER_ADDRESS", os.getenv("POLYGON_ADDRESS", ""))
 PRIVATE_KEY = os.getenv("POLYGON_PRIVATE_KEY", "")
-SIGNATURE_TYPE = int(os.getenv("POLYMARKET_SIGNATURE_TYPE", "2"))  # 0=EOA, 1=Email/Magic, 2=Browser/Privy
+SIGNATURE_TYPE = int(os.getenv("POLYMARKET_SIGNATURE_TYPE", "1"))  # 0=EOA, 1=Poly proxy, 2=Browser/Privy
 
 # Builder credentials (from polymarket.com/settings?tab=builder)
 # IMPORTANT: These are BUILDER creds, NOT CLOB API creds. Get them from polymarket.com/settings?tab=builder
@@ -613,21 +613,6 @@ def get_clob_client() -> Optional["ClobClient"]:
           f"funder={FUNDER_ADDRESS[:6]}...{FUNDER_ADDRESS[-4:]}, sig_type={SIGNATURE_TYPE}", flush=True)
 
     try:
-        # Build builder config only if explicitly enabled
-        builder_config = None
-        if BUILDER_ENABLED and BUILDER_API_KEY and BUILDER_API_SECRET and BUILDER_API_PASSPHRASE:
-            from py_builder_signing_sdk.config import BuilderConfig, BuilderApiKeyCreds
-            builder_config = BuilderConfig(
-                local_builder_creds=BuilderApiKeyCreds(
-                    key=BUILDER_API_KEY,
-                    secret=BUILDER_API_SECRET,
-                    passphrase=BUILDER_API_PASSPHRASE,
-                )
-            )
-            print(f"[ALGO] Builder config loaded (key={BUILDER_API_KEY[:8]}...)", flush=True)
-        else:
-            print(f"[ALGO] Builder mode disabled (set POLYMARKET_BUILDER_ENABLED=true to enable)", flush=True)
-
         # For signature_type=0 (EOA), funder is not needed
         funder = FUNDER_ADDRESS if SIGNATURE_TYPE != 0 else None
         if SIGNATURE_TYPE == 0 and FUNDER_ADDRESS:
@@ -639,9 +624,8 @@ def get_clob_client() -> Optional["ClobClient"]:
             chain_id=137,
             signature_type=SIGNATURE_TYPE,
             funder=funder,
-            builder_config=builder_config,
         )
-        creds = client.derive_api_key()
+        creds = client.create_or_derive_api_creds()
         client.set_api_creds(creds)
         print(f"[ALGO] CLOB client initialized successfully", flush=True)
         return client
