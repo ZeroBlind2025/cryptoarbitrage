@@ -635,14 +635,17 @@ def place_bet(client: "ClobClient", token_id: str, amount: float, max_price: flo
             limit_price = min(round(max_price, 4), 0.99)
             size = amount / limit_price  # shares to buy at this price
 
-            from py_clob_client.clob_types import OrderArgs
+            from py_clob_client.clob_types import OrderArgs, PartialCreateOrderOptions
             print(f"[ALGO] Limit order: {size:.2f} shares @ {limit_price:.4f} (max ${amount:.2f})")
-            order = client.create_order(OrderArgs(
-                token_id=token_id,
-                price=limit_price,
-                size=round(size, 2),
-                side=BUY,
-            ))
+            order = client.create_order(
+                OrderArgs(
+                    token_id=token_id,
+                    price=limit_price,
+                    size=round(size, 2),
+                    side=BUY,
+                ),
+                options=PartialCreateOrderOptions(tick_size="0.01"),
+            )
             result = client.post_order(order)
         else:
             # Fallback: FOK market order (no price protection)
@@ -675,6 +678,7 @@ def place_bet(client: "ClobClient", token_id: str, amount: float, max_price: flo
         return fill_info
     except Exception as e:
         print(f"[ALGO] Order error: {e}")
+        import traceback; traceback.print_exc()
         return {}
 
 
@@ -687,14 +691,17 @@ def place_sell(client: "ClobClient", token_id: str, size: float, min_price: floa
     try:
         if min_price and min_price > 0:
             limit_price = max(round(min_price, 4), 0.01)
-            from py_clob_client.clob_types import OrderArgs
+            from py_clob_client.clob_types import OrderArgs, PartialCreateOrderOptions
             print(f"[ALGO] Sell limit: {size:.2f} shares @ min {limit_price:.4f}")
-            order = client.create_order(OrderArgs(
-                token_id=token_id,
-                price=limit_price,
-                size=round(size, 2),
-                side=SELL,
-            ))
+            order = client.create_order(
+                OrderArgs(
+                    token_id=token_id,
+                    price=limit_price,
+                    size=round(size, 2),
+                    side=SELL,
+                ),
+                options=PartialCreateOrderOptions(tick_size="0.01"),
+            )
             result = client.post_order(order)
         else:
             print(f"[ALGO] WARNING: No min_price, using FOK market sell")

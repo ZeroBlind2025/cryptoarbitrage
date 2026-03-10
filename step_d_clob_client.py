@@ -528,7 +528,11 @@ class CLOBClient:
                 size=order.size,
                 side=side,
             )
-            clob_order = self._clob_client.create_order(order_args)
+            from py_clob_client.clob_types import PartialCreateOrderOptions
+            clob_order = self._clob_client.create_order(
+                order_args,
+                options=PartialCreateOrderOptions(tick_size="0.01"),
+            )
             
             # Submit
             result = self._clob_client.post_order(clob_order)
