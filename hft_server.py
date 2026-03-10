@@ -1342,57 +1342,12 @@ def copy_trader_loop():
 
 @app.route('/api/copy-trader/start', methods=['POST'])
 def api_copy_trader_start():
-    """Start copy trading"""
-    global copy_trader, copy_trader_thread, stop_copy_trader, copy_trader_paused
-
-    if not HAS_COPY_TRADER:
-        return jsonify({"error": "Poly Algo module not available"}), 400
-
-    if copy_trader_thread and copy_trader_thread.is_alive():
-        return jsonify({"error": "Poly Algo already running"}), 400
-
-    data = request.get_json() or {}
-    live_mode = data.get('live', False)
-    crypto_only = data.get('crypto_only', True)
-    bet_amount = data.get('bet_amount')
-    coin_bet_amounts = data.get('coin_bet_amounts')  # e.g. {"btc": 1.0, "eth": 2.0, "sol": 1.0}
-
-    # Require confirmation for live mode
-    if live_mode and not data.get('confirm_live'):
-        return jsonify({
-            "error": "Live mode requires confirmation",
-            "message": "Set confirm_live=true to enable live algo trading"
-        }), 403
-
-    # Create copy trader with dashboard callback
-    # Opening balance is set via ALGO_STARTING_BALANCE env var on Railway
-    try:
-        copy_trader = CopyTrader(
-            dry_run=not live_mode,
-            crypto_only=crypto_only,
-            on_trade=on_copy_trade,
-            bet_amount=bet_amount,
-            coin_bet_amounts=coin_bet_amounts,
-        )
-        copy_trader.start()
-    except Exception as e:
-        print(f"[SERVER] Failed to start Poly Algo: {e}")
-        import traceback; traceback.print_exc()
-        copy_trader = None
-        return jsonify({"error": f"Failed to start: {e}"}), 500
-
-    # Start background thread
-    stop_copy_trader.clear()
-    copy_trader_paused.clear()  # Start in active (not paused) state
-    copy_trader_thread = threading.Thread(target=copy_trader_loop, daemon=True)
-    copy_trader_thread.start()
-
-    mode_str = "LIVE" if live_mode else "DRY RUN"
+    """Start copy trading — DISABLED: copy trader is disabled to prevent
+    uncontrolled trading. Use momentum engine instead."""
     return jsonify({
-        "success": True,
-        "message": f"Poly Algo started in {mode_str} mode, following {copy_trader.target_name}",
-        "target": TARGET_ADDRESS,
-    })
+        "error": "Copy trader is disabled",
+        "message": "Copy trader has been disabled on the backend. Use the momentum engine instead."
+    }), 403
 
 
 @app.route('/api/copy-trader/stop', methods=['POST'])
