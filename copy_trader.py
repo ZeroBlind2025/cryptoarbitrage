@@ -590,15 +590,19 @@ def has_opposite_position(entered_markets: dict, condition_id: str, outcome_inde
 def get_clob_client() -> Optional["ClobClient"]:
     """Initialize CLOB client with credentials"""
     if not HAS_CLOB_CLIENT:
+        print("[ALGO] CLOB client FAILED: py_clob_client not installed", flush=True)
         return None
 
     if not PRIVATE_KEY:
-        print("[ALGO] Error: POLYGON_PRIVATE_KEY not set in environment")
+        print("[ALGO] CLOB client FAILED: POLYGON_PRIVATE_KEY not set in environment", flush=True)
         return None
 
     if not FUNDER_ADDRESS:
-        print("[ALGO] Error: POLYMARKET_FUNDER_ADDRESS not set in environment")
+        print("[ALGO] CLOB client FAILED: POLYMARKET_FUNDER_ADDRESS (or POLYGON_ADDRESS) not set in environment", flush=True)
         return None
+
+    print(f"[ALGO] Initializing CLOB client: key={PRIVATE_KEY[:6]}...{PRIVATE_KEY[-4:]}, "
+          f"funder={FUNDER_ADDRESS[:6]}...{FUNDER_ADDRESS[-4:]}, sig_type={SIGNATURE_TYPE}", flush=True)
 
     try:
         client = ClobClient(
@@ -610,9 +614,11 @@ def get_clob_client() -> Optional["ClobClient"]:
         )
         creds = client.derive_api_key()
         client.set_api_creds(creds)
+        print(f"[ALGO] CLOB client initialized successfully", flush=True)
         return client
     except Exception as e:
-        print(f"[ALGO] Error initializing CLOB client: {e}")
+        print(f"[ALGO] CLOB client FAILED during init: {e}", flush=True)
+        import traceback; traceback.print_exc()
         return None
 
 
