@@ -451,6 +451,7 @@ ERC1155_BALANCE_ABI = json.loads("""[
 
 
 POLYGON_RPC_FALLBACKS = [
+    "https://polygon-mainnet.g.alchemy.com/v2/S3PJkQkcYoIJiE9iaUxFc",
     "https://polygon-bor-rpc.publicnode.com",
     "https://polygon.llamarpc.com",
     "https://rpc.ankr.com/polygon",

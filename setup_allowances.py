@@ -40,6 +40,7 @@ def main():
         private_key = "0x" + private_key
 
     rpc_fallbacks = [
+        "https://polygon-mainnet.g.alchemy.com/v2/S3PJkQkcYoIJiE9iaUxFc",
         "https://polygon-bor-rpc.publicnode.com",
         "https://polygon.llamarpc.com",
         "https://rpc.ankr.com/polygon",
