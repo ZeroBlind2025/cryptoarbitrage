@@ -1564,6 +1564,32 @@ class MomentumEngine:
                 position["pnl"] = pnl
                 self.positions["stats"]["wins"] = self.positions["stats"].get("wins", 0) + 1
                 print(f"[MOMENTUM] WIN: {position['market'][:30]} | +${pnl:.2f}", flush=True)
+
+                # Auto-redeem winning shares on-chain → converts back to USDC
+                try:
+                    from copy_trader import redeem_winning_position, _log_copy_trade
+                    redeemed = redeem_winning_position(
+                        condition_id=condition_id,
+                        token_id=token_id,
+                        dry_run=self.dry_run,
+                    )
+                    position["redeemed"] = redeemed
+                    _log_copy_trade("momentum_redeem", {
+                        "market": position.get("market", ""),
+                        "condition_id": condition_id,
+                        "token_id": token_id,
+                        "redeemed": redeemed,
+                        "dry_run": self.dry_run,
+                        "pnl": pnl,
+                    })
+                    if redeemed:
+                        print(f"[MOMENTUM] Auto-redeemed: {position['market'][:30]}", flush=True)
+                    else:
+                        print(f"[MOMENTUM] Redemption failed for {position['market'][:30]} — redeem manually", flush=True)
+                except Exception as e:
+                    position["redeemed"] = False
+                    print(f"[MOMENTUM] Redemption error: {e}", flush=True)
+
             elif won is False:
                 pnl = -amount
                 position["result"] = "LOSS"
