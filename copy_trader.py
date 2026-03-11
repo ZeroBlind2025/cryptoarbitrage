@@ -730,22 +730,14 @@ def _get_relay_headers(body_dict: dict) -> dict:
         "path": "/submit",
         "body": _json.dumps(body_dict),
     }
-    last_err = None
-    for attempt in range(2):
-        try:
-            resp = requests.post(RELAY_SIGN_URL, json=payload, timeout=15)
-            resp.raise_for_status()
-            return resp.json()
-        except requests.exceptions.HTTPError as e:
-            last_err = e
-            if e.response is not None and e.response.status_code == 429:
-                wait = 900  # 15 minutes — let the rate limiter fully reset
-                print(f"[REDEEM] Shared signer rate-limited, retrying in {wait}s...")
-                import time as _time
-                _time.sleep(wait)
-                continue
-            raise
-    raise last_err
+    try:
+        resp = requests.post(RELAY_SIGN_URL, json=payload, timeout=15)
+        resp.raise_for_status()
+        return resp.json()
+    except requests.exceptions.HTTPError as e:
+        if e.response is not None and e.response.status_code == 429:
+            print(f"[REDEEM] Shared signer rate-limited (429), skipping relay — will queue for retry")
+        raise
     # --- Method 3: Shared signing server (rate-limited) ---
     payload = {
         "method": "POST",
@@ -1077,30 +1069,23 @@ def redeem_winning_position(condition_id: str, token_id: str = "", dry_run: bool
                 address=w3.to_checksum_address(token_holder),
                 abi=GNOSIS_SAFE_ABI,
             )
-            # Retry relay with long backoff on 429 (rate limit).
-            # The shared relayer key is heavily rate-limited and needs a full
-            # cool-down before retrying — short retries just reset the window.
+            # Try gasless relay once — on 429, queue for retry instead of blocking.
             relay_err = None
-            max_relay_attempts = 2
-            for attempt in range(max_relay_attempts):
-                try:
-                    tx_hex = _redeem_via_relay(
-                        w3, account, safe_contract, token_holder,
-                        contract_addr, call_data,
-                    )
-                    print(f"[REDEEM] SUCCESS (gasless relay): condition={cid[:20]}... tx={tx_hex}")
-                    return True
-                except Exception as e:
-                    relay_err = e
-                    if "429" in str(e) and attempt < max_relay_attempts - 1:
-                        wait = 900  # 15 minutes — let the rate limiter fully reset
-                        print(f"[REDEEM] Relay 429, retrying in {wait}s (attempt {attempt+1}/{max_relay_attempts})...")
-                        import time
-                        time.sleep(wait)
-                    else:
-                        break
+            try:
+                tx_hex = _redeem_via_relay(
+                    w3, account, safe_contract, token_holder,
+                    contract_addr, call_data,
+                )
+                print(f"[REDEEM] SUCCESS (gasless relay): condition={cid[:20]}... tx={tx_hex}")
+                return True
+            except Exception as e:
+                relay_err = e
+                if "429" in str(e):
+                    print(f"[REDEEM] Relay 429 rate-limited, queuing for later retry (non-blocking)")
+                    _queue_pending_redemption(condition_id, token_id, slug)
+                    return False
 
-            print(f"[REDEEM] Gasless relay failed after {max_relay_attempts} attempts ({relay_err}), trying direct Safe tx...")
+            print(f"[REDEEM] Gasless relay failed ({relay_err}), trying direct Safe tx...")
             try:
                 tx_hex = _exec_via_safe(w3, token_holder, contract_addr, bytes.fromhex(call_data[2:]), account)
                 print(f"[REDEEM] SUCCESS (direct proxy): condition={cid[:20]}... tx={tx_hex}")
