@@ -423,7 +423,7 @@ CTF_REDEEM_ABI = json.loads("""[
     }
 ]""")
 
-# Minimal ABI for NegRiskAdapter redeemPositions (different signature)
+# Minimal ABI for NegRiskAdapter redeemPositions + getConditionId
 NEG_RISK_REDEEM_ABI = json.loads("""[
     {
         "inputs": [
@@ -433,6 +433,15 @@ NEG_RISK_REDEEM_ABI = json.loads("""[
         "name": "redeemPositions",
         "outputs": [],
         "stateMutability": "nonpayable",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {"name": "_questionId", "type": "bytes32"}
+        ],
+        "name": "getConditionId",
+        "outputs": [{"name": "", "type": "bytes32"}],
+        "stateMutability": "view",
         "type": "function"
     }
 ]""")
@@ -1027,6 +1036,30 @@ def redeem_winning_position(condition_id: str, token_id: str = "", dry_run: bool
             except Exception as diag_err:
                 print(f"[REDEEM] payoutDenominator check failed: {diag_err}")
 
+            # Diagnostic: verify conditionId matches what NegRiskAdapter expects.
+            # The Gamma API may return a different conditionId than the adapter's
+            # derived one.  If so, use the adapter-derived conditionId.
+            try:
+                clob_resp2 = requests.get(
+                    f"{CLOB_API}/markets/{condition_id}", timeout=5,
+                )
+                if clob_resp2.status_code == 200:
+                    clob_data2 = clob_resp2.json()
+                    question_id = clob_data2.get("question_id", "")
+                    if question_id:
+                        q_bytes = bytes.fromhex(question_id.replace("0x", "").zfill(64))
+                        adapter_cid = contract.functions.getConditionId(q_bytes).call()
+                        adapter_cid_hex = "0x" + adapter_cid.hex()
+                        print(f"[REDEEM] conditionId check: API={cid[:20]}... adapter={adapter_cid_hex[:20]}... question={question_id[:20]}...")
+                        if adapter_cid_hex.lower() != cid.lower():
+                            print(f"[REDEEM] MISMATCH! Using adapter-derived conditionId instead")
+                            condition_bytes = adapter_cid
+                            call_data = contract.encode_abi("redeemPositions", [condition_bytes, amounts])
+                    else:
+                        print(f"[REDEEM] No question_id in CLOB response")
+            except Exception as cid_err:
+                print(f"[REDEEM] conditionId verification failed: {cid_err}")
+
             print(f"[REDEEM] NegRisk redemption: condition={cid[:20]}... amounts={amounts} outcome_idx={outcome_index}")
             call_data = contract.encode_abi("redeemPositions", [condition_bytes, amounts])
         else:
@@ -1058,6 +1091,7 @@ def redeem_winning_position(condition_id: str, token_id: str = "", dry_run: bool
                         w3.to_checksum_address(token_holder),
                         w3.to_checksum_address(NEG_RISK_ADAPTER_ADDRESS),
                     ).call()
+                    print(f"[REDEEM] Safe→NegRiskAdapter approval on CTF: {approved}")
                     if not approved:
                         print(f"[REDEEM] Safe not approved for NegRiskAdapter on CTF — setting approval...")
                         approve_data = ctf_for_approval.encode_abi(
