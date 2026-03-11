@@ -823,6 +823,7 @@ def _exec_via_safe(w3, safe_address: str, to: str, call_data: bytes, account) ->
     )
 
     safe_nonce = safe.functions.nonce().call()
+    print(f"[REDEEM] Direct Safe nonce (on-chain): {safe_nonce}")
     call_data_hex = "0x" + call_data.hex()
 
     tx_hash_bytes = safe.functions.getTransactionHash(
@@ -1036,9 +1037,7 @@ def redeem_winning_position(condition_id: str, token_id: str = "", dry_run: bool
             except Exception as diag_err:
                 print(f"[REDEEM] payoutDenominator check failed: {diag_err}")
 
-            # Diagnostic: verify conditionId matches what NegRiskAdapter expects.
-            # The Gamma API may return a different conditionId than the adapter's
-            # derived one.  If so, use the adapter-derived conditionId.
+            # Diagnostic: log question_id and adapter-derived conditionId (no auto-correction)
             try:
                 clob_resp2 = requests.get(
                     f"{CLOB_API}/markets/{condition_id}", timeout=5,
@@ -1046,22 +1045,42 @@ def redeem_winning_position(condition_id: str, token_id: str = "", dry_run: bool
                 if clob_resp2.status_code == 200:
                     clob_data2 = clob_resp2.json()
                     question_id = clob_data2.get("question_id", "")
+                    clob_tokens = clob_data2.get("tokens", [])
+                    print(f"[REDEEM] CLOB question_id={question_id[:20]}... tokens={len(clob_tokens)}")
                     if question_id:
-                        q_bytes = bytes.fromhex(question_id.replace("0x", "").zfill(64))
-                        adapter_cid = contract.functions.getConditionId(q_bytes).call()
-                        adapter_cid_hex = "0x" + adapter_cid.hex()
-                        print(f"[REDEEM] conditionId check: API={cid[:20]}... adapter={adapter_cid_hex[:20]}... question={question_id[:20]}...")
-                        if adapter_cid_hex.lower() != cid.lower():
-                            print(f"[REDEEM] MISMATCH! Using adapter-derived conditionId instead")
-                            condition_bytes = adapter_cid
-                            call_data = contract.encode_abi("redeemPositions", [condition_bytes, amounts])
-                    else:
-                        print(f"[REDEEM] No question_id in CLOB response")
+                        try:
+                            q_bytes = bytes.fromhex(question_id.replace("0x", "").zfill(64))
+                            adapter_cid = contract.functions.getConditionId(q_bytes).call()
+                            adapter_cid_hex = "0x" + adapter_cid.hex()
+                            print(f"[REDEEM] conditionId: API={cid[:20]}... adapter_derived={adapter_cid_hex[:20]}... match={adapter_cid_hex.lower() == cid.lower()}")
+                            # Check payoutDenominator for adapter-derived conditionId too
+                            payout_adapter = ctf_diag.functions.payoutDenominator(adapter_cid).call()
+                            print(f"[REDEEM] payoutDenominator: API_cid={payout_denom} adapter_cid={payout_adapter}")
+                        except Exception as e2:
+                            print(f"[REDEEM] adapter conditionId check failed: {e2}")
+                    # Log both token balances from CLOB response
+                    for i, tok in enumerate(clob_tokens):
+                        try:
+                            tid = tok.get("token_id", "")
+                            tid_int2 = int(tid, 16) if tid.startswith("0x") else int(tid)
+                            bal2 = ctf_diag.functions.balanceOf(balance_wallet, tid_int2).call()
+                            print(f"[REDEEM] Token[{i}] outcome={tok.get('outcome', '?')} balance={bal2} token_id={tid[:20]}...")
+                        except Exception:
+                            pass
             except Exception as cid_err:
-                print(f"[REDEEM] conditionId verification failed: {cid_err}")
+                print(f"[REDEEM] conditionId diagnostic failed: {cid_err}")
 
             print(f"[REDEEM] NegRisk redemption: condition={cid[:20]}... amounts={amounts} outcome_idx={outcome_index}")
             call_data = contract.encode_abi("redeemPositions", [condition_bytes, amounts])
+
+            # Simulate the inner call (as if called from the Safe) to get actual revert reason
+            try:
+                contract.functions.redeemPositions(condition_bytes, amounts).call(
+                    {"from": w3.to_checksum_address(token_holder)}
+                )
+                print(f"[REDEEM] Inner call simulation: SUCCESS")
+            except Exception as sim_err:
+                print(f"[REDEEM] Inner call simulation FAILED: {sim_err}")
         else:
             # Standard binary: CTF.redeemPositions(collateral, parent, conditionId, indexSets)
             contract_addr = CTF_CONTRACT_ADDRESS
