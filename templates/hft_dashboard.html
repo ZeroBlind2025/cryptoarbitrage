@@ -1368,6 +1368,9 @@
                                                 )}
                                             </div>
                                         )}
+                                        {/* Balance Chart */}
+                                        <BalanceChart history={momentum.balance_history || []} />
+
                                         <div className="flex justify-between">
                                             <span className="text-slate-400">Scans</span>
                                             <span className="text-white font-mono">{momentum.scans_completed || 0}</span>

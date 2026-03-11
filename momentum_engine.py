@@ -1800,6 +1800,47 @@ class MomentumEngine:
             }
         return result
 
+    @staticmethod
+    def _thin_balance_history(history: list) -> list:
+        """Downsample balance history so the chart stays responsive.
+
+        Same strategy as CopyTrader._thin_balance_history: keep full resolution
+        for recent data, progressively thin older data.
+        """
+        if len(history) <= 2000:
+            return history
+
+        now_ms = time.time() * 1000
+        buckets = [
+            (1 * 3600 * 1000, 1),
+            (6 * 3600 * 1000, 5),
+            (24 * 3600 * 1000, 20),
+            (7 * 24 * 3600 * 1000, 100),
+            (30 * 24 * 3600 * 1000, 500),
+        ]
+
+        result = []
+        for idx, entry in enumerate(history):
+            try:
+                ts = entry.get("timestamp", "")
+                entry_ms = datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp() * 1000
+            except Exception:
+                continue
+            age_ms = max(0, now_ms - entry_ms)
+
+            keep = False
+            for boundary, step in buckets:
+                if age_ms < boundary:
+                    keep = (idx % step == 0)
+                    break
+            else:
+                keep = (idx % 500 == 0)
+
+            if keep:
+                result.append(entry)
+
+        return result
+
     def get_stats(self) -> dict:
         """Get current stats for dashboard."""
         stats = self.positions.get("stats", {})
@@ -1846,6 +1887,19 @@ class MomentumEngine:
                 "timestamp": pos.get("timestamp", ""),
             })
 
+        # Build momentum-only balance_history (filter shared history to momentum events)
+        raw_history = [
+            h for h in stats.get("balance_history", [])
+            if str(h.get("event", "")).startswith("momentum")
+        ]
+        raw_len = len(raw_history)
+        cache = getattr(self, "_mbh_cache", None)
+        if cache and cache[0] == raw_len:
+            balance_history = cache[1]
+        else:
+            balance_history = self._thin_balance_history(raw_history)
+            self._mbh_cache = (raw_len, balance_history)
+
         return {
             "trades_entered": self.trades_entered,
             "trades_skipped": self.trades_skipped,
@@ -1860,6 +1914,7 @@ class MomentumEngine:
             "open_staked": m_open_staked,
             "coin_roi": coin_roi,
             "open_by_coin": open_by_coin,
+            "balance_history": balance_history,
             "min_entry_price": self.min_entry_price,
             "max_entry_price": self.max_entry_price,
             "max_entries_per_market": self.max_entries_per_market,
