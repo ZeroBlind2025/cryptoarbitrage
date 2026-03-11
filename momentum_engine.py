@@ -1453,9 +1453,16 @@ class MomentumEngine:
 
         Delegates to the same resolution logic as the copy trader.
         """
-        from copy_trader import get_market_resolution
+        from copy_trader import get_market_resolution, retry_pending_redemptions
 
         now = time.time()
+
+        # Retry any queued redemptions (rate-limited relay, no gas, etc.)
+        try:
+            retry_pending_redemptions(dry_run=self.dry_run)
+        except Exception:
+            pass
+
         if now - self.last_resolution_check < self.resolution_check_interval:
             return
 
@@ -1577,7 +1584,7 @@ class MomentumEngine:
 
                 # Auto-redeem winning shares on-chain → converts back to USDC
                 try:
-                    from copy_trader import redeem_winning_position, _log_copy_trade
+                    from copy_trader import redeem_winning_position, _log_copy_trade, _queue_pending_redemption
                     redeemed = redeem_winning_position(
                         condition_id=condition_id,
                         token_id=token_id,
@@ -1598,10 +1605,16 @@ class MomentumEngine:
                     elif redeemed is None:
                         pass  # No-op: balance was 0, already logged by redeem function
                     else:
-                        print(f"[MOMENTUM] Redemption failed for {position['market'][:30]} — redeem manually", flush=True)
+                        print(f"[MOMENTUM] Redemption failed for {position['market'][:30]} — queued for retry", flush=True)
+                        _queue_pending_redemption(condition_id, token_id, slug)
                 except Exception as e:
                     position["redeemed"] = False
                     print(f"[MOMENTUM] Redemption error: {e}", flush=True)
+                    try:
+                        from copy_trader import _queue_pending_redemption
+                        _queue_pending_redemption(condition_id, token_id, slug)
+                    except Exception:
+                        pass
 
             elif won is False:
                 pnl = -amount

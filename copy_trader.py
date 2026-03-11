@@ -66,6 +66,10 @@ FUNDER_ADDRESS = os.getenv("POLYMARKET_FUNDER_ADDRESS", os.getenv("POLYGON_ADDRE
 PRIVATE_KEY = os.getenv("POLYGON_PRIVATE_KEY", "")
 SIGNATURE_TYPE = int(os.getenv("POLYMARKET_SIGNATURE_TYPE", "2"))  # 0=EOA, 1=Poly proxy, 2=Gnosis Safe (most common)
 
+# Relayer API Key (simplest auth — create at polymarket.com/settings?tab=api-keys)
+# Just needs RELAYER_API_KEY + your EOA address. No rate limits from shared signer.
+RELAYER_API_KEY = os.getenv("POLYMARKET_RELAYER_API_KEY", "")
+
 # Builder credentials (from polymarket.com/settings?tab=builder)
 # IMPORTANT: These are BUILDER creds, NOT CLOB API creds. Get them from polymarket.com/settings?tab=builder
 # Set POLYMARKET_BUILDER_ENABLED=true to use builder mode (not needed for basic trading)
@@ -644,15 +648,29 @@ def _sign_safe_tx(account, safe_contract, to: str, call_data: str, nonce: int, w
 def _get_relay_headers(body_dict: dict) -> dict:
     """Get signed headers for the Polymarket gasless relay.
 
-    The relay requires BOTH:
-    - L2 auth headers (POLY_ADDRESS, POLY_SIGNATURE, etc.)
-    - Builder headers (POLY_BUILDER_API_KEY, POLY_BUILDER_SIGNATURE, etc.)
-
     Priority:
-    1. Builder creds (env vars) + derived L2 creds — own quota, no rate limits
-    2. Shared signing server — generates both header sets, but rate-limited
+    1. Relayer API Key (simplest, from polymarket.com/settings?tab=api-keys)
+    2. Builder creds (env vars) + derived L2 creds — own quota, no rate limits
+    3. Shared signing server — generates both header sets, but rate-limited
     """
     import json as _json
+
+    # --- Method 0: Relayer API Key (simplest, no HMAC needed) ---
+    if RELAYER_API_KEY:
+        eoa = os.getenv("POLYMARKET_ADDRESS", "")
+        if not eoa and PRIVATE_KEY:
+            try:
+                from eth_account import Account
+                eoa = Account.from_key(PRIVATE_KEY).address
+            except Exception:
+                pass
+        if eoa:
+            print(f"[REDEEM] Using Relayer API Key (key={RELAYER_API_KEY[:12]}...)")
+            return {
+                "RELAYER_API_KEY": RELAYER_API_KEY,
+                "RELAYER_API_KEY_ADDRESS": eoa,
+                "Content-Type": "application/json",
+            }
 
     # --- Method 1: Builder credentials + L2 creds ---
     if BUILDER_ENABLED and BUILDER_API_KEY and BUILDER_API_SECRET and BUILDER_API_PASSPHRASE:
@@ -873,6 +891,61 @@ def _exec_via_safe(w3, safe_address: str, to: str, call_data: bytes, account) ->
     return tx_hash.hex()
 
 
+# Queue for redemptions that failed due to relay rate-limit / no gas.
+# Each entry: {"condition_id": str, "token_id": str, "slug": str, "attempts": int, "next_retry": float}
+_pending_redemptions: list = []
+_PENDING_MAX_ATTEMPTS = 20  # give up after this many total attempts
+
+
+def _queue_pending_redemption(condition_id: str, token_id: str, slug: str, attempts: int = 1):
+    """Add a failed redemption to the retry queue."""
+    import time as _t
+    # Don't duplicate
+    for item in _pending_redemptions:
+        if item["condition_id"] == condition_id:
+            item["attempts"] = attempts
+            item["next_retry"] = _t.time() + min(60 * attempts, 300)  # 60s, 120s, ... up to 5min
+            return
+    _pending_redemptions.append({
+        "condition_id": condition_id,
+        "token_id": token_id,
+        "slug": slug,
+        "attempts": attempts,
+        "next_retry": _t.time() + 60,
+    })
+    print(f"[REDEEM] Queued for retry (attempt {attempts}): condition={condition_id[:20]}...")
+
+
+def retry_pending_redemptions(dry_run: bool = False):
+    """Retry any queued redemptions whose backoff has elapsed. Call periodically."""
+    import time as _t
+    if not _pending_redemptions:
+        return
+    now = _t.time()
+    still_pending = []
+    for item in _pending_redemptions:
+        if now < item["next_retry"]:
+            still_pending.append(item)
+            continue
+        if item["attempts"] >= _PENDING_MAX_ATTEMPTS:
+            print(f"[REDEEM] Giving up after {item['attempts']} attempts: {item['condition_id'][:20]}...")
+            continue
+        print(f"[REDEEM] Retrying queued redemption (attempt {item['attempts']+1}): {item['condition_id'][:20]}...")
+        result = redeem_winning_position(
+            item["condition_id"], token_id=item["token_id"],
+            dry_run=dry_run, slug=item["slug"],
+        )
+        if result is True:
+            print(f"[REDEEM] Queued redemption succeeded!")
+        else:
+            item["attempts"] += 1
+            item["next_retry"] = now + min(60 * item["attempts"], 300)
+            still_pending.append(item)
+    _pending_redemptions[:] = still_pending
+    if _pending_redemptions:
+        print(f"[REDEEM] {len(_pending_redemptions)} redemption(s) still queued for retry")
+
+
 def redeem_winning_position(condition_id: str, token_id: str = "", dry_run: bool = False, slug: str = ""):
     """Redeem winning conditional tokens on-chain for USDC.
 
@@ -988,9 +1061,11 @@ def redeem_winning_position(condition_id: str, token_id: str = "", dry_run: bool
             print(f"[REDEEM] payoutDenominator check failed: {diag_err}")
 
         market_type = "NegRisk" if is_neg_risk else "Standard"
-        print(f"[REDEEM] {market_type} CTF redemption: condition={cid[:20]}... indexSets=[1,2]")
+        # Polymarket uses USDC.e as collateral (per docs). Try USDC.e first.
+        collateral = USDC_E_ADDRESS
+        print(f"[REDEEM] {market_type} CTF redemption: condition={cid[:20]}... collateral=USDC.e indexSets=[1,2]")
         call_data = contract.encode_abi("redeemPositions", [
-            w3.to_checksum_address(USDC_ADDRESS),
+            w3.to_checksum_address(collateral),
             HASH_ZERO,
             condition_bytes,
             [1, 2],
@@ -1002,9 +1077,12 @@ def redeem_winning_position(condition_id: str, token_id: str = "", dry_run: bool
                 address=w3.to_checksum_address(token_holder),
                 abi=GNOSIS_SAFE_ABI,
             )
-            # Retry relay with exponential backoff on 429 (rate limit)
+            # Retry relay with exponential backoff on 429 (rate limit).
+            # Using shared signer (no builder creds), so rate limits are tight.
+            # Longer delays give the rate limiter time to reset.
             relay_err = None
-            for attempt in range(4):
+            max_relay_attempts = 6
+            for attempt in range(max_relay_attempts):
                 try:
                     tx_hex = _redeem_via_relay(
                         w3, account, safe_contract, token_holder,
@@ -1014,28 +1092,30 @@ def redeem_winning_position(condition_id: str, token_id: str = "", dry_run: bool
                     return True
                 except Exception as e:
                     relay_err = e
-                    if "429" in str(e) and attempt < 3:
-                        wait = 2 ** (attempt + 1)  # 2, 4, 8 seconds
-                        print(f"[REDEEM] Relay 429, retrying in {wait}s (attempt {attempt+1}/4)...")
+                    if "429" in str(e) and attempt < max_relay_attempts - 1:
+                        wait = min(5 * (2 ** attempt), 60)  # 5, 10, 20, 40, 60, 60
+                        print(f"[REDEEM] Relay 429, retrying in {wait}s (attempt {attempt+1}/{max_relay_attempts})...")
                         import time
                         time.sleep(wait)
                     else:
                         break
 
-            print(f"[REDEEM] Gasless relay failed after retries ({relay_err}), trying direct Safe tx...")
+            print(f"[REDEEM] Gasless relay failed after {max_relay_attempts} attempts ({relay_err}), trying direct Safe tx...")
             try:
                 tx_hex = _exec_via_safe(w3, token_holder, contract_addr, bytes.fromhex(call_data[2:]), account)
                 print(f"[REDEEM] SUCCESS (direct proxy): condition={cid[:20]}... tx={tx_hex}")
                 return True
             except Exception as direct_err:
                 if "insufficient" in str(direct_err).lower():
-                    print(f"[REDEEM] Direct tx failed: EOA has insufficient MATIC for gas. Fund EOA or wait for relay.")
+                    print(f"[REDEEM] Direct tx failed: EOA has insufficient MATIC for gas.")
+                    _queue_pending_redemption(condition_id, token_id, slug)
+                    return False
                 raise RuntimeError(f"Both relay ({relay_err}) and direct ({direct_err}) failed") from direct_err
         else:
-            # Direct EOA call
+            # Direct EOA call (USDC.e first per Polymarket docs)
             nonce = w3.eth.get_transaction_count(eoa_address)
             tx = contract.functions.redeemPositions(
-                w3.to_checksum_address(USDC_ADDRESS),
+                w3.to_checksum_address(collateral),
                 HASH_ZERO,
                 condition_bytes,
                 [1, 2],
@@ -1052,11 +1132,11 @@ def redeem_winning_position(condition_id: str, token_id: str = "", dry_run: bool
                 print(f"[REDEEM] SUCCESS: condition={cid[:20]}... tx={tx_hash.hex()}")
                 return True
 
-            # Transaction reverted — try bridged USDC.e as fallback collateral
-            print(f"[REDEEM] Native USDC failed, trying bridged USDC.e...")
+            # Transaction reverted — try native USDC as fallback collateral
+            print(f"[REDEEM] USDC.e failed, trying native USDC...")
             nonce = w3.eth.get_transaction_count(eoa_address)
             tx = contract.functions.redeemPositions(
-                w3.to_checksum_address(USDC_E_ADDRESS),
+                w3.to_checksum_address(USDC_ADDRESS),
                 HASH_ZERO,
                 condition_bytes,
                 [1, 2],
@@ -1069,23 +1149,23 @@ def redeem_winning_position(condition_id: str, token_id: str = "", dry_run: bool
             tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
             receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
             if receipt.status == 1:
-                print(f"[REDEEM] SUCCESS (USDC.e): tx={tx_hash.hex()}")
+                print(f"[REDEEM] SUCCESS (native USDC): tx={tx_hash.hex()}")
                 return True
 
             print(f"[REDEEM] FAILED: transaction reverted")
             return False
 
     except Exception as e:
-        # If proxy call failed for standard market, try USDC.e through proxy
+        # If proxy call reverted (wrong collateral?), try native USDC as fallback
         if use_proxy and "reverted" in str(e).lower():
             try:
-                print(f"[REDEEM] USDC failed, trying USDC.e via relay...")
+                print(f"[REDEEM] USDC.e failed via proxy, trying native USDC...")
                 contract = w3.eth.contract(
                     address=w3.to_checksum_address(CTF_CONTRACT_ADDRESS),
                     abi=CTF_REDEEM_ABI,
                 )
-                call_data_e = contract.encode_abi("redeemPositions", [
-                    w3.to_checksum_address(USDC_E_ADDRESS),
+                call_data_fb = contract.encode_abi("redeemPositions", [
+                    w3.to_checksum_address(USDC_ADDRESS),
                     HASH_ZERO,
                     condition_bytes,
                     [1, 2],
@@ -1097,14 +1177,14 @@ def redeem_winning_position(condition_id: str, token_id: str = "", dry_run: bool
                 try:
                     tx_hex = _redeem_via_relay(
                         w3, account, safe_contract, token_holder,
-                        CTF_CONTRACT_ADDRESS, call_data_e,
+                        CTF_CONTRACT_ADDRESS, call_data_fb,
                     )
                 except Exception:
-                    tx_hex = _exec_via_safe(w3, token_holder, CTF_CONTRACT_ADDRESS, bytes.fromhex(call_data_e[2:]), account)
-                print(f"[REDEEM] SUCCESS (USDC.e via proxy): tx={tx_hex}")
+                    tx_hex = _exec_via_safe(w3, token_holder, CTF_CONTRACT_ADDRESS, bytes.fromhex(call_data_fb[2:]), account)
+                print(f"[REDEEM] SUCCESS (native USDC via proxy): tx={tx_hex}")
                 return True
             except Exception as e2:
-                print(f"[REDEEM] USDC.e proxy also failed: {e2}")
+                print(f"[REDEEM] Native USDC proxy also failed: {e2}")
                 return False
         print(f"[REDEEM] Error: {e}")
         return False
@@ -2415,7 +2495,8 @@ class CopyTrader:
                         elif redeemed is None:
                             pass  # No-op: balance was 0, already logged by redeem function
                         else:
-                            print(f"[ALGO] Redemption failed for {position['market'][:30]} — redeem manually")
+                            print(f"[ALGO] Redemption failed for {position['market'][:30]} — queued for retry")
+                            _queue_pending_redemption(condition_id, token_id, slug)
                     except Exception as e:
                         position["redeemed"] = False
                         _log_copy_trade("redeem_error", {
@@ -2425,6 +2506,7 @@ class CopyTrader:
                             "error": str(e),
                         })
                         print(f"[ALGO] Redemption error: {e}")
+                        _queue_pending_redemption(condition_id, token_id, slug)
 
                 elif won is False:
                     pnl = -amount
