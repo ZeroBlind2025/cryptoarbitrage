@@ -437,7 +437,7 @@ NEG_RISK_REDEEM_ABI = json.loads("""[
     }
 ]""")
 
-# Minimal ABI for ERC1155 balanceOf (to check token holdings before redeeming)
+# Minimal ABI for ERC1155 balanceOf + isApprovedForAll + setApprovalForAll
 ERC1155_BALANCE_ABI = json.loads("""[
     {
         "inputs": [
@@ -445,6 +445,35 @@ ERC1155_BALANCE_ABI = json.loads("""[
             {"name": "id", "type": "uint256"}
         ],
         "name": "balanceOf",
+        "outputs": [{"name": "", "type": "uint256"}],
+        "stateMutability": "view",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {"name": "account", "type": "address"},
+            {"name": "operator", "type": "address"}
+        ],
+        "name": "isApprovedForAll",
+        "outputs": [{"name": "", "type": "bool"}],
+        "stateMutability": "view",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {"name": "operator", "type": "address"},
+            {"name": "approved", "type": "bool"}
+        ],
+        "name": "setApprovalForAll",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {"name": "conditionId", "type": "bytes32"}
+        ],
+        "name": "payoutDenominator",
         "outputs": [{"name": "", "type": "uint256"}],
         "stateMutability": "view",
         "type": "function"
@@ -983,6 +1012,21 @@ def redeem_winning_position(condition_id: str, token_id: str = "", dry_run: bool
 
             amounts = [0, 0]
             amounts[outcome_index] = amount
+
+            # Diagnostic: check if condition is resolved on-chain
+            try:
+                ctf_diag = w3.eth.contract(
+                    address=w3.to_checksum_address(CTF_CONTRACT_ADDRESS),
+                    abi=ERC1155_BALANCE_ABI,
+                )
+                payout_denom = ctf_diag.functions.payoutDenominator(condition_bytes).call()
+                print(f"[REDEEM] On-chain payoutDenominator={payout_denom} (0=not resolved)")
+                if payout_denom == 0:
+                    print(f"[REDEEM] Condition NOT resolved on-chain yet — skipping")
+                    return None
+            except Exception as diag_err:
+                print(f"[REDEEM] payoutDenominator check failed: {diag_err}")
+
             print(f"[REDEEM] NegRisk redemption: condition={cid[:20]}... amounts={amounts} outcome_idx={outcome_index}")
             call_data = contract.encode_abi("redeemPositions", [condition_bytes, amounts])
         else:
@@ -1001,6 +1045,33 @@ def redeem_winning_position(condition_id: str, token_id: str = "", dry_run: bool
             ])
 
         if use_proxy:
+            # Ensure the Safe has approved the target contract as an ERC1155 operator.
+            # NegRiskAdapter calls ctf.safeBatchTransferFrom(msg.sender, ...) which
+            # requires the Safe to have approved it on the CTF contract.
+            if is_neg_risk:
+                try:
+                    ctf_for_approval = w3.eth.contract(
+                        address=w3.to_checksum_address(CTF_CONTRACT_ADDRESS),
+                        abi=ERC1155_BALANCE_ABI,
+                    )
+                    approved = ctf_for_approval.functions.isApprovedForAll(
+                        w3.to_checksum_address(token_holder),
+                        w3.to_checksum_address(NEG_RISK_ADAPTER_ADDRESS),
+                    ).call()
+                    if not approved:
+                        print(f"[REDEEM] Safe not approved for NegRiskAdapter on CTF — setting approval...")
+                        approve_data = ctf_for_approval.encode_abi(
+                            "setApprovalForAll",
+                            [w3.to_checksum_address(NEG_RISK_ADAPTER_ADDRESS), True],
+                        )
+                        _exec_via_safe(
+                            w3, token_holder, CTF_CONTRACT_ADDRESS,
+                            bytes.fromhex(approve_data[2:]), account,
+                        )
+                        print(f"[REDEEM] Approval set successfully")
+                except Exception as approval_err:
+                    print(f"[REDEEM] Approval check/set failed: {approval_err}")
+
             # Route through Polymarket's gasless relay (no MATIC needed on EOA)
             safe_contract = w3.eth.contract(
                 address=w3.to_checksum_address(token_holder),
