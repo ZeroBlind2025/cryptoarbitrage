@@ -371,6 +371,10 @@ def discover_active_markets() -> list[dict]:
     ]
     event_slug_coins = ["btc", "eth", "sol", "xrp"]
     event_slug_found = 0
+    _slug_hits = 0
+    _slug_misses = 0
+    _slug_errors = 0
+    _slug_miss_examples = []
 
     for coin_abbr in event_slug_coins:
         coin_full = COIN_SLUG_NAMES.get(coin_abbr, coin_abbr)
@@ -395,22 +399,41 @@ def discover_active_markets() -> list[dict]:
                         if resp.status_code == 200:
                             data = resp.json()
                             events_list = data if isinstance(data, list) else [data] if isinstance(data, dict) else []
+                            slug_found_any = False
                             for event in events_list:
                                 if not isinstance(event, dict):
                                     continue
                                 for mkt in event.get("markets", []):
                                     if _add_market(mkt):
                                         event_slug_found += 1
+                                        slug_found_any = True
                                 if "conditionId" in event:
                                     if _add_market(event):
                                         event_slug_found += 1
-                    except Exception:
-                        pass
+                                        slug_found_any = True
+                            if slug_found_any or events_list:
+                                _slug_hits += 1
+                            else:
+                                _slug_misses += 1
+                                if len(_slug_miss_examples) < 4:
+                                    _slug_miss_examples.append(event_slug)
+                        else:
+                            _slug_errors += 1
+                            if _slug_errors <= 2:
+                                print(f"[MOMENTUM] Slug API {resp.status_code} for {event_slug}",
+                                      flush=True)
+                    except Exception as e:
+                        _slug_errors += 1
+                        if _slug_errors <= 2:
+                            print(f"[MOMENTUM] Slug API error for {event_slug}: {e}",
+                                  flush=True)
                     time.sleep(0.02)
 
-    if event_slug_found > 0:
-        print(f"[MOMENTUM] Event slugs: found {event_slug_found} markets "
-              f"via computed slugs", flush=True)
+    print(f"[MOMENTUM] Event slugs: found={event_slug_found} "
+          f"hits={_slug_hits} misses={_slug_misses} errors={_slug_errors}",
+          flush=True)
+    if _slug_miss_examples:
+        print(f"[MOMENTUM] Slug miss examples: {_slug_miss_examples}", flush=True)
 
     # ================================================================
     # Strategy 1: /events endpoint (broad listing)
