@@ -963,168 +963,40 @@ def redeem_winning_position(condition_id: str, token_id: str = "", dry_run: bool
         return True
 
     try:
-        if is_neg_risk:
-            # NegRisk: call NegRiskAdapter.redeemPositions(conditionId, amounts)
-            contract_addr = NEG_RISK_ADAPTER_ADDRESS
-            contract = w3.eth.contract(
-                address=w3.to_checksum_address(contract_addr),
-                abi=NEG_RISK_REDEEM_ABI,
-            )
-            amount = token_balance
-            if amount == 0 and token_id:
-                try:
-                    ctf_token = w3.eth.contract(
-                        address=w3.to_checksum_address(CTF_CONTRACT_ADDRESS),
-                        abi=ERC1155_BALANCE_ABI,
-                    )
-                    tid_int = int(token_id, 16) if token_id.startswith("0x") else int(token_id)
-                    amount = ctf_token.functions.balanceOf(balance_wallet, tid_int).call()
-                except Exception:
-                    pass
+        # Both NegRisk and standard CLOB tokens are redeemed through the CTF directly.
+        # The NegRiskAdapter must NOT be used for CLOB tokens — it uses different
+        # internal token IDs, causing "SafeMath: subtraction overflow" errors.
+        # For CLOB tokens: CTF.redeemPositions(USDC, bytes32(0), conditionId, [1,2])
+        contract_addr = CTF_CONTRACT_ADDRESS
+        contract = w3.eth.contract(
+            address=w3.to_checksum_address(contract_addr),
+            abi=CTF_REDEEM_ABI,
+        )
 
-            if amount == 0:
-                print(f"[REDEEM] NegRisk: no token balance found, skipping")
+        # Check if condition is resolved on-chain before attempting redemption
+        try:
+            ctf_diag = w3.eth.contract(
+                address=w3.to_checksum_address(CTF_CONTRACT_ADDRESS),
+                abi=ERC1155_BALANCE_ABI,
+            )
+            payout_denom = ctf_diag.functions.payoutDenominator(condition_bytes).call()
+            print(f"[REDEEM] On-chain payoutDenominator={payout_denom} (0=not resolved)")
+            if payout_denom == 0:
+                print(f"[REDEEM] Condition NOT resolved on-chain yet — skipping")
                 return None
+        except Exception as diag_err:
+            print(f"[REDEEM] payoutDenominator check failed: {diag_err}")
 
-            # NegRiskAdapter.redeemPositions expects amounts[] with one entry
-            # per outcome (2 for binary).  We must figure out which outcome
-            # index (0 or 1) our token_id sits at so we pass
-            # [amount, 0] or [0, amount].
-            outcome_index = 0  # default: assume first outcome
-            if token_id:
-                try:
-                    clob_resp = requests.get(
-                        f"{CLOB_API}/markets/{condition_id}", timeout=5,
-                    )
-                    if clob_resp.status_code == 200:
-                        clob_data = clob_resp.json()
-                        clob_tokens = clob_data.get("tokens", [])
-                        for idx, tok in enumerate(clob_tokens):
-                            tid = tok.get("token_id", "")
-                            if str(tid) == str(token_id):
-                                outcome_index = idx
-                                break
-                except Exception:
-                    pass
-                # Fallback: check on-chain balances for both outcomes
-                if outcome_index == 0 and token_id:
-                    try:
-                        ctf_c = w3.eth.contract(
-                            address=w3.to_checksum_address(CTF_CONTRACT_ADDRESS),
-                            abi=ERC1155_BALANCE_ABI,
-                        )
-                        tid_int = int(token_id, 16) if token_id.startswith("0x") else int(token_id)
-                        bal = ctf_c.functions.balanceOf(balance_wallet, tid_int).call()
-                        if bal == 0:
-                            outcome_index = 1  # our token might be the other one
-                    except Exception:
-                        pass
-
-            amounts = [0, 0]
-            amounts[outcome_index] = amount
-
-            # Diagnostic: check if condition is resolved on-chain
-            try:
-                ctf_diag = w3.eth.contract(
-                    address=w3.to_checksum_address(CTF_CONTRACT_ADDRESS),
-                    abi=ERC1155_BALANCE_ABI,
-                )
-                payout_denom = ctf_diag.functions.payoutDenominator(condition_bytes).call()
-                print(f"[REDEEM] On-chain payoutDenominator={payout_denom} (0=not resolved)")
-                if payout_denom == 0:
-                    print(f"[REDEEM] Condition NOT resolved on-chain yet — skipping")
-                    return None
-            except Exception as diag_err:
-                print(f"[REDEEM] payoutDenominator check failed: {diag_err}")
-
-            # Diagnostic: log question_id and adapter-derived conditionId (no auto-correction)
-            try:
-                clob_resp2 = requests.get(
-                    f"{CLOB_API}/markets/{condition_id}", timeout=5,
-                )
-                if clob_resp2.status_code == 200:
-                    clob_data2 = clob_resp2.json()
-                    question_id = clob_data2.get("question_id", "")
-                    clob_tokens = clob_data2.get("tokens", [])
-                    print(f"[REDEEM] CLOB question_id={question_id[:20]}... tokens={len(clob_tokens)}")
-                    if question_id:
-                        try:
-                            q_bytes = bytes.fromhex(question_id.replace("0x", "").zfill(64))
-                            adapter_cid = contract.functions.getConditionId(q_bytes).call()
-                            adapter_cid_hex = "0x" + adapter_cid.hex()
-                            print(f"[REDEEM] conditionId: API={cid[:20]}... adapter_derived={adapter_cid_hex[:20]}... match={adapter_cid_hex.lower() == cid.lower()}")
-                            # Check payoutDenominator for adapter-derived conditionId too
-                            payout_adapter = ctf_diag.functions.payoutDenominator(adapter_cid).call()
-                            print(f"[REDEEM] payoutDenominator: API_cid={payout_denom} adapter_cid={payout_adapter}")
-                        except Exception as e2:
-                            print(f"[REDEEM] adapter conditionId check failed: {e2}")
-                    # Log both token balances from CLOB response
-                    for i, tok in enumerate(clob_tokens):
-                        try:
-                            tid = tok.get("token_id", "")
-                            tid_int2 = int(tid, 16) if tid.startswith("0x") else int(tid)
-                            bal2 = ctf_diag.functions.balanceOf(balance_wallet, tid_int2).call()
-                            print(f"[REDEEM] Token[{i}] outcome={tok.get('outcome', '?')} balance={bal2} token_id={tid[:20]}...")
-                        except Exception:
-                            pass
-            except Exception as cid_err:
-                print(f"[REDEEM] conditionId diagnostic failed: {cid_err}")
-
-            print(f"[REDEEM] NegRisk redemption: condition={cid[:20]}... amounts={amounts} outcome_idx={outcome_index}")
-            call_data = contract.encode_abi("redeemPositions", [condition_bytes, amounts])
-
-            # Simulate the inner call (as if called from the Safe) to get actual revert reason
-            try:
-                contract.functions.redeemPositions(condition_bytes, amounts).call(
-                    {"from": w3.to_checksum_address(token_holder)}
-                )
-                print(f"[REDEEM] Inner call simulation: SUCCESS")
-            except Exception as sim_err:
-                print(f"[REDEEM] Inner call simulation FAILED: {sim_err}")
-        else:
-            # Standard binary: CTF.redeemPositions(collateral, parent, conditionId, indexSets)
-            contract_addr = CTF_CONTRACT_ADDRESS
-            contract = w3.eth.contract(
-                address=w3.to_checksum_address(contract_addr),
-                abi=CTF_REDEEM_ABI,
-            )
-            print(f"[REDEEM] Standard redemption: condition={cid[:20]}... indexSets=[1,2]")
-            call_data = contract.encode_abi("redeemPositions", [
-                w3.to_checksum_address(USDC_ADDRESS),
-                HASH_ZERO,
-                condition_bytes,
-                [1, 2],
-            ])
+        market_type = "NegRisk" if is_neg_risk else "Standard"
+        print(f"[REDEEM] {market_type} CTF redemption: condition={cid[:20]}... indexSets=[1,2]")
+        call_data = contract.encode_abi("redeemPositions", [
+            w3.to_checksum_address(USDC_ADDRESS),
+            HASH_ZERO,
+            condition_bytes,
+            [1, 2],
+        ])
 
         if use_proxy:
-            # Ensure the Safe has approved the target contract as an ERC1155 operator.
-            # NegRiskAdapter calls ctf.safeBatchTransferFrom(msg.sender, ...) which
-            # requires the Safe to have approved it on the CTF contract.
-            if is_neg_risk:
-                try:
-                    ctf_for_approval = w3.eth.contract(
-                        address=w3.to_checksum_address(CTF_CONTRACT_ADDRESS),
-                        abi=ERC1155_BALANCE_ABI,
-                    )
-                    approved = ctf_for_approval.functions.isApprovedForAll(
-                        w3.to_checksum_address(token_holder),
-                        w3.to_checksum_address(NEG_RISK_ADAPTER_ADDRESS),
-                    ).call()
-                    print(f"[REDEEM] Safe→NegRiskAdapter approval on CTF: {approved}")
-                    if not approved:
-                        print(f"[REDEEM] Safe not approved for NegRiskAdapter on CTF — setting approval...")
-                        approve_data = ctf_for_approval.encode_abi(
-                            "setApprovalForAll",
-                            [w3.to_checksum_address(NEG_RISK_ADAPTER_ADDRESS), True],
-                        )
-                        _exec_via_safe(
-                            w3, token_holder, CTF_CONTRACT_ADDRESS,
-                            bytes.fromhex(approve_data[2:]), account,
-                        )
-                        print(f"[REDEEM] Approval set successfully")
-                except Exception as approval_err:
-                    print(f"[REDEEM] Approval check/set failed: {approval_err}")
-
             # Route through Polymarket's gasless relay (no MATIC needed on EOA)
             safe_contract = w3.eth.contract(
                 address=w3.to_checksum_address(token_holder),
@@ -1149,12 +1021,10 @@ def redeem_winning_position(condition_id: str, token_id: str = "", dry_run: bool
             # Direct EOA call
             nonce = w3.eth.get_transaction_count(eoa_address)
             tx = contract.functions.redeemPositions(
-                *([condition_bytes, amounts] if is_neg_risk else [
-                    w3.to_checksum_address(USDC_ADDRESS),
-                    HASH_ZERO,
-                    condition_bytes,
-                    [1, 2],
-                ])
+                w3.to_checksum_address(USDC_ADDRESS),
+                HASH_ZERO,
+                condition_bytes,
+                [1, 2],
             ).build_transaction({
                 "chainId": 137,
                 "from": eoa_address,
@@ -1168,33 +1038,32 @@ def redeem_winning_position(condition_id: str, token_id: str = "", dry_run: bool
                 print(f"[REDEEM] SUCCESS: condition={cid[:20]}... tx={tx_hash.hex()}")
                 return True
 
-            # Transaction reverted — try bridged USDC.e for standard markets
-            if not is_neg_risk:
-                print(f"[REDEEM] Native USDC failed, trying bridged USDC.e...")
-                nonce = w3.eth.get_transaction_count(eoa_address)
-                tx = contract.functions.redeemPositions(
-                    w3.to_checksum_address(USDC_E_ADDRESS),
-                    HASH_ZERO,
-                    condition_bytes,
-                    [1, 2],
-                ).build_transaction({
-                    "chainId": 137,
-                    "from": eoa_address,
-                    "nonce": nonce,
-                })
-                signed = w3.eth.account.sign_transaction(tx, private_key=PRIVATE_KEY)
-                tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-                receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
-                if receipt.status == 1:
-                    print(f"[REDEEM] SUCCESS (USDC.e): tx={tx_hash.hex()}")
-                    return True
+            # Transaction reverted — try bridged USDC.e as fallback collateral
+            print(f"[REDEEM] Native USDC failed, trying bridged USDC.e...")
+            nonce = w3.eth.get_transaction_count(eoa_address)
+            tx = contract.functions.redeemPositions(
+                w3.to_checksum_address(USDC_E_ADDRESS),
+                HASH_ZERO,
+                condition_bytes,
+                [1, 2],
+            ).build_transaction({
+                "chainId": 137,
+                "from": eoa_address,
+                "nonce": nonce,
+            })
+            signed = w3.eth.account.sign_transaction(tx, private_key=PRIVATE_KEY)
+            tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+            receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+            if receipt.status == 1:
+                print(f"[REDEEM] SUCCESS (USDC.e): tx={tx_hash.hex()}")
+                return True
 
             print(f"[REDEEM] FAILED: transaction reverted")
             return False
 
     except Exception as e:
         # If proxy call failed for standard market, try USDC.e through proxy
-        if use_proxy and not is_neg_risk and "reverted" in str(e).lower():
+        if use_proxy and "reverted" in str(e).lower():
             try:
                 print(f"[REDEEM] USDC failed, trying USDC.e via relay...")
                 contract = w3.eth.contract(
