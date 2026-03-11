@@ -1002,21 +1002,35 @@ def redeem_winning_position(condition_id: str, token_id: str = "", dry_run: bool
                 address=w3.to_checksum_address(token_holder),
                 abi=GNOSIS_SAFE_ABI,
             )
-            try:
-                tx_hex = _redeem_via_relay(
-                    w3, account, safe_contract, token_holder,
-                    contract_addr, call_data,
-                )
-                print(f"[REDEEM] SUCCESS (gasless relay): condition={cid[:20]}... tx={tx_hex}")
-                return True
-            except Exception as relay_err:
-                print(f"[REDEEM] Gasless relay failed ({relay_err}), trying direct Safe tx...")
+            # Retry relay with exponential backoff on 429 (rate limit)
+            relay_err = None
+            for attempt in range(4):
                 try:
-                    tx_hex = _exec_via_safe(w3, token_holder, contract_addr, bytes.fromhex(call_data[2:]), account)
-                    print(f"[REDEEM] SUCCESS (direct proxy): condition={cid[:20]}... tx={tx_hex}")
+                    tx_hex = _redeem_via_relay(
+                        w3, account, safe_contract, token_holder,
+                        contract_addr, call_data,
+                    )
+                    print(f"[REDEEM] SUCCESS (gasless relay): condition={cid[:20]}... tx={tx_hex}")
                     return True
-                except Exception as direct_err:
-                    raise RuntimeError(f"Both relay ({relay_err}) and direct ({direct_err}) failed") from direct_err
+                except Exception as e:
+                    relay_err = e
+                    if "429" in str(e) and attempt < 3:
+                        wait = 2 ** (attempt + 1)  # 2, 4, 8 seconds
+                        print(f"[REDEEM] Relay 429, retrying in {wait}s (attempt {attempt+1}/4)...")
+                        import time
+                        time.sleep(wait)
+                    else:
+                        break
+
+            print(f"[REDEEM] Gasless relay failed after retries ({relay_err}), trying direct Safe tx...")
+            try:
+                tx_hex = _exec_via_safe(w3, token_holder, contract_addr, bytes.fromhex(call_data[2:]), account)
+                print(f"[REDEEM] SUCCESS (direct proxy): condition={cid[:20]}... tx={tx_hex}")
+                return True
+            except Exception as direct_err:
+                if "insufficient" in str(direct_err).lower():
+                    print(f"[REDEEM] Direct tx failed: EOA has insufficient MATIC for gas. Fund EOA or wait for relay.")
+                raise RuntimeError(f"Both relay ({relay_err}) and direct ({direct_err}) failed") from direct_err
         else:
             # Direct EOA call
             nonce = w3.eth.get_transaction_count(eoa_address)
