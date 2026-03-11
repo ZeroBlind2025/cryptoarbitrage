@@ -271,8 +271,10 @@ class CLOBWebSocket:
         elif event_type == "tick_size_change":
             pass  # Ignore tick size changes
         else:
-            # Unknown event type - might be initial snapshot
-            if "bids" in data or "asks" in data:
+            # No event_type — detect from message shape
+            if "price_changes" in data:
+                self._handle_price_change(data)
+            elif "bids" in data or "asks" in data:
                 self._handle_book(data)
 
     def _handle_book(self, data: dict):
@@ -311,8 +313,10 @@ class CLOBWebSocket:
         if self.on_book_update:
             self.on_book_update(asset_id, book)
 
-        if self.on_price_change and book.best_bid and book.best_ask:
-            self.on_price_change(asset_id, book.best_bid, book.best_ask)
+        if self.on_price_change and (book.best_bid or book.best_ask):
+            bid = book.best_bid or book.best_ask
+            ask = book.best_ask or book.best_bid
+            self.on_price_change(asset_id, bid, ask)
 
     def _handle_price_change(self, data: dict):
         """Handle price change event.
@@ -356,9 +360,12 @@ class CLOBWebSocket:
                         book.best_ask = float(best_ask)
                     book.last_update_ms = int(time.time() * 1000)
 
-                # Fire callback
-                if self.on_price_change and book.best_bid and book.best_ask:
-                    self.on_price_change(asset_id, book.best_bid, book.best_ask)
+                # Fire callback — use best_bid as fallback if best_ask is
+                # not yet known (some messages only carry one side)
+                if self.on_price_change and (book.best_bid or book.best_ask):
+                    bid = book.best_bid or book.best_ask
+                    ask = book.best_ask or book.best_bid
+                    self.on_price_change(asset_id, bid, ask)
 
     def _handle_last_trade(self, data: dict):
         """Handle last trade price event"""
