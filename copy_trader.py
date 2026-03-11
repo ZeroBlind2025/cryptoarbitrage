@@ -731,7 +731,7 @@ def _get_relay_headers(body_dict: dict) -> dict:
         "body": _json.dumps(body_dict),
     }
     last_err = None
-    for attempt in range(3):
+    for attempt in range(2):
         try:
             resp = requests.post(RELAY_SIGN_URL, json=payload, timeout=15)
             resp.raise_for_status()
@@ -739,7 +739,7 @@ def _get_relay_headers(body_dict: dict) -> dict:
         except requests.exceptions.HTTPError as e:
             last_err = e
             if e.response is not None and e.response.status_code == 429:
-                wait = 2 ** (attempt + 1)
+                wait = 900  # 15 minutes — let the rate limiter fully reset
                 print(f"[REDEEM] Shared signer rate-limited, retrying in {wait}s...")
                 import time as _time
                 _time.sleep(wait)
@@ -904,14 +904,14 @@ def _queue_pending_redemption(condition_id: str, token_id: str, slug: str, attem
     for item in _pending_redemptions:
         if item["condition_id"] == condition_id:
             item["attempts"] = attempts
-            item["next_retry"] = _t.time() + min(60 * attempts, 300)  # 60s, 120s, ... up to 5min
+            item["next_retry"] = _t.time() + min(900 * attempts, 1800)  # 15min, 30min cap
             return
     _pending_redemptions.append({
         "condition_id": condition_id,
         "token_id": token_id,
         "slug": slug,
         "attempts": attempts,
-        "next_retry": _t.time() + 60,
+        "next_retry": _t.time() + 900,  # 15 minutes before first retry
     })
     print(f"[REDEEM] Queued for retry (attempt {attempts}): condition={condition_id[:20]}...")
 
@@ -1077,11 +1077,11 @@ def redeem_winning_position(condition_id: str, token_id: str = "", dry_run: bool
                 address=w3.to_checksum_address(token_holder),
                 abi=GNOSIS_SAFE_ABI,
             )
-            # Retry relay with exponential backoff on 429 (rate limit).
-            # Using shared signer (no builder creds), so rate limits are tight.
-            # Longer delays give the rate limiter time to reset.
+            # Retry relay with long backoff on 429 (rate limit).
+            # The shared relayer key is heavily rate-limited and needs a full
+            # cool-down before retrying — short retries just reset the window.
             relay_err = None
-            max_relay_attempts = 6
+            max_relay_attempts = 2
             for attempt in range(max_relay_attempts):
                 try:
                     tx_hex = _redeem_via_relay(
@@ -1093,7 +1093,7 @@ def redeem_winning_position(condition_id: str, token_id: str = "", dry_run: bool
                 except Exception as e:
                     relay_err = e
                     if "429" in str(e) and attempt < max_relay_attempts - 1:
-                        wait = min(5 * (2 ** attempt), 60)  # 5, 10, 20, 40, 60, 60
+                        wait = 900  # 15 minutes — let the rate limiter fully reset
                         print(f"[REDEEM] Relay 429, retrying in {wait}s (attempt {attempt+1}/{max_relay_attempts})...")
                         import time
                         time.sleep(wait)
@@ -1686,7 +1686,7 @@ class CopyTrader:
         self.positions = load_positions()
 
         self.last_resolution_check = 0
-        self.resolution_check_interval = 60  # Check every 60 seconds
+        self.resolution_check_interval = 900  # Check every 15 minutes (relayer rate-limited)
 
         # WebSocket for real-time prices (replaces stale REST prices)
         self.ws: Optional["CLOBWebSocket"] = None

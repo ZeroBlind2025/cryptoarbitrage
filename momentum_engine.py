@@ -825,7 +825,7 @@ class MomentumEngine:
 
         # Resolution
         self.last_resolution_check = 0
-        self.resolution_check_interval = 60
+        self.resolution_check_interval = 900  # 15 minutes (relayer rate-limited)
 
         # WebSocket for live prices
         self.ws: Optional["CLOBWebSocket"] = None
