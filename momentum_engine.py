@@ -1582,6 +1582,7 @@ class MomentumEngine:
                         condition_id=condition_id,
                         token_id=token_id,
                         dry_run=self.dry_run,
+                        slug=slug,
                     )
                     position["redeemed"] = bool(redeemed)
                     _log_copy_trade("momentum_redeem", {

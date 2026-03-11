@@ -534,15 +534,32 @@ def _get_web3():
     return None
 
 
-def _check_neg_risk(condition_id: str) -> bool:
-    """Check if a market is neg_risk by querying the CLOB API."""
+def _check_neg_risk(condition_id: str, slug: str = "") -> bool:
+    """Check if a market is neg_risk by querying the CLOB API.
+
+    Falls back to slug-based detection for crypto updown markets which
+    are always neg_risk.  This covers cases where the CLOB API doesn't
+    return the neg_risk field (e.g. resolved/closed markets).
+    """
+    # Fast path: crypto updown markets are always neg_risk
+    if slug:
+        s = slug.lower()
+        if any(pattern in s for pattern in ["-updown-", "updown-5m", "updown-15m", "updown-30m", "updown-60m"]):
+            return True
+
     try:
         resp = requests.get(f"{CLOB_API}/markets/{condition_id}", timeout=10)
         if resp.status_code == 200:
-            return resp.json().get("neg_risk", False)
+            data = resp.json()
+            neg = data.get("neg_risk", None)
+            if neg is not None:
+                return bool(neg)
     except Exception:
         pass
-    return False
+
+    # Conservative fallback: treat as neg_risk if condition_id lookup failed
+    # Most Polymarket binary markets are neg_risk
+    return True
 
 
 # Polymarket gasless relay — pays gas so the EOA doesn't need MATIC
@@ -817,7 +834,7 @@ def _exec_via_safe(w3, safe_address: str, to: str, call_data: bytes, account) ->
     return tx_hash.hex()
 
 
-def redeem_winning_position(condition_id: str, token_id: str = "", dry_run: bool = False):
+def redeem_winning_position(condition_id: str, token_id: str = "", dry_run: bool = False, slug: str = ""):
     """Redeem winning conditional tokens on-chain for USDC.
 
     After a market resolves, winning shares must be redeemed via the
@@ -900,7 +917,7 @@ def redeem_winning_position(condition_id: str, token_id: str = "", dry_run: bool
             print(f"[REDEEM] Could not check balance (proceeding anyway): {e}")
 
     # Determine if neg_risk market
-    is_neg_risk = _check_neg_risk(condition_id)
+    is_neg_risk = _check_neg_risk(condition_id, slug=slug)
 
     if dry_run:
         print(f"[REDEEM] DRY RUN: would redeem condition={cid[:20]}... neg_risk={is_neg_risk} proxy={use_proxy}")
@@ -1108,10 +1125,12 @@ def sweep_unredeemed(dry_run: bool = False) -> dict:
 
         print(f"[SWEEP] Redeeming: {title} | size={size:.2f} | cid={condition_id[:20]}...", flush=True)
 
+        slug = pos.get("slug", "") or pos.get("market_slug", "") or ""
         result = redeem_winning_position(
             condition_id=condition_id,
             token_id=token_id,
             dry_run=dry_run,
+            slug=slug,
         )
 
         if result is True:
@@ -2337,6 +2356,7 @@ class CopyTrader:
                             condition_id=condition_id,
                             token_id=token_id,
                             dry_run=self.dry_run,
+                            slug=slug,
                         )
                         position["redeemed"] = bool(redeemed)
                         _log_copy_trade("redeem", {
