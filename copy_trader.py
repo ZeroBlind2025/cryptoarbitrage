@@ -947,8 +947,44 @@ def redeem_winning_position(condition_id: str, token_id: str = "", dry_run: bool
                 print(f"[REDEEM] NegRisk: no token balance found, skipping")
                 return None
 
-            print(f"[REDEEM] NegRisk redemption: condition={cid[:20]}... amount={amount}")
-            call_data = contract.encode_abi("redeemPositions", [condition_bytes, [amount]])
+            # NegRiskAdapter.redeemPositions expects amounts[] with one entry
+            # per outcome (2 for binary).  We must figure out which outcome
+            # index (0 or 1) our token_id sits at so we pass
+            # [amount, 0] or [0, amount].
+            outcome_index = 0  # default: assume first outcome
+            if token_id:
+                try:
+                    clob_resp = requests.get(
+                        f"{CLOB_API}/markets/{condition_id}", timeout=5,
+                    )
+                    if clob_resp.status_code == 200:
+                        clob_data = clob_resp.json()
+                        clob_tokens = clob_data.get("tokens", [])
+                        for idx, tok in enumerate(clob_tokens):
+                            tid = tok.get("token_id", "")
+                            if str(tid) == str(token_id):
+                                outcome_index = idx
+                                break
+                except Exception:
+                    pass
+                # Fallback: check on-chain balances for both outcomes
+                if outcome_index == 0 and token_id:
+                    try:
+                        ctf_c = w3.eth.contract(
+                            address=w3.to_checksum_address(CTF_CONTRACT_ADDRESS),
+                            abi=ERC1155_BALANCE_ABI,
+                        )
+                        tid_int = int(token_id, 16) if token_id.startswith("0x") else int(token_id)
+                        bal = ctf_c.functions.balanceOf(balance_wallet, tid_int).call()
+                        if bal == 0:
+                            outcome_index = 1  # our token might be the other one
+                    except Exception:
+                        pass
+
+            amounts = [0, 0]
+            amounts[outcome_index] = amount
+            print(f"[REDEEM] NegRisk redemption: condition={cid[:20]}... amounts={amounts} outcome_idx={outcome_index}")
+            call_data = contract.encode_abi("redeemPositions", [condition_bytes, amounts])
         else:
             # Standard binary: CTF.redeemPositions(collateral, parent, conditionId, indexSets)
             contract_addr = CTF_CONTRACT_ADDRESS
@@ -989,7 +1025,7 @@ def redeem_winning_position(condition_id: str, token_id: str = "", dry_run: bool
             # Direct EOA call
             nonce = w3.eth.get_transaction_count(eoa_address)
             tx = contract.functions.redeemPositions(
-                *([condition_bytes, [token_balance]] if is_neg_risk else [
+                *([condition_bytes, amounts] if is_neg_risk else [
                     w3.to_checksum_address(USDC_ADDRESS),
                     HASH_ZERO,
                     condition_bytes,
