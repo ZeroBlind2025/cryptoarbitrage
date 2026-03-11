@@ -606,6 +606,48 @@ def _check_neg_risk(condition_id: str, slug: str = "") -> bool:
 
 # Polymarket gasless relay — pays gas so the EOA doesn't need MATIC
 RELAY_URL = "https://relayer-v2.polymarket.com"
+
+# Rate limiter for relayer /submit — 25 req/min limit, we target 24 req/min (2.5s gap)
+_relay_submit_times: list = []  # timestamps of recent /submit calls
+_RELAY_MAX_PER_MINUTE = 24  # stay just under the 25/min limit
+_RELAY_WINDOW = 60.0  # sliding window in seconds
+_RELAY_MIN_GAP = 2.5  # minimum seconds between /submit calls
+
+
+def _relay_rate_limit_wait():
+    """Block until we can safely send another /submit request.
+
+    Enforces both a per-minute cap (24/min) and a minimum gap (2.5s)
+    to stay safely under the Polymarket relayer's 25 req/min limit.
+    """
+    import time as _t
+    now = _t.time()
+
+    # Purge timestamps outside the sliding window
+    while _relay_submit_times and _relay_submit_times[0] < now - _RELAY_WINDOW:
+        _relay_submit_times.pop(0)
+
+    # Enforce minimum gap between calls
+    if _relay_submit_times:
+        gap = _RELAY_MIN_GAP - (now - _relay_submit_times[-1])
+        if gap > 0:
+            print(f"[RELAY] Rate limit: waiting {gap:.1f}s (min gap)")
+            _t.sleep(gap)
+            now = _t.time()
+
+    # Enforce per-minute cap
+    while len(_relay_submit_times) >= _RELAY_MAX_PER_MINUTE:
+        oldest = _relay_submit_times[0]
+        wait = (oldest + _RELAY_WINDOW) - now + 0.1  # +0.1s buffer
+        if wait > 0:
+            print(f"[RELAY] Rate limit: waiting {wait:.1f}s ({len(_relay_submit_times)}/{_RELAY_MAX_PER_MINUTE} in window)")
+            _t.sleep(wait)
+            now = _t.time()
+        # Re-purge after sleeping
+        while _relay_submit_times and _relay_submit_times[0] < now - _RELAY_WINDOW:
+            _relay_submit_times.pop(0)
+
+    _relay_submit_times.append(now)
 RELAY_SIGN_URL = "https://builder-signing-server.vercel.app/sign"
 ADDRESS_ZERO = "0x" + "00" * 20
 
@@ -795,6 +837,9 @@ def _redeem_via_relay(w3, account, safe_contract, proxy_address: str,
     }
 
     headers = _get_relay_headers(body)
+
+    # Enforce rate limit before hitting /submit (25 req/min limit)
+    _relay_rate_limit_wait()
 
     resp = requests.post(
         f"{RELAY_URL}/submit",
@@ -1514,6 +1559,27 @@ def get_clob_client() -> Optional["ClobClient"]:
 
 
 _balance_error_until = 0.0  # Timestamp until which we skip orders due to balance/allowance errors
+_balance_error_count = 0  # Consecutive balance errors — escalates pause duration
+
+
+def check_usdc_balance() -> Optional[float]:
+    """Check on-chain USDC balance of the trading wallet. Returns balance in $ or None on error."""
+    if not HAS_WEB3 or not PRIVATE_KEY:
+        return None
+    try:
+        w3 = _get_web3()
+        if not w3 or not w3.is_connected():
+            return None
+        # Check the proxy wallet (funder) if using proxy, else EOA
+        use_proxy = SIGNATURE_TYPE >= 1 and FUNDER_ADDRESS
+        wallet = w3.to_checksum_address(FUNDER_ADDRESS) if use_proxy else w3.eth.account.from_key(PRIVATE_KEY).address
+        # ERC20 balanceOf
+        erc20_abi = json.loads('[{"inputs":[{"name":"account","type":"address"}],"name":"balanceOf","outputs":[{"name":"","type":"uint256"}],"stateMutability":"view","type":"function"}]')
+        usdc = w3.eth.contract(address=w3.to_checksum_address(USDC_E_ADDRESS), abi=erc20_abi)
+        bal = usdc.functions.balanceOf(wallet).call()
+        return bal / 1e6  # USDC has 6 decimals
+    except Exception:
+        return None
 
 def place_bet(client: "ClobClient", token_id: str, amount: float, max_price: float = 0) -> dict:
     """Place a FOK market buy order. Returns fill details or empty dict on failure.
@@ -1522,11 +1588,19 @@ def place_bet(client: "ClobClient", token_id: str, amount: float, max_price: flo
     maker_amount (USDC) rounded to 2 decimals, taker_amount (shares) to 4.
     The price parameter caps the worst fill price.
     """
-    global _balance_error_until
+    global _balance_error_until, _balance_error_count
     if time.time() < _balance_error_until:
-        remaining = int(_balance_error_until - time.time())
-        print(f"[ALGO] Skipping order — insufficient balance/allowance (retry in {remaining}s)")
-        return {}
+        # Proactively check if balance has recovered (e.g. from a redemption)
+        bal = check_usdc_balance()
+        if bal is not None and bal >= amount:
+            print(f"[ALGO] Balance recovered (${bal:.2f}) — resuming trading!")
+            _balance_error_until = 0.0
+            _balance_error_count = 0
+        else:
+            remaining = int(_balance_error_until - time.time())
+            bal_str = f" (on-chain: ${bal:.2f})" if bal is not None else ""
+            print(f"[ALGO] Skipping order — insufficient balance{bal_str} (retry in {remaining}s)")
+            return {}
     try:
         # Use the price cap if provided, otherwise let the library calculate
         price = min(round(max_price, 2), 0.99) if max_price and max_price > 0 else 0
@@ -1564,9 +1638,12 @@ def place_bet(client: "ClobClient", token_id: str, amount: float, max_price: flo
     except Exception as e:
         error_str = str(e).lower()
         if "balance" in error_str or "allowance" in error_str:
-            _balance_error_until = time.time() + 300  # Pause orders for 5 minutes
+            _balance_error_count += 1
+            # Escalating pause: 2min, 4min, 8min, cap at 10min — balance check can resume early
+            pause = min(120 * (2 ** (_balance_error_count - 1)), 600)
+            _balance_error_until = time.time() + pause
             print(f"[ALGO] Order error (BALANCE/ALLOWANCE): {e}")
-            print(f"[ALGO] *** Pausing all orders for 5 minutes — deposit USDC or run setup_allowances.py ***")
+            print(f"[ALGO] *** Pausing orders for {pause//60}m{pause%60}s (attempt #{_balance_error_count}) — will auto-resume if balance recovers ***")
         else:
             print(f"[ALGO] Order error: {e}")
             import traceback; traceback.print_exc()
@@ -2343,6 +2420,9 @@ class CopyTrader:
 
                 # Periodically check for resolved positions
                 self.check_resolutions()
+
+                # Retry any queued redemptions (rate-limited / failed earlier)
+                retry_pending_redemptions(dry_run=self.dry_run)
 
                 time.sleep(POLL_INTERVAL)
 
