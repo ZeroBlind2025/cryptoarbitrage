@@ -587,75 +587,92 @@ def _sign_safe_tx(account, safe_contract, to: str, call_data: str, nonce: int, w
 
 
 def _get_relay_headers(body_dict: dict) -> dict:
-    """Get signed headers for the Polymarket relay.
+    """Get signed headers for the Polymarket gasless relay.
+
+    The relay requires BOTH:
+    - L2 auth headers (POLY_ADDRESS, POLY_SIGNATURE, etc.)
+    - Builder headers (POLY_BUILDER_API_KEY, POLY_BUILDER_SIGNATURE, etc.)
 
     Priority:
-    1. Builder credentials (env vars) — highest rate limits
-    2. Derive CLOB API creds from private key — same as trading, no extra config
-    3. Shared signing server — last resort, rate-limited
+    1. Builder creds (env vars) + derived L2 creds — own quota, no rate limits
+    2. Shared signing server — generates both header sets, but rate-limited
     """
     import json as _json
 
-    # --- Method 1: Explicit builder credentials ---
+    # --- Method 1: Builder credentials + L2 creds ---
     if BUILDER_ENABLED and BUILDER_API_KEY and BUILDER_API_SECRET and BUILDER_API_PASSPHRASE:
         try:
-            from py_clob_client.signer import Signer
-            from py_clob_client.headers.headers import create_level_2_headers
-            from py_clob_client.clob_types import RequestArgs, ApiCreds
-
-            signer = Signer(private_key=PRIVATE_KEY, chain_id=137)
-            creds = ApiCreds(
-                api_key=BUILDER_API_KEY,
-                api_secret=BUILDER_API_SECRET,
-                api_passphrase=BUILDER_API_PASSPHRASE,
-            )
-            headers = create_level_2_headers(
-                signer=signer,
-                creds=creds,
-                request_args=RequestArgs(
-                    method="POST",
-                    request_path="/submit",
-                    body=body_dict,
-                ),
-            )
-            return headers
-        except Exception as e:
-            print(f"[REDEEM] Builder creds failed ({e}), trying derived creds...")
-
-    # --- Method 2: Derive API creds from private key (same as trading) ---
-    if HAS_CLOB_CLIENT and PRIVATE_KEY:
-        try:
-            from py_clob_client.client import ClobClient
+            from py_builder_signing_sdk.config import BuilderConfig, BuilderApiKeyCreds
             from py_clob_client.signer import Signer
             from py_clob_client.headers.headers import create_level_2_headers
             from py_clob_client.clob_types import RequestArgs
 
-            # Create a minimal client just to derive creds
-            if FUNDER_ADDRESS:
-                client = ClobClient(
-                    CLOB_API, key=PRIVATE_KEY, chain_id=137,
-                    signature_type=SIGNATURE_TYPE, funder=FUNDER_ADDRESS,
-                )
-            else:
-                client = ClobClient(CLOB_API, key=PRIVATE_KEY, chain_id=137)
+            # Generate builder-specific headers (POLY_BUILDER_*)
+            builder_config = BuilderConfig(
+                local_builder_creds=BuilderApiKeyCreds(
+                    key=BUILDER_API_KEY,
+                    secret=BUILDER_API_SECRET,
+                    passphrase=BUILDER_API_PASSPHRASE,
+                ),
+            )
+            body_str = _json.dumps(body_dict)
+            builder_payload = builder_config.generate_builder_headers(
+                "POST", "/submit", body_str,
+            )
+            builder_headers = builder_payload.to_dict() if builder_payload else {}
 
-            creds = client.derive_api_key()
-            if creds and creds.api_key:
-                signer = Signer(private_key=PRIVATE_KEY, chain_id=137)
-                headers = create_level_2_headers(
-                    signer=signer,
-                    creds=creds,
-                    request_args=RequestArgs(
-                        method="POST",
-                        request_path="/submit",
-                        body=body_dict,
-                    ),
-                )
-                print(f"[REDEEM] Using derived CLOB API creds (key={creds.api_key[:8]}...)")
-                return headers
+            # Generate L2 headers from derived CLOB creds
+            l2_headers = {}
+            if HAS_CLOB_CLIENT and PRIVATE_KEY:
+                from py_clob_client.client import ClobClient
+                if FUNDER_ADDRESS:
+                    client = ClobClient(
+                        CLOB_API, key=PRIVATE_KEY, chain_id=137,
+                        signature_type=SIGNATURE_TYPE, funder=FUNDER_ADDRESS,
+                    )
+                else:
+                    client = ClobClient(CLOB_API, key=PRIVATE_KEY, chain_id=137)
+                creds = client.derive_api_key()
+                if creds and creds.api_key:
+                    signer = Signer(private_key=PRIVATE_KEY, chain_id=137)
+                    l2_headers = create_level_2_headers(
+                        signer=signer,
+                        creds=creds,
+                        request_args=RequestArgs(
+                            method="POST",
+                            request_path="/submit",
+                            body=body_dict,
+                        ),
+                    )
+
+            headers = {**l2_headers, **builder_headers}
+            print(f"[REDEEM] Using builder creds (key={BUILDER_API_KEY[:12]}...)")
+            return headers
         except Exception as e:
-            print(f"[REDEEM] Derived creds failed ({e}), falling back to shared signer...")
+            print(f"[REDEEM] Builder creds failed ({e}), falling back to shared signer...")
 
+    # --- Method 2: Shared signing server (with retry for 429) ---
+    payload = {
+        "method": "POST",
+        "path": "/submit",
+        "body": _json.dumps(body_dict),
+    }
+    last_err = None
+    for attempt in range(3):
+        try:
+            resp = requests.post(RELAY_SIGN_URL, json=payload, timeout=15)
+            resp.raise_for_status()
+            return resp.json()
+        except requests.exceptions.HTTPError as e:
+            last_err = e
+            if e.response is not None and e.response.status_code == 429:
+                wait = 2 ** (attempt + 1)
+                print(f"[REDEEM] Shared signer rate-limited, retrying in {wait}s...")
+                import time as _time
+                _time.sleep(wait)
+                continue
+            raise
+    raise last_err
     # --- Method 3: Shared signing server (rate-limited) ---
     payload = {
         "method": "POST",
