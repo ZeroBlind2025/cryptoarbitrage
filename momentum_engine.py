@@ -321,10 +321,15 @@ def _is_crypto_updown_event(title: str, slug: str) -> bool:
 def discover_active_markets() -> list[dict]:
     """Find all active crypto updown markets across all intervals (5m, 15m, 1hr).
 
-    Uses three strategies in order:
-      1. /events endpoint — primary discovery via events with nested markets
-      2. Timestamp-based slug search — for specific interval windows
-      3. Broad /markets fallback — catch anything missed
+    Uses three strategies IN PARALLEL:
+      0. Event slug lookup with computed timestamps (parallel batch)
+      1. /events endpoint — broad listing with nested markets
+      2. Timestamp-based slug search on /markets (parallel batch)
+      3. slug_contains partial match searches (parallel batch)
+      4. Broad /markets + /events fallback
+
+    All HTTP calls are parallelized via ThreadPoolExecutor for speed.
+    Previous sequential implementation took ~10s; parallel takes ~1-2s.
 
     Returns a list of market dicts with:
       - slug, question, condition_id
@@ -334,278 +339,244 @@ def discover_active_markets() -> list[dict]:
       - coin: "btc", "eth", "sol", "xrp"
       - interval: "5m", "15m", "60m"
     """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     markets = []
     seen_conditions = set()
+    _lock = threading.Lock()
 
     def _add_market(raw: dict):
-        """Parse and add a market if valid and not seen."""
+        """Parse and add a market if valid and not seen (thread-safe)."""
         cid = raw.get("conditionId") or raw.get("condition_id") or ""
-        if cid in seen_conditions:
-            return False
+        with _lock:
+            if cid in seen_conditions:
+                return False
         m = _parse_market(raw)
         if m:
-            markets.append(m)
-            seen_conditions.add(cid)
+            with _lock:
+                if m["condition_id"] in seen_conditions:
+                    return False
+                markets.append(m)
+                seen_conditions.add(m["condition_id"])
             return True
         return False
 
-    # ================================================================
-    # Strategy 0: Event slug lookup with computed timestamps
-    #
-    # 5m/15m use unix-timestamp slugs:
-    #   /event/{coin}-updown-{5m|15m}-{unix_ts}
-    #   e.g. btc-updown-5m-1772397000
-    #
-    # Hourly uses human-readable ET date/time:
-    #   /event/{coin}-up-or-down-{month}-{day}-{hour}{am/pm}-et
-    #   e.g. bitcoin-up-or-down-march-3-9pm-et
-    # ================================================================
     now_ts = int(time.time())
 
-    # --- 5m / 15m: unix-timestamp based ---
-    # Polymarket slug timestamps follow floor-aligned unix seconds:
-    #   5m:  Math.floor(now / 300000) * 300  (i.e. floor to 300s boundary)
-    #   15m: Math.floor(now / 900000) * 900  (i.e. floor to 900s boundary)
-    ts_slug_configs = [
-        ("5m", 300), ("15m", 900),
-    ]
+    # ================================================================
+    # Build all slug-based requests upfront, then fire in parallel
+    # ================================================================
+
+    # Helper: fetch a single URL and return raw JSON
+    def _fetch_json(url, params, timeout=10):
+        try:
+            resp = requests.get(url, params=params, timeout=timeout)
+            if resp.status_code == 200:
+                return resp.json()
+        except Exception:
+            pass
+        return None
+
+    # --- Strategy 0: Event slug lookups (parallel) ---
+    # 4 coins × 2 intervals × 4 windows × ~2 variants = up to 64 URLs
+    ts_slug_configs = [("5m", 300), ("15m", 900)]
     event_slug_coins = ["btc", "eth", "sol", "xrp"]
+
+    strategy0_slugs = []  # list of event_slug strings
+    for coin_abbr in event_slug_coins:
+        coin_full = COIN_SLUG_NAMES.get(coin_abbr, coin_abbr)
+        for tag, window_secs in ts_slug_configs:
+            base_ts = (now_ts // window_secs) * window_secs
+            for ts in [base_ts + window_secs, base_ts, base_ts - window_secs, base_ts - 2 * window_secs]:
+                strategy0_slugs.append(f"{coin_abbr}-updown-{tag}-{ts}")
+                if coin_full != coin_abbr:
+                    strategy0_slugs.append(f"{coin_full}-updown-{tag}-{ts}")
+
+    # --- Strategy 2: Timestamp-based /markets slug lookups (parallel) ---
+    strategy2_slugs = []
+    for coin_abbr in CRYPTO_COINS:
+        coin_name = COIN_SLUG_NAMES.get(coin_abbr, coin_abbr)
+        for tag, window_secs in ts_slug_configs:
+            base_ts = (now_ts // window_secs) * window_secs
+            for ts in [base_ts + window_secs, base_ts, base_ts - window_secs, base_ts - 2 * window_secs]:
+                strategy2_slugs.append(f"{coin_name}-updown-{tag}-{ts}")
+                if coin_abbr != coin_name:
+                    strategy2_slugs.append(f"{coin_abbr}-updown-{tag}-{ts}")
+
+    # --- Strategy 2b: slug_contains partial matches (parallel) ---
+    slug_search_terms = [
+        "updown-5m", "updown-15m",
+        "btc-updown", "eth-updown", "sol-updown", "xrp-updown",
+        "bitcoin-updown", "ethereum-updown", "solana-updown",
+    ]
+
+    # ================================================================
+    # Fire ALL strategies in parallel via ThreadPoolExecutor
+    # ================================================================
     event_slug_found = 0
     _slug_hits = 0
     _slug_misses = 0
     _slug_errors = 0
     _slug_miss_examples = []
 
-    for coin_abbr in event_slug_coins:
-        coin_full = COIN_SLUG_NAMES.get(coin_abbr, coin_abbr)
-        for tag, window_secs in ts_slug_configs:
-            base_ts = (now_ts // window_secs) * window_secs
-            # Check next, current, and TWO previous windows.
-            # "Half Missing" fix: Polymarket keeps the previous interval open
-            # for a few minutes while the new one starts. Check 2 back to catch
-            # markets that are still settling.
-            for ts in [base_ts + window_secs, base_ts, base_ts - window_secs, base_ts - 2 * window_secs]:
-                slug_variants = [f"{coin_abbr}-updown-{tag}-{ts}"]
-                if coin_full != coin_abbr:
-                    slug_variants.append(f"{coin_full}-updown-{tag}-{ts}")
+    def _do_strategy0(event_slug):
+        """Fetch one event slug from /events."""
+        return ("s0", event_slug, _fetch_json(
+            f"{GAMMA_API}/events", {"slug": event_slug}, timeout=10))
 
-                for event_slug in slug_variants:
-                    try:
-                        resp = requests.get(
-                            f"{GAMMA_API}/events",
-                            params={"slug": event_slug},
-                            timeout=10,
-                        )
-                        if resp.status_code == 200:
-                            data = resp.json()
-                            events_list = data if isinstance(data, list) else [data] if isinstance(data, dict) else []
-                            slug_found_any = False
-                            for event in events_list:
-                                if not isinstance(event, dict):
-                                    continue
-                                for mkt in event.get("markets", []):
-                                    if _add_market(mkt):
-                                        event_slug_found += 1
-                                        slug_found_any = True
-                                if "conditionId" in event:
-                                    if _add_market(event):
-                                        event_slug_found += 1
-                                        slug_found_any = True
-                            if slug_found_any or events_list:
-                                _slug_hits += 1
-                            else:
-                                _slug_misses += 1
-                                if len(_slug_miss_examples) < 4:
-                                    _slug_miss_examples.append(event_slug)
-                        else:
-                            _slug_errors += 1
-                            if _slug_errors <= 2:
-                                print(f"[MOMENTUM] Slug API {resp.status_code} for {event_slug}",
-                                      flush=True)
-                    except Exception as e:
-                        _slug_errors += 1
-                        if _slug_errors <= 2:
-                            print(f"[MOMENTUM] Slug API error for {event_slug}: {e}",
-                                  flush=True)
-                    time.sleep(0.02)
+    def _do_strategy1_events():
+        """Broad /events listing."""
+        return ("s1_events", None, _fetch_json(
+            f"{GAMMA_API}/events",
+            {"active": "true", "closed": "false", "limit": 100},
+            timeout=15))
+
+    def _do_strategy2(slug_pattern):
+        """Fetch one slug from /markets."""
+        return ("s2", slug_pattern, _fetch_json(
+            f"{GAMMA_API}/markets", {"slug": slug_pattern}, timeout=10))
+
+    def _do_strategy2b(search_term):
+        """slug_contains partial match on /markets."""
+        return ("s2b", search_term, _fetch_json(
+            f"{GAMMA_API}/markets",
+            {"slug_contains": search_term, "active": "true",
+             "closed": "false", "limit": 100},
+            timeout=10))
+
+    def _do_strategy3_markets():
+        """Broad /markets search."""
+        return ("s3_markets", None, _fetch_json(
+            f"{GAMMA_API}/markets",
+            {"active": "true", "closed": "false", "limit": 200},
+            timeout=15))
+
+    def _do_strategy3_events():
+        """Broad /events search."""
+        return ("s3_events", None, _fetch_json(
+            f"{GAMMA_API}/events",
+            {"active": "true", "closed": "false", "limit": 200},
+            timeout=15))
+
+    # Submit all work to the thread pool
+    with ThreadPoolExecutor(max_workers=20) as pool:
+        futures = []
+
+        # Strategy 0: event slug lookups
+        for slug in strategy0_slugs:
+            futures.append(pool.submit(_do_strategy0, slug))
+
+        # Strategy 1: broad events listing
+        futures.append(pool.submit(_do_strategy1_events))
+
+        # Strategy 2: /markets slug lookups
+        for slug in strategy2_slugs:
+            futures.append(pool.submit(_do_strategy2, slug))
+
+        # Strategy 2b: slug_contains searches
+        for term in slug_search_terms:
+            futures.append(pool.submit(_do_strategy2b, term))
+
+        # Strategy 3: broad /markets + /events
+        futures.append(pool.submit(_do_strategy3_markets))
+        futures.append(pool.submit(_do_strategy3_events))
+
+        # Process results as they complete
+        _ASSET_NAMES_LOWER = ["bitcoin", "ethereum", "solana", "xrp"]
+        slug_contains_found = 0
+        broad_found = 0
+
+        for fut in as_completed(futures):
+            strategy, label, data = fut.result()
+
+            if data is None:
+                if strategy == "s0":
+                    _slug_errors += 1
+                continue
+
+            if strategy == "s0":
+                # Event slug lookup result
+                events_list = data if isinstance(data, list) else [data] if isinstance(data, dict) else []
+                slug_found_any = False
+                for event in events_list:
+                    if not isinstance(event, dict):
+                        continue
+                    for mkt in event.get("markets", []):
+                        if _add_market(mkt):
+                            event_slug_found += 1
+                            slug_found_any = True
+                    if "conditionId" in event:
+                        if _add_market(event):
+                            event_slug_found += 1
+                            slug_found_any = True
+                if slug_found_any or events_list:
+                    _slug_hits += 1
+                else:
+                    _slug_misses += 1
+                    if len(_slug_miss_examples) < 4:
+                        _slug_miss_examples.append(label)
+
+            elif strategy == "s1_events":
+                # Broad events listing
+                events = data if isinstance(data, list) else []
+                events_checked = 0
+                for event in events:
+                    event_title = event.get("title", "")
+                    event_slug = event.get("slug", "")
+                    if not _is_crypto_updown_event(event_title, event_slug):
+                        continue
+                    events_checked += 1
+                    for mkt in event.get("markets", []):
+                        _add_market(mkt)
+                if events_checked > 0:
+                    print(f"[MOMENTUM] Events: checked {events_checked} crypto events "
+                          f"from {len(events)} total", flush=True)
+
+            elif strategy == "s2":
+                # /markets slug lookup
+                if isinstance(data, list):
+                    for raw in data:
+                        _add_market(raw)
+
+            elif strategy == "s2b":
+                # slug_contains partial match
+                if isinstance(data, list):
+                    for raw in data:
+                        if _add_market(raw):
+                            slug_contains_found += 1
+
+            elif strategy == "s3_markets":
+                # Broad /markets search
+                if isinstance(data, list):
+                    for raw in data:
+                        question = raw.get("question") or ""
+                        slug = (raw.get("slug") or "").lower()
+                        q_lower = question.lower()
+                        is_updown = ("up or down" in q_lower or "updown" in slug
+                                     or "up-or-down" in slug)
+                        is_crypto = any(a in q_lower or a in slug
+                                       for a in _ASSET_NAMES_LOWER)
+                        if is_updown and is_crypto:
+                            if _add_market(raw):
+                                broad_found += 1
+
+            elif strategy == "s3_events":
+                # Broad /events search
+                events = data if isinstance(data, list) else []
+                for event in events:
+                    event_title = event.get("title", "")
+                    event_slug = event.get("slug", "")
+                    if not _is_crypto_updown_event(event_title, event_slug):
+                        continue
+                    for mkt in event.get("markets", []):
+                        if _add_market(mkt):
+                            broad_found += 1
 
     print(f"[MOMENTUM] Event slugs: found={event_slug_found} "
           f"hits={_slug_hits} misses={_slug_misses} errors={_slug_errors}",
           flush=True)
     if _slug_miss_examples:
         print(f"[MOMENTUM] Slug miss examples: {_slug_miss_examples}", flush=True)
-
-    # ================================================================
-    # Strategy 1: /events endpoint (broad listing)
-    # Events contain nested markets — catches any we missed above.
-    # ================================================================
-    try:
-        resp = requests.get(
-            f"{GAMMA_API}/events",
-            params={
-                "active": "true",
-                "closed": "false",
-                "limit": 100,
-            },
-            timeout=15,
-        )
-        if resp.status_code == 200:
-            events = resp.json()
-            events_checked = 0
-            for event in events:
-                event_title = event.get("title", "")
-                event_slug = event.get("slug", "")
-
-                # Quick filter: is this a crypto updown event?
-                if not _is_crypto_updown_event(event_title, event_slug):
-                    continue
-
-                events_checked += 1
-                event_markets = event.get("markets", [])
-                for mkt in event_markets:
-                    _add_market(mkt)
-
-            if events_checked > 0:
-                print(f"[MOMENTUM] Events: checked {events_checked} crypto events "
-                      f"from {len(events)} total", flush=True)
-        else:
-            print(f"[MOMENTUM] Events endpoint returned {resp.status_code}", flush=True)
-
-    except Exception as e:
-        print(f"[MOMENTUM] Events search error: {e}", flush=True)
-
-    # ================================================================
-    # Strategy 2: Timestamp-based slug search (5m/15m only)
-    # Polymarket uses unix-ts slugs for short intervals:
-    #   "bitcoin-updown-15m-1740844800"
-    #   "ethereum-updown-5m-1740844500"
-    # Hourly uses human-readable format (handled in Strategy 0).
-    # ================================================================
-
-    # Interval configs: (slug_tag, seconds_per_window)
-    interval_configs = [
-        ("5m", 300),
-        ("15m", 900),
-    ]
-
-    for coin_abbr in CRYPTO_COINS:
-        coin_name = COIN_SLUG_NAMES.get(coin_abbr, coin_abbr)
-        for tag, window_secs in interval_configs:
-            # Next + current + 2 previous windows (settling markets stay open)
-            base_ts = (now_ts // window_secs) * window_secs
-            timestamps = [base_ts + window_secs, base_ts, base_ts - window_secs, base_ts - 2 * window_secs]
-
-            for ts in timestamps:
-                # Try BOTH abbreviated and full coin names
-                # Polymarket uses both: "eth-updown-15m-{ts}" AND
-                # "ethereum-updown-15m-{ts}" depending on market type
-                slug_variants = [f"{coin_name}-updown-{tag}-{ts}"]
-                if coin_abbr != coin_name:
-                    slug_variants.append(f"{coin_abbr}-updown-{tag}-{ts}")
-
-                for slug_pattern in slug_variants:
-                    try:
-                        # Don't filter active/closed for exact slug lookups —
-                        # settling markets may have active=false but still be tradeable
-                        resp = requests.get(
-                            f"{GAMMA_API}/markets",
-                            params={"slug": slug_pattern},
-                            timeout=10,
-                        )
-                        if resp.status_code == 200:
-                            data = resp.json()
-                            if isinstance(data, list):
-                                for raw in data:
-                                    _add_market(raw)
-                    except Exception:
-                        pass
-
-            time.sleep(0.02)
-
-    # Also search with slug_contains for partial matches
-    # Prioritise short-interval terms first (5m/15m most likely to be missed)
-    slug_search_terms = [
-        "updown-5m", "updown-15m",
-        "btc-updown", "eth-updown", "sol-updown", "xrp-updown",
-        "bitcoin-updown", "ethereum-updown", "solana-updown",
-    ]
-    slug_contains_found = 0
-    for search_term in slug_search_terms:
-        try:
-            resp = requests.get(
-                f"{GAMMA_API}/markets",
-                params={
-                    "slug_contains": search_term,
-                    "active": "true",
-                    "closed": "false",
-                    "limit": 100,
-                },
-                timeout=10,
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                if isinstance(data, list):
-                    for raw in data:
-                        if _add_market(raw):
-                            slug_contains_found += 1
-        except Exception:
-            pass
-        time.sleep(0.02)
-
-    # ================================================================
-    # Strategy 3: Broad /markets search with question-text filtering
-    # This is the most reliable discovery method — fetch active markets
-    # and filter locally for crypto "Up or Down" markets by question text.
-    # Uses the same approach proven by Polymarket's own discovery scripts.
-    # ================================================================
-    _ASSET_NAMES = ["Bitcoin", "Ethereum", "Solana", "XRP",
-                    "bitcoin", "ethereum", "solana", "xrp"]
-    broad_found = 0
-    try:
-        response = requests.get(
-            f"{GAMMA_API}/markets",
-            params={"active": "true", "closed": "false", "limit": 200},
-            timeout=15,
-        )
-        response.raise_for_status()
-        all_markets = response.json()
-
-        for raw in all_markets:
-            question = raw.get("question") or ""
-            slug = (raw.get("slug") or "").lower()
-            # Filter: must be a crypto updown market
-            q_lower = question.lower()
-            is_updown = ("up or down" in q_lower or "updown" in slug
-                         or "up-or-down" in slug)
-            is_crypto = any(a.lower() in q_lower or a.lower() in slug
-                          for a in _ASSET_NAMES[:4])
-            if is_updown and is_crypto:
-                if _add_market(raw):
-                    broad_found += 1
-
-    except Exception as e:
-        print(f"[MOMENTUM] Broad search error: {e}", flush=True)
-
-    # Also try fetching from /events with active+closed filter
-    # Events endpoint groups markets by event, may surface different results
-    try:
-        resp = requests.get(
-            f"{GAMMA_API}/events",
-            params={"active": "true", "closed": "false", "limit": 200},
-            timeout=15,
-        )
-        if resp.status_code == 200:
-            events = resp.json()
-            for event in events:
-                event_title = event.get("title", "")
-                event_slug = event.get("slug", "")
-                if not _is_crypto_updown_event(event_title, event_slug):
-                    continue
-                for mkt in event.get("markets", []):
-                    if _add_market(mkt):
-                        broad_found += 1
-    except Exception as e:
-        print(f"[MOMENTUM] Events broad search error: {e}", flush=True)
 
     if broad_found > 0:
         print(f"[MOMENTUM] Broad search: found {broad_found} new markets", flush=True)
@@ -669,21 +640,28 @@ def discover_active_markets() -> list[dict]:
         print(f"[MOMENTUM] Filtered to {len(active_markets)} active markets "
               f"(from {len(markets)} total)", flush=True)
 
-    # --- Enrich with canonical CLOB token IDs ---
+    # --- Enrich with canonical CLOB token IDs (parallel) ---
     # The Gamma API clobTokenIds may differ from the actual CLOB WS token IDs.
     # Query CLOB API to get the exact IDs the WebSocket uses.
     enriched = 0
-    for m in active_markets:
-        cid = m.get("condition_id", "")
-        clob_ids = _fetch_clob_token_ids(cid)
-        if clob_ids and len(clob_ids) == 2 and all(clob_ids):
-            gamma_ids = m["token_ids"]
-            if gamma_ids != clob_ids:
-                print(f"[MOMENTUM] Token ID FIX for {m['coin'].upper()}_{m['interval']}: "
-                      f"gamma={gamma_ids[0][:20]}... clob={clob_ids[0][:20]}...", flush=True)
-            m["token_ids"] = clob_ids
-            enriched += 1
-        time.sleep(0.02)
+    if active_markets:
+        def _enrich_one(m_idx):
+            cid = active_markets[m_idx].get("condition_id", "")
+            clob_ids = _fetch_clob_token_ids(cid)
+            return m_idx, clob_ids
+
+        with ThreadPoolExecutor(max_workers=10) as pool:
+            futs = {pool.submit(_enrich_one, i): i for i in range(len(active_markets))}
+            for fut in as_completed(futs):
+                m_idx, clob_ids = fut.result()
+                if clob_ids and len(clob_ids) == 2 and all(clob_ids):
+                    m = active_markets[m_idx]
+                    gamma_ids = m["token_ids"]
+                    if gamma_ids != clob_ids:
+                        print(f"[MOMENTUM] Token ID FIX for {m['coin'].upper()}_{m['interval']}: "
+                              f"gamma={gamma_ids[0][:20]}... clob={clob_ids[0][:20]}...", flush=True)
+                    m["token_ids"] = clob_ids
+                    enriched += 1
 
     if enriched > 0:
         print(f"[MOMENTUM] Enriched {enriched}/{len(active_markets)} markets "
@@ -838,9 +816,11 @@ class MomentumEngine:
         # Market discovery cache — REST calls are slow, WebSocket prices are fast.
         # Only re-discover markets every N seconds; use cached list + WS prices
         # for the fast per-second price checks.
+        # Discovery runs in a background thread so it never blocks the scan loop.
         self._cached_markets: list = []
         self._last_market_discovery = 0.0
         self._market_discovery_interval = 30  # re-discover every 30s
+        self._discovery_in_progress = False
 
         # Fast 5m boundary detection — track which 5m epochs we've already
         # discovered so we can do targeted slug lookups right at boundaries
@@ -1093,9 +1073,11 @@ class MomentumEngine:
         """Fast targeted discovery when a new 5m epoch starts.
 
         Instead of waiting up to 30s for the next full discovery cycle,
-        this does ~8 REST calls (4 coins × 2 slug variants) to grab
-        the brand-new 5m markets right as they appear.
+        this does ~8 REST calls (4 coins × 2 slug variants) IN PARALLEL
+        to grab the brand-new 5m markets right as they appear.
         """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
         now_ts = int(time.time())
         current_epoch = (now_ts // 300) * 300
 
@@ -1105,36 +1087,45 @@ class MomentumEngine:
         self._last_5m_epoch = current_epoch
         new_markets = []
 
+        # Build all slug variants upfront
+        all_slugs = []
         for coin_abbr in CRYPTO_COINS:
             coin_full = COIN_SLUG_NAMES.get(coin_abbr, coin_abbr)
-            # The new market uses the current epoch timestamp
-            slug_variants = [f"{coin_full}-updown-5m-{current_epoch}"]
+            all_slugs.append(f"{coin_full}-updown-5m-{current_epoch}")
             if coin_abbr != coin_full:
-                slug_variants.append(f"{coin_abbr}-updown-5m-{current_epoch}")
+                all_slugs.append(f"{coin_abbr}-updown-5m-{current_epoch}")
 
-            for event_slug in slug_variants:
-                try:
-                    resp = requests.get(
-                        f"{GAMMA_API}/events",
-                        params={"slug": event_slug},
-                        timeout=10,
-                    )
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        events_list = data if isinstance(data, list) else [data] if isinstance(data, dict) else []
-                        for event in events_list:
-                            if not isinstance(event, dict):
-                                continue
-                            for mkt in event.get("markets", []):
-                                parsed = _parse_market(mkt)
-                                if parsed:
-                                    new_markets.append(parsed)
-                            if "conditionId" in event:
-                                parsed = _parse_market(event)
-                                if parsed:
-                                    new_markets.append(parsed)
-                except Exception:
-                    pass
+        def _fetch_slug(event_slug):
+            try:
+                resp = requests.get(
+                    f"{GAMMA_API}/events",
+                    params={"slug": event_slug},
+                    timeout=10,
+                )
+                if resp.status_code == 200:
+                    return resp.json()
+            except Exception:
+                pass
+            return None
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            futs = {pool.submit(_fetch_slug, s): s for s in all_slugs}
+            for fut in as_completed(futs):
+                data = fut.result()
+                if data is None:
+                    continue
+                events_list = data if isinstance(data, list) else [data] if isinstance(data, dict) else []
+                for event in events_list:
+                    if not isinstance(event, dict):
+                        continue
+                    for mkt in event.get("markets", []):
+                        parsed = _parse_market(mkt)
+                        if parsed:
+                            new_markets.append(parsed)
+                    if "conditionId" in event:
+                        parsed = _parse_market(event)
+                        if parsed:
+                            new_markets.append(parsed)
 
         if new_markets:
             print(f"[MOMENTUM] 5m boundary: grabbed {len(new_markets)} new markets "
@@ -1183,16 +1174,34 @@ class MomentumEngine:
 
         # Use cached markets for fast WS-driven price checks.
         # Only re-discover via REST every _market_discovery_interval seconds.
+        # Discovery runs in a background thread so the scan loop stays fast (~1/sec).
         now = time.time()
-        if now - self._last_market_discovery >= self._market_discovery_interval or not self._cached_markets:
-            prev_count = len(self._cached_markets)
-            self._cached_markets = discover_active_markets()
-            self._last_market_discovery = now
-
-            # Force WS resubscription when markets change so new tokens
-            # get live prices immediately instead of waiting 30s
-            if len(self._cached_markets) != prev_count:
+        need_discovery = (now - self._last_market_discovery >= self._market_discovery_interval
+                          or not self._cached_markets)
+        if need_discovery and not self._discovery_in_progress:
+            if not self._cached_markets:
+                # First run: must block to get initial markets
+                self._cached_markets = discover_active_markets()
+                self._last_market_discovery = time.time()
                 self._refresh_ws_tokens(force=True)
+            else:
+                # Subsequent runs: discover in background, don't block scan
+                self._discovery_in_progress = True
+                self._last_market_discovery = now  # prevent re-trigger
+
+                def _bg_discover():
+                    try:
+                        new_markets = discover_active_markets()
+                        prev_count = len(self._cached_markets)
+                        self._cached_markets = new_markets
+                        if len(new_markets) != prev_count:
+                            self._refresh_ws_tokens(force=True)
+                    except Exception as e:
+                        print(f"[MOMENTUM] Background discovery error: {e}", flush=True)
+                    finally:
+                        self._discovery_in_progress = False
+
+                threading.Thread(target=_bg_discover, daemon=True).start()
 
         markets = self._cached_markets
         if not markets:
