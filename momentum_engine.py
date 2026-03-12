@@ -107,6 +107,10 @@ POLL_INTERVAL = int(os.getenv("MOMENTUM_POLL_INTERVAL", "1"))
 # Max entries per market (same as copy trader default)
 MAX_ENTRIES_PER_MARKET = int(os.getenv("COPY_MAX_ENTRIES_PER_MARKET", "2"))
 
+# Cooldown between re-entries into the same market (seconds).
+# Prevents rapid-fire follow-ups when price ticks up within the same scan cycle.
+FOLLOW_UP_COOLDOWN = int(os.getenv("MOMENTUM_FOLLOW_UP_COOLDOWN", "60"))
+
 # Minimum minutes before market close to allow entry.
 # Prevents placing trades after (or right at) the close time.
 MIN_MINUTES_BEFORE_CLOSE = float(os.getenv("MOMENTUM_MIN_MINUTES_BEFORE_CLOSE", "1.0"))
@@ -827,6 +831,7 @@ class MomentumEngine:
         # that can flip between API calls).
         self.entered_markets: dict = {}
         self.market_entry_count: dict = {}
+        self.last_trade_time: dict = {}  # (condition_id, token_id) → epoch timestamp
 
         # Position tracking — share the same dict as copy trader when available
         # so both engines' trades appear in the combined P&L / balance chart
@@ -1388,6 +1393,18 @@ class MomentumEngine:
                         print(f"  REJECT max_entries: {self.market_entry_count[market_key]}/{self.max_entries_per_market} for {_mkt_label} {outcome}", flush=True)
                         continue
 
+                # --- GUARD: Cooldown between re-entries ---
+                # Prevents rapid-fire follow-ups (e.g. PROBE → RE-ENTRY in 2s)
+                if market_key in self.entered_markets:
+                    last_t = self.last_trade_time.get(market_key, 0)
+                    elapsed = time.time() - last_t
+                    if elapsed < FOLLOW_UP_COOLDOWN:
+                        remaining = FOLLOW_UP_COOLDOWN - elapsed
+                        _mkt_label_short = (question or slug)[:50]
+                        print(f"[MOMENTUM] Skip (cooldown: {remaining:.0f}s remaining of {FOLLOW_UP_COOLDOWN}s): {_mkt_label_short} {outcome}", flush=True)
+                        self.trades_skipped += 1
+                        continue
+
                 # --- GUARD: Upward-only re-entry ---
                 # Key difference: compare against LAST buy price, not first.
                 # With a LIVE price source (ws/clob_rest), allow re-entry at
@@ -1474,6 +1491,7 @@ class MomentumEngine:
                     # Update last buy price (NOT first — this is the key difference)
                     self.entered_markets[market_key] = price
                     self.market_entry_count[market_key] = self.market_entry_count.get(market_key, 0) + 1
+                    self.last_trade_time[market_key] = time.time()
 
                     # Save position
                     position = {
