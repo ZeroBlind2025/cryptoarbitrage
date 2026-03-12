@@ -109,7 +109,7 @@ MAX_ENTRIES_PER_MARKET = int(os.getenv("COPY_MAX_ENTRIES_PER_MARKET", "2"))
 # Prevents rapid-fire follow-ups when price ticks up within the same scan cycle.
 FOLLOW_UP_COOLDOWN = int(os.getenv("MOMENTUM_FOLLOW_UP_COOLDOWN", "30"))
 FOLLOW_UP_COOLDOWN_15M = int(os.getenv("MOMENTUM_15m_COOLDOWN", "240"))  # 4 minutes for 15m markets
-REENTRY_MAX_PRICE = float(os.getenv("MOMENTUM_REENTRY_MAX_PRICE", "0.899"))  # skip re-entry above 89.9¢
+REENTRY_MIN_PRICE = float(os.getenv("MOMENTUM_REENTRY_MIN_PRICE", "0.899"))  # only re-enter above 89.9¢
 
 # Minimum minutes before market close to allow entry.
 # Prevents placing trades after (or right at) the close time.
@@ -1419,10 +1419,10 @@ class MomentumEngine:
                         self.trades_skipped += 1
                         continue
 
-                # --- GUARD: Re-entry price cap ---
-                # Don't chase re-entries above 89.9¢ — diminishing upside.
-                if market_key in self.entered_markets and price > REENTRY_MAX_PRICE:
-                    print(f"[MOMENTUM] Skip re-entry (price {price*100:.1f}¢ > {REENTRY_MAX_PRICE*100:.1f}¢ cap): {(question or slug)[:50]} {outcome}", flush=True)
+                # --- GUARD: Re-entry minimum price ---
+                # Only re-enter once price has pushed past 89.9¢ — confirms strength.
+                if market_key in self.entered_markets and price <= REENTRY_MIN_PRICE:
+                    print(f"[MOMENTUM] Skip re-entry (price {price*100:.1f}¢ <= {REENTRY_MIN_PRICE*100:.1f}¢ min): {(question or slug)[:50]} {outcome}", flush=True)
                     self.trades_skipped += 1
                     continue
 
