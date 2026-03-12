@@ -111,6 +111,26 @@ MAX_ENTRIES_PER_MARKET = int(os.getenv("COPY_MAX_ENTRIES_PER_MARKET", "2"))
 # Prevents placing trades after (or right at) the close time.
 MIN_MINUTES_BEFORE_CLOSE = float(os.getenv("MOMENTUM_MIN_MINUTES_BEFORE_CLOSE", "1.0"))
 
+# ---------------------------------------------------------------------------
+# Market entry delay — wait N minutes after a market opens before entering.
+# Early-market prices are volatile and reversals are common.  By waiting,
+# we only enter once the direction has stabilised.
+#
+# 15m market → wait 9 minutes (60% of duration)
+#  5m market → wait 3 minutes (60% of duration)
+# ---------------------------------------------------------------------------
+MARKET_ENTRY_DELAY: dict[str, float] = {
+    "5m":  float(os.getenv("MOMENTUM_ENTRY_DELAY_5M",  "3")),
+    "15m": float(os.getenv("MOMENTUM_ENTRY_DELAY_15M", "9")),
+}
+
+# Interval durations in minutes (used to derive market start time from end time)
+_INTERVAL_DURATION_MINUTES: dict[str, float] = {
+    "5m": 5,
+    "15m": 15,
+    "60m": 60,
+}
+
 
 # =============================================================================
 # MARKET DISCOVERY
@@ -1283,6 +1303,24 @@ class MomentumEngine:
             if minutes_left is not None and minutes_left < MIN_MINUTES_BEFORE_CLOSE:
                 # Market is closed or about to close — skip
                 continue
+
+            # --- GUARD: Market must be old enough (entry delay) ---
+            # Derive market age from end_date and interval duration.
+            # If the market just opened, early prices are volatile and
+            # reversals are common — wait for the direction to stabilise.
+            interval = market.get("interval", "")
+            entry_delay = MARKET_ENTRY_DELAY.get(interval)
+            if entry_delay and minutes_left is not None:
+                duration = _INTERVAL_DURATION_MINUTES.get(interval)
+                if duration:
+                    market_age_minutes = duration - minutes_left
+                    if market_age_minutes < entry_delay:
+                        wait_remaining = entry_delay - market_age_minutes
+                        # Log once per market per scan cycle (only when candidate price would qualify)
+                        _delay_label = f"{coin.upper()}_{interval} {slug[:30]}"
+                        print(f"[MOMENTUM] DELAY {_delay_label}: market age {market_age_minutes:.1f}m < {entry_delay:.0f}m delay "
+                              f"(wait {wait_remaining:.1f}m more)", flush=True)
+                        continue
 
             # Build a short label for rejection logging
             _mkt_label = f"{coin.upper()}_{market['interval']} {slug[:30]}"
