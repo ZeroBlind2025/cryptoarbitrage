@@ -404,7 +404,7 @@ def discover_active_markets() -> list[dict]:
 
     # --- Strategy 0: Event slug lookups (parallel) ---
     # 4 coins × 2 intervals × 4 windows × ~2 variants = up to 64 URLs
-    ts_slug_configs = [("5m", 300)]
+    ts_slug_configs = [("5m", 300), ("15m", 900)]
     event_slug_coins = ["btc", "eth", "sol", "xrp"]
 
     strategy0_slugs = []  # list of event_slug strings
@@ -430,7 +430,7 @@ def discover_active_markets() -> list[dict]:
 
     # --- Strategy 2b: slug_contains partial matches (parallel) ---
     slug_search_terms = [
-        "updown-5m",
+        "updown-5m", "updown-15m",
         "btc-updown", "eth-updown", "sol-updown", "xrp-updown",
         "bitcoin-updown", "ethereum-updown", "solana-updown",
     ]
