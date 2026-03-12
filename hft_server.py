@@ -251,27 +251,27 @@ def discover_markets() -> list[dict]:
         current_ts = int(now.timestamp())
 
         # ============================================================
-        # FETCH CRYPTO 15-MIN MARKETS
+        # FETCH CRYPTO 5-MIN MARKETS (15m disabled)
         # ============================================================
-        print("[HFT] Searching for 15-min crypto markets...", flush=True)
+        print("[HFT] Searching for 5-min crypto markets...", flush=True)
 
-        # Generate timestamps for current and upcoming 15-min windows
-        # Round down to nearest 15 minutes
-        base_ts = (current_ts // 900) * 900  # 900 seconds = 15 minutes
+        # Generate timestamps for current and upcoming 5-min windows
+        # Round down to nearest 5 minutes
+        base_ts = (current_ts // 300) * 300  # 300 seconds = 5 minutes
 
         # Try multiple time offsets to catch active markets
         timestamps_to_try = [
             base_ts,          # Current window
-            base_ts + 900,    # Next window
-            base_ts + 1800,   # +30 min
-            base_ts - 900,    # Previous (might still be active)
-            base_ts - 1800,   # 2 windows back (settling)
+            base_ts + 300,    # Next window
+            base_ts + 600,    # +10 min
+            base_ts - 300,    # Previous (might still be active)
+            base_ts - 600,    # 2 windows back (settling)
         ]
 
         # Search for each crypto symbol
         for symbol in CRYPTO_SYMBOLS:
             for ts in timestamps_to_try:
-                slug_pattern = f"{symbol}-updown-15m-{ts}"
+                slug_pattern = f"{symbol}-updown-5m-{ts}"
 
                 try:
                     resp = requests.get(
@@ -286,7 +286,7 @@ def discover_markets() -> list[dict]:
                                 market_data = parse_market_data(raw)
                                 if market_data:
                                     # Calculate minutes until resolution
-                                    end_ts = ts + 900  # 15 min after start
+                                    end_ts = ts + 300  # 5 min after start
                                     minutes_until = (end_ts - current_ts) / 60
                                     if minutes_until > 0:
                                         market_data["category"] = "crypto"
@@ -300,7 +300,7 @@ def discover_markets() -> list[dict]:
                 # Small delay to avoid rate limiting
                 time_module.sleep(0.05)
 
-        # Also try a general search for "updown-15m" patterns
+        # Also try a general search for "updown" patterns (excluding 15m)
         try:
             resp = requests.get(
                 f"{GAMMA_API}/markets",
@@ -315,7 +315,7 @@ def discover_markets() -> list[dict]:
                 all_markets = resp.json()
                 for raw in all_markets:
                     slug = raw.get("slug", "")
-                    if "updown" in slug.lower() or "up-or-down" in slug.lower():
+                    if ("updown" in slug.lower() or "up-or-down" in slug.lower()) and "-15m-" not in slug.lower():
                         # Check if we already have this market
                         if not any(m["slug"] == slug for m in markets):
                             market_data = parse_market_data(raw)
@@ -338,7 +338,7 @@ def discover_markets() -> list[dict]:
         except Exception as e:
             print(f"[HFT] General scan error: {e}", flush=True)
 
-        print(f"[HFT] Crypto 15m markets found: {crypto_found}", flush=True)
+        print(f"[HFT] Crypto markets found (15m disabled): {crypto_found}", flush=True)
 
         # ============================================================
         # SPORTS MARKETS DISABLED — momentum engine only uses crypto

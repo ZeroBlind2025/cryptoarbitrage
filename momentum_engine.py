@@ -94,11 +94,9 @@ MAX_ENTRY_PRICE = float(os.getenv("MOMENTUM_MAX_ENTRY_PRICE", "0.989"))
 # MIN_ENTRY_PRICE / MAX_ENTRY_PRICE range.
 #
 # 5m  bracket: 85-<98.9¢ (uber conservative)
-# 15m bracket: 85-<98.9¢
 # ---------------------------------------------------------------------------
 INTERVAL_PRICE_BRACKETS: dict[str, list[tuple[float, float]]] = {
     "5m":  [(0.85, 0.989)],
-    "15m": [(0.85, 0.989)],
 }
 
 # How often to poll prices (seconds)
@@ -120,18 +118,15 @@ MIN_MINUTES_BEFORE_CLOSE = float(os.getenv("MOMENTUM_MIN_MINUTES_BEFORE_CLOSE", 
 # Early-market prices are volatile and reversals are common.  By waiting,
 # we only enter once the direction has stabilised.
 #
-# 15m market → wait 9 minutes (60% of duration)
 #  5m market → wait 2 minutes (40% of duration)
 # ---------------------------------------------------------------------------
 MARKET_ENTRY_DELAY: dict[str, float] = {
     "5m":  float(os.getenv("MOMENTUM_ENTRY_DELAY_5M",  "2")),
-    "15m": float(os.getenv("MOMENTUM_ENTRY_DELAY_15M", "9")),
 }
 
 # Interval durations in minutes (used to derive market start time from end time)
 _INTERVAL_DURATION_MINUTES: dict[str, float] = {
     "5m": 5,
-    "15m": 15,
     "60m": 60,
 }
 
@@ -149,11 +144,11 @@ COIN_SLUG_NAMES = {
     "sol": "solana",
     "xrp": "xrp",
 }
-INTERVALS = ["5m", "15m"]
+INTERVALS = ["5m"]
 
 # Interval detection patterns for question text
 # e.g. "9:00AM-9:15AM" = 15m, "9:00AM-9:05AM" = 5m, "12PM" (hourly) = 60m
-_INTERVAL_MINUTES = {5: "5m", 15: "15m", 60: "60m"}
+_INTERVAL_MINUTES = {5: "5m", 60: "60m"}
 
 
 def _detect_interval(slug: str, question: str) -> str:
@@ -403,7 +398,7 @@ def discover_active_markets() -> list[dict]:
 
     # --- Strategy 0: Event slug lookups (parallel) ---
     # 4 coins × 2 intervals × 4 windows × ~2 variants = up to 64 URLs
-    ts_slug_configs = [("5m", 300), ("15m", 900)]
+    ts_slug_configs = [("5m", 300)]
     event_slug_coins = ["btc", "eth", "sol", "xrp"]
 
     strategy0_slugs = []  # list of event_slug strings
@@ -429,7 +424,7 @@ def discover_active_markets() -> list[dict]:
 
     # --- Strategy 2b: slug_contains partial matches (parallel) ---
     slug_search_terms = [
-        "updown-5m", "updown-15m",
+        "updown-5m",
         "btc-updown", "eth-updown", "sol-updown", "xrp-updown",
         "bitcoin-updown", "ethereum-updown", "solana-updown",
     ]
