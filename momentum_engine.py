@@ -654,6 +654,12 @@ def discover_active_markets() -> list[dict]:
         # Skip markets that are already closed
         if minutes_left is not None and minutes_left < 0:
             continue
+        # Skip future markets that haven't started yet (negative age)
+        # e.g. a 15m market with 21.8 minutes left hasn't opened yet
+        interval = m.get("interval", "")
+        duration = _INTERVAL_DURATION_MINUTES.get(interval)
+        if duration and minutes_left is not None and minutes_left > duration:
+            continue
         active_markets.append(m)
 
     if len(active_markets) < len(markets):
