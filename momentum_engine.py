@@ -108,6 +108,7 @@ MAX_ENTRIES_PER_MARKET = int(os.getenv("COPY_MAX_ENTRIES_PER_MARKET", "2"))
 # Cooldown between re-entries into the same market (seconds).
 # Prevents rapid-fire follow-ups when price ticks up within the same scan cycle.
 FOLLOW_UP_COOLDOWN = int(os.getenv("MOMENTUM_FOLLOW_UP_COOLDOWN", "30"))
+FOLLOW_UP_COOLDOWN_15M = int(os.getenv("MOMENTUM_15m_COOLDOWN", "240"))  # 4 minutes for 15m markets
 
 # Minimum minutes before market close to allow entry.
 # Prevents placing trades after (or right at) the close time.
@@ -118,15 +119,18 @@ MIN_MINUTES_BEFORE_CLOSE = float(os.getenv("MOMENTUM_MIN_MINUTES_BEFORE_CLOSE", 
 # Early-market prices are volatile and reversals are common.  By waiting,
 # we only enter once the direction has stabilised.
 #
-#  5m market → wait 2 minutes (40% of duration)
+#  5m market  → wait 2 minutes (40% of duration)
+# 15m market  → wait 9 minutes (60% of duration)
 # ---------------------------------------------------------------------------
 MARKET_ENTRY_DELAY: dict[str, float] = {
     "5m":  float(os.getenv("MOMENTUM_ENTRY_DELAY_5M",  "2")),
+    "15m": float(os.getenv("MOMENTUM_ENTRY_DELAY_15M", "9")),
 }
 
 # Interval durations in minutes (used to derive market start time from end time)
 _INTERVAL_DURATION_MINUTES: dict[str, float] = {
     "5m": 5,
+    "15m": 15,
     "60m": 60,
 }
 
@@ -144,11 +148,11 @@ COIN_SLUG_NAMES = {
     "sol": "solana",
     "xrp": "xrp",
 }
-INTERVALS = ["5m"]
+INTERVALS = ["5m", "15m"]
 
 # Interval detection patterns for question text
 # e.g. "9:00AM-9:15AM" = 15m, "9:00AM-9:05AM" = 5m, "12PM" (hourly) = 60m
-_INTERVAL_MINUTES = {5: "5m", 60: "60m"}
+_INTERVAL_MINUTES = {5: "5m", 15: "15m", 60: "60m"}
 
 
 def _detect_interval(slug: str, question: str) -> str:
@@ -1404,12 +1408,13 @@ class MomentumEngine:
                 # --- GUARD: Cooldown between re-entries ---
                 # Prevents rapid-fire follow-ups (e.g. PROBE → RE-ENTRY in 2s)
                 if market_key in self.entered_markets:
+                    cooldown = FOLLOW_UP_COOLDOWN_15M if interval == "15m" else FOLLOW_UP_COOLDOWN
                     last_t = self.last_trade_time.get(market_key, 0)
                     elapsed = time.time() - last_t
-                    if elapsed < FOLLOW_UP_COOLDOWN:
-                        remaining = FOLLOW_UP_COOLDOWN - elapsed
+                    if elapsed < cooldown:
+                        remaining = cooldown - elapsed
                         _mkt_label_short = (question or slug)[:50]
-                        print(f"[MOMENTUM] Skip (cooldown: {remaining:.0f}s remaining of {FOLLOW_UP_COOLDOWN}s): {_mkt_label_short} {outcome}", flush=True)
+                        print(f"[MOMENTUM] Skip (cooldown: {remaining:.0f}s remaining of {cooldown}s): {_mkt_label_short} {outcome}", flush=True)
                         self.trades_skipped += 1
                         continue
 
