@@ -84,6 +84,7 @@ PROBE_AMOUNT = float(os.getenv("PROBE_AMOUNT", "10.0"))   # $ for first (probe) 
 POLL_INTERVAL = int(os.getenv("COPY_POLL_INTERVAL", "10"))  # seconds between checks
 ALGO_STARTING_BALANCE = float(os.getenv("ALGO_STARTING_BALANCE", "2300.0"))  # Starting balance for Poly Algo
 PRICE_BUFFER_BPS = int(os.getenv("COPY_PRICE_BUFFER_BPS", "50"))  # Max overbid vs target's price (50 bps = 0.5%)
+FOLLOW_UP_COOLDOWN = int(os.getenv("COPY_FOLLOW_UP_COOLDOWN", "60"))  # seconds between re-entries into same market
 
 # Per-coin lot sizes ($ per copied bet, per coin)
 # Override via env: COIN_BET_BTC=1.0  COIN_BET_ETH=2.0  COIN_BET_SOL=1.0
@@ -1784,6 +1785,7 @@ class CopyTrader:
         self.copied_sizes: set = set()  # Track (condition_id, target_size) to dedup re-scans
         self.entered_markets: dict = {}  # (condition_id, outcome_index) → entry_price
         self.market_entry_count: dict = {}  # (condition_id, outcome_index) → number of entries
+        self.last_trade_time: dict = {}  # (condition_id, outcome_index) → epoch timestamp of last trade
         self.max_entries_per_market = int(os.getenv("COPY_MAX_ENTRIES_PER_MARKET", "2"))  # Cap re-entries per market window
         self.target_name = get_profile_name(TARGET_ADDRESS)
         self.on_trade = on_trade  # Callback for dashboard integration
@@ -2123,6 +2125,16 @@ class CopyTrader:
             if condition_id and market_key in self.entered_markets:
                 print(f"[ALGO] Re-entry: {title} | {outcome} (price {price:.3f})")
 
+                # 60-second cooldown between re-entries — confirms direction before
+                # following up with full lot (prevents rapid-fire double entries)
+                last_t = self.last_trade_time.get(market_key, 0)
+                elapsed = time.time() - last_t
+                if elapsed < FOLLOW_UP_COOLDOWN:
+                    remaining = FOLLOW_UP_COOLDOWN - elapsed
+                    print(f"[ALGO] Skip (cooldown: {remaining:.0f}s remaining of {FOLLOW_UP_COOLDOWN}s): {title} | {outcome}")
+                    self.trades_skipped += 1
+                    continue
+
             # GUARD 2 disabled — no re-entry cap
             # GUARD 3 disabled — opposite side block removed
 
@@ -2224,6 +2236,9 @@ class CopyTrader:
 
             # Save position for tracking (if trade was successful or dry run)
             if trade_record["status"] in ["filled", "dry_run"]:
+                # Record trade time for follow-up cooldown
+                if condition_id:
+                    self.last_trade_time[market_key] = time.time()
                 # Record market entry — only store the FIRST entry price so
                 # subsequent conviction re-entries are compared against the
                 # original, not against an already-elevated price.
