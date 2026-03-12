@@ -273,18 +273,19 @@ def _parse_market(raw: dict) -> Optional[dict]:
 
     # Parse market close time so we can avoid entering after close
     end_date_str = raw.get("endDate") or raw.get("end_date_iso")
+    end_date_parsed = None
     minutes_until_close = None
     if end_date_str:
         try:
             if "T" in str(end_date_str):
-                end_date = datetime.fromisoformat(
+                end_date_parsed = datetime.fromisoformat(
                     end_date_str.replace("Z", "+00:00")
                 )
             else:
-                end_date = datetime.strptime(end_date_str, "%Y-%m-%d")
-                end_date = end_date.replace(tzinfo=timezone.utc)
+                end_date_parsed = datetime.strptime(end_date_str, "%Y-%m-%d")
+                end_date_parsed = end_date_parsed.replace(tzinfo=timezone.utc)
             now = datetime.now(timezone.utc)
-            minutes_until_close = (end_date - now).total_seconds() / 60
+            minutes_until_close = (end_date_parsed - now).total_seconds() / 60
         except (ValueError, TypeError):
             pass
 
@@ -298,6 +299,7 @@ def _parse_market(raw: dict) -> Optional[dict]:
         "coin": coin,
         "interval": interval,
         "minutes_until_close": minutes_until_close,
+        "end_date": end_date_parsed,  # stored for live recalculation
     }
 
 
@@ -1304,8 +1306,16 @@ class MomentumEngine:
             if coin in self.paused_coins:
                 continue
 
+            # --- Recalculate minutes_left live from stored end_date ---
+            # The cached minutes_until_close goes stale; recompute from
+            # the absolute end_date so delay/close guards are accurate.
+            end_date = market.get("end_date")
+            if end_date is not None:
+                minutes_left = (end_date - datetime.now(timezone.utc)).total_seconds() / 60
+            else:
+                minutes_left = market.get("minutes_until_close")
+
             # --- GUARD: Market must still be open ---
-            minutes_left = market.get("minutes_until_close")
             if minutes_left is not None and minutes_left < MIN_MINUTES_BEFORE_CLOSE:
                 # Market is closed or about to close — skip
                 continue
@@ -1482,7 +1492,7 @@ class MomentumEngine:
                     "market": title,
                     "condition_id": condition_id,
                     "token_id": token_id,
-                    "minutes_until_close": market.get("minutes_until_close"),
+                    "minutes_until_close": minutes_left,
                 })
 
                 if trade_record["status"] in ("filled", "dry_run"):
