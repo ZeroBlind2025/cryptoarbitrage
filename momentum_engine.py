@@ -121,10 +121,10 @@ MIN_MINUTES_BEFORE_CLOSE = float(os.getenv("MOMENTUM_MIN_MINUTES_BEFORE_CLOSE", 
 # we only enter once the direction has stabilised.
 #
 # 15m market → wait 9 minutes (60% of duration)
-#  5m market → wait 3 minutes (60% of duration)
+#  5m market → wait 2 minutes (40% of duration)
 # ---------------------------------------------------------------------------
 MARKET_ENTRY_DELAY: dict[str, float] = {
-    "5m":  float(os.getenv("MOMENTUM_ENTRY_DELAY_5M",  "3")),
+    "5m":  float(os.getenv("MOMENTUM_ENTRY_DELAY_5M",  "2")),
     "15m": float(os.getenv("MOMENTUM_ENTRY_DELAY_15M", "9")),
 }
 
