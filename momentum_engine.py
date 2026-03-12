@@ -1324,8 +1324,11 @@ class MomentumEngine:
                         wait_remaining = entry_delay - market_age_minutes
                         # Log once per market per scan cycle (only when candidate price would qualify)
                         _delay_label = f"{coin.upper()}_{interval} {slug[:30]}"
+                        _wait_secs = int(wait_remaining * 60)
+                        _wait_m, _wait_s = divmod(_wait_secs, 60)
+                        _wait_display = f"{_wait_m}m{_wait_s:02d}s" if _wait_m else f"{_wait_s}s"
                         print(f"[MOMENTUM] DELAY {_delay_label}: market age {market_age_minutes:.1f}m < {entry_delay:.0f}m delay "
-                              f"(wait {wait_remaining:.1f}m more)", flush=True)
+                              f"(wait {_wait_display} more)", flush=True)
                         continue
 
             # Build a short label for rejection logging
