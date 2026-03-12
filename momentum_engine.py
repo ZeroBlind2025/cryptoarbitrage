@@ -107,7 +107,7 @@ MAX_ENTRIES_PER_MARKET = int(os.getenv("COPY_MAX_ENTRIES_PER_MARKET", "2"))
 
 # Cooldown between re-entries into the same market (seconds).
 # Prevents rapid-fire follow-ups when price ticks up within the same scan cycle.
-FOLLOW_UP_COOLDOWN = int(os.getenv("MOMENTUM_FOLLOW_UP_COOLDOWN", "60"))
+FOLLOW_UP_COOLDOWN = int(os.getenv("MOMENTUM_FOLLOW_UP_COOLDOWN", "30"))
 
 # Minimum minutes before market close to allow entry.
 # Prevents placing trades after (or right at) the close time.
