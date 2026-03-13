@@ -124,6 +124,7 @@ except Exception as e:
 momentum_engine: Optional["MomentumEngine"] = None
 momentum_thread: Optional[threading.Thread] = None
 stop_momentum = threading.Event()
+momentum_paused = threading.Event()  # When set, skip new scans but keep resolution running
 momentum_trades: deque = deque(maxlen=500)
 
 
@@ -1991,18 +1992,21 @@ def momentum_loop():
         try:
             loop_count += 1
 
-            entered = momentum_engine.scan_and_trade()
-            if entered > 0:
-                print(f"[MOMENTUM] Entered {entered} trade(s)", flush=True)
+            # Only scan for new trades if NOT paused
+            if not momentum_paused.is_set():
+                entered = momentum_engine.scan_and_trade()
+                if entered > 0:
+                    print(f"[MOMENTUM] Entered {entered} trade(s)", flush=True)
 
-            # Always check resolutions
+            # Always check resolutions (even when paused)
             momentum_engine.check_resolutions()
 
             # Heartbeat every ~5 min
             heartbeat_every = max(1, 300 // poll_s)
             if loop_count % heartbeat_every == 0:
                 stats = momentum_engine.get_stats()
-                print(f"[MOMENTUM] Heartbeat #{loop_count}: "
+                paused_label = "PAUSED" if momentum_paused.is_set() else "ACTIVE"
+                print(f"[MOMENTUM] Heartbeat #{loop_count}: {paused_label} | "
                       f"{stats['open_positions']} open | "
                       f"{stats['trades_entered']} entered | "
                       f"{stats['scans_completed']} scans", flush=True)
@@ -2073,6 +2077,7 @@ def api_momentum_start():
         print("[MOMENTUM] Auto-paused copy trader polling (resolutions still running)", flush=True)
 
     stop_momentum.clear()
+    momentum_paused.clear()
     momentum_thread = threading.Thread(target=momentum_loop, daemon=True)
     momentum_thread.start()
 
@@ -2117,6 +2122,48 @@ def api_momentum_stop():
     })
 
 
+@app.route('/api/momentum/pause', methods=['POST'])
+def api_momentum_pause():
+    """Pause momentum engine - stops new scans but keeps resolution running"""
+    global momentum_paused
+
+    if not momentum_thread or not momentum_thread.is_alive():
+        return jsonify({"error": "Momentum engine not running"}), 400
+
+    if momentum_paused.is_set():
+        return jsonify({"error": "Already paused"}), 400
+
+    momentum_paused.set()
+    open_count = len(momentum_engine.positions.get("open", [])) if momentum_engine else 0
+    print(f"[MOMENTUM] PAUSED - No new scans. Resolution engine still running for {open_count} open positions.", flush=True)
+
+    return jsonify({
+        "success": True,
+        "message": f"Paused. Resolution engine running for {open_count} open position(s).",
+        "open_positions": open_count,
+    })
+
+
+@app.route('/api/momentum/resume', methods=['POST'])
+def api_momentum_resume():
+    """Resume momentum engine scanning"""
+    global momentum_paused
+
+    if not momentum_thread or not momentum_thread.is_alive():
+        return jsonify({"error": "Momentum engine not running"}), 400
+
+    if not momentum_paused.is_set():
+        return jsonify({"error": "Not paused"}), 400
+
+    momentum_paused.clear()
+    print(f"[MOMENTUM] RESUMED - Now scanning for new trades again.", flush=True)
+
+    return jsonify({
+        "success": True,
+        "message": "Momentum engine resumed",
+    })
+
+
 @app.route('/api/momentum/status')
 def api_momentum_status():
     """Get momentum engine status"""
@@ -2124,7 +2171,7 @@ def api_momentum_status():
         return jsonify({"available": False, "running": False, "error": "Module not available"})
 
     running = momentum_thread and momentum_thread.is_alive()
-    status = {"available": True, "running": running}
+    status = {"available": True, "running": running, "paused": momentum_paused.is_set() if running else False}
 
     if momentum_engine:
         status.update(momentum_engine.get_stats())
@@ -2360,8 +2407,10 @@ def _get_momentum_data() -> dict:
         "paused_coins": [], "dry_run": True,
         "active_entries": {},
     }
+    running = momentum_thread and momentum_thread.is_alive()
     base = {
-        "running": momentum_thread and momentum_thread.is_alive(),
+        "running": running,
+        "paused": momentum_paused.is_set() if running else False,
     }
     try:
         if momentum_engine:
