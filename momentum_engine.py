@@ -889,8 +889,8 @@ class MomentumEngine:
         # --- DRY RUN OVERRIDES ---
         # Wider price range, no delays/cooldowns, no probe sizing
         if self.dry_run:
-            self.min_entry_price = 0.65
-            self.max_entry_price = 0.85
+            self.min_entry_price = 0.85
+            self.max_entry_price = 0.989
             self.interval_price_brackets = {}  # use global range for all intervals
             self._dry_run_no_delays = True      # flag checked in scan loop
             self._dry_run_no_probe = True       # use full lot size, no probe
