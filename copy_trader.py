@@ -1556,7 +1556,7 @@ def get_latest_sells(wallet_address: str, limit: int = 20, verbose: bool = False
 
 
 def is_crypto_market(bet: dict) -> bool:
-    """Check if bet is on a crypto market (15, 30, or 60 min)"""
+    """Check if bet is on a crypto market (5, 15, 30, or 60 min)"""
     slug = bet.get("slug", "").lower()
     title = bet.get("title", "").lower()
 
@@ -1565,9 +1565,10 @@ def is_crypto_market(bet: dict) -> bool:
         if pattern in slug or pattern in title:
             return True
 
-    # Also check for specific crypto keywords and timeframes (15, 30, 60 min)
+    # Also check for specific crypto keywords and timeframes (5, 15, 30, 60 min)
     crypto_keywords = [
         "bitcoin", "ethereum", "solana", "xrp", "ripple",
+        "5m", "5-min", "5 min",
         "15m", "15-min", "15 min",
         "30m", "30-min", "30 min",
         "60m", "60-min", "60 min", "1h", "1-hour", "1 hour"

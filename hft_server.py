@@ -239,8 +239,9 @@ def discover_markets() -> list[dict]:
     GAMMA_API = "https://gamma-api.polymarket.com"
     SPORTS_TAG_ID = 100639
 
-    # 15-minute market cryptos
+    # Crypto coin abbreviations and their full Polymarket slug names
     CRYPTO_SYMBOLS = ["btc", "eth", "sol", "xrp"]
+    COIN_FULL_NAMES = {"btc": "bitcoin", "eth": "ethereum", "sol": "solana", "xrp": "xrp"}
 
     markets = []
     crypto_found = 0
@@ -268,34 +269,42 @@ def discover_markets() -> list[dict]:
             base_ts - 600,    # 2 windows back (settling)
         ]
 
-        # Search for each crypto symbol
+        # Search for each crypto symbol (try both full name and abbreviation)
         for symbol in CRYPTO_SYMBOLS:
+            full_name = COIN_FULL_NAMES.get(symbol, symbol)
             for ts in timestamps_to_try:
-                slug_pattern = f"{symbol}-updown-5m-{ts}"
+                # Polymarket uses full coin names in slugs (e.g. bitcoin-updown-5m-{ts})
+                slug_pattern = f"{full_name}-updown-5m-{ts}"
 
-                try:
-                    resp = requests.get(
-                        f"{GAMMA_API}/markets",
-                        params={"slug": slug_pattern},
-                        timeout=10
-                    )
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        if isinstance(data, list) and data:
-                            for raw in data:
-                                market_data = parse_market_data(raw)
-                                if market_data:
-                                    # Calculate minutes until resolution
-                                    end_ts = ts + 300  # 5 min after start
-                                    minutes_until = (end_ts - current_ts) / 60
-                                    if minutes_until > 0:
-                                        market_data["category"] = "crypto"
-                                        market_data["minutes_until"] = minutes_until
-                                        markets.append(market_data)
-                                        crypto_found += 1
-                                        print(f"[HFT] Found crypto: {slug_pattern} ({minutes_until:.1f}m)", flush=True)
-                except:
-                    pass
+                # Try both full name and abbreviated slugs
+                slug_variants = [slug_pattern]
+                if full_name != symbol:
+                    slug_variants.append(f"{symbol}-updown-5m-{ts}")
+
+                for sv in slug_variants:
+                    try:
+                        resp = requests.get(
+                            f"{GAMMA_API}/markets",
+                            params={"slug": sv},
+                            timeout=10
+                        )
+                        if resp.status_code == 200:
+                            data = resp.json()
+                            if isinstance(data, list) and data:
+                                for raw in data:
+                                    market_data = parse_market_data(raw)
+                                    if market_data:
+                                        # Calculate minutes until resolution
+                                        end_ts = ts + 300  # 5 min after start
+                                        minutes_until = (end_ts - current_ts) / 60
+                                        if minutes_until > 0:
+                                            market_data["category"] = "crypto"
+                                            market_data["minutes_until"] = minutes_until
+                                            markets.append(market_data)
+                                            crypto_found += 1
+                                            print(f"[HFT] Found crypto: {sv} ({minutes_until:.1f}m)", flush=True)
+                    except:
+                        pass
 
                 # Small delay to avoid rate limiting
                 time_module.sleep(0.05)
