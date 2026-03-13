@@ -885,6 +885,16 @@ class MomentumEngine:
 
     def start(self):
         """Initialize the momentum engine."""
+
+        # --- DRY RUN OVERRIDES ---
+        # Wider price range, no delays/cooldowns, no probe sizing
+        if self.dry_run:
+            self.min_entry_price = 0.65
+            self.max_entry_price = 0.85
+            self.interval_price_brackets = {}  # use global range for all intervals
+            self._dry_run_no_delays = True      # flag checked in scan loop
+            self._dry_run_no_probe = True       # use full lot size, no probe
+
         balance = self.positions.get("stats", {}).get("balance", ALGO_STARTING_BALANCE)
         lot_sizes = ", ".join(f"{c.upper()}=${a}" for c, a in sorted(self.coin_bet_amounts.items()))
         print("\n" + "=" * 60)
@@ -899,6 +909,9 @@ class MomentumEngine:
             if other:
                 print(f"    {', '.join(other)}: global range ({self.min_entry_price*100:.0f}-{self.max_entry_price*100:.0f}¢)")
         print(f"  Re-entry: upward only (current > last buy)")
+        if self.dry_run:
+            print(f"  Delays/cooldowns: DISABLED (dry run)")
+            print(f"  Probe sizing: DISABLED (using dashboard lot sizes)")
         print(f"  Lot sizes: {lot_sizes} (default: ${self.bet_amount})")
         print(f"  Balance: ${balance:.2f}")
         print(f"  Mode: {'DRY RUN' if self.dry_run else 'LIVE'}")
@@ -1329,22 +1342,24 @@ class MomentumEngine:
             # Derive market age from end_date and interval duration.
             # If the market just opened, early prices are volatile and
             # reversals are common — wait for the direction to stabilise.
+            # SKIP in dry run mode — no delays.
             interval = market.get("interval", "")
-            entry_delay = MARKET_ENTRY_DELAY.get(interval)
-            if entry_delay and minutes_left is not None:
-                duration = _INTERVAL_DURATION_MINUTES.get(interval)
-                if duration:
-                    market_age_minutes = duration - minutes_left
-                    if market_age_minutes < entry_delay:
-                        wait_remaining = entry_delay - market_age_minutes
-                        # Log once per market per scan cycle (only when candidate price would qualify)
-                        _delay_label = f"{coin.upper()}_{interval} {slug[:30]}"
-                        _wait_secs = int(wait_remaining * 60)
-                        _wait_m, _wait_s = divmod(_wait_secs, 60)
-                        _wait_display = f"{_wait_m}m{_wait_s:02d}s" if _wait_m else f"{_wait_s}s"
-                        print(f"[MOMENTUM] DELAY {_delay_label}: market age {market_age_minutes:.1f}m < {entry_delay:.0f}m delay "
-                              f"(wait {_wait_display} more)", flush=True)
-                        continue
+            if not getattr(self, '_dry_run_no_delays', False):
+                entry_delay = MARKET_ENTRY_DELAY.get(interval)
+                if entry_delay and minutes_left is not None:
+                    duration = _INTERVAL_DURATION_MINUTES.get(interval)
+                    if duration:
+                        market_age_minutes = duration - minutes_left
+                        if market_age_minutes < entry_delay:
+                            wait_remaining = entry_delay - market_age_minutes
+                            # Log once per market per scan cycle (only when candidate price would qualify)
+                            _delay_label = f"{coin.upper()}_{interval} {slug[:30]}"
+                            _wait_secs = int(wait_remaining * 60)
+                            _wait_m, _wait_s = divmod(_wait_secs, 60)
+                            _wait_display = f"{_wait_m}m{_wait_s:02d}s" if _wait_m else f"{_wait_s}s"
+                            print(f"[MOMENTUM] DELAY {_delay_label}: market age {market_age_minutes:.1f}m < {entry_delay:.0f}m delay "
+                                  f"(wait {_wait_display} more)", flush=True)
+                            continue
 
             # Build a short label for rejection logging
             _mkt_label = f"{coin.upper()}_{market['interval']} {slug[:30]}"
@@ -1408,7 +1423,8 @@ class MomentumEngine:
 
                 # --- GUARD: Cooldown between re-entries ---
                 # Prevents rapid-fire follow-ups (e.g. PROBE → RE-ENTRY in 2s)
-                if market_key in self.entered_markets:
+                # SKIP in dry run mode — no cooldowns.
+                if market_key in self.entered_markets and not getattr(self, '_dry_run_no_delays', False):
                     cooldown = FOLLOW_UP_COOLDOWN_15M if interval == "15m" else FOLLOW_UP_COOLDOWN
                     last_t = self.last_trade_time.get(market_key, 0)
                     elapsed = time.time() - last_t
@@ -1421,7 +1437,8 @@ class MomentumEngine:
 
                 # --- GUARD: Re-entry minimum price ---
                 # Only re-enter once price has pushed past 89.9¢ — confirms strength.
-                if market_key in self.entered_markets and price <= REENTRY_MIN_PRICE:
+                # SKIP in dry run mode — no re-entry min price gate.
+                if market_key in self.entered_markets and price <= REENTRY_MIN_PRICE and not getattr(self, '_dry_run_no_delays', False):
                     print(f"[MOMENTUM] Skip re-entry (price {price*100:.1f}¢ <= {REENTRY_MIN_PRICE*100:.1f}¢ min): {(question or slug)[:50]} {outcome}", flush=True)
                     self.trades_skipped += 1
                     continue
@@ -1449,7 +1466,11 @@ class MomentumEngine:
                 # --- ENTER THE TRADE ---
                 full_lot = self.coin_bet_amounts.get(coin, self.bet_amount)
                 is_first_entry = market_key not in self.entered_markets
-                trade_amount = PROBE_AMOUNT if is_first_entry else full_lot
+                # In dry run mode: skip probe sizing, always use dashboard lot size
+                if getattr(self, '_dry_run_no_probe', False):
+                    trade_amount = full_lot
+                else:
+                    trade_amount = PROBE_AMOUNT if is_first_entry else full_lot
                 title = (question or slug)[:50]
                 entry_type = "PROBE" if is_first_entry else "RE-ENTRY"
 

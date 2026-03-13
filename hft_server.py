@@ -1364,12 +1364,67 @@ def copy_trader_loop():
 
 @app.route('/api/copy-trader/start', methods=['POST'])
 def api_copy_trader_start():
-    """Start copy trading — DISABLED: copy trader is disabled to prevent
-    uncontrolled trading. Use momentum engine instead."""
+    """Start copy trading in dry run mode only.
+    Live copy trading remains disabled — use momentum engine for live."""
+    global copy_trader, copy_trader_thread, stop_copy_trader, copy_trader_paused
+
+    if not HAS_COPY_TRADER:
+        return jsonify({"error": "Copy trader module not available"}), 400
+
+    data = request.get_json() or {}
+    live_mode = data.get('live', False)
+
+    # Only allow dry run mode for copy trader
+    if live_mode:
+        return jsonify({
+            "error": "Copy trader is disabled for live trading",
+            "message": "Copy trader only runs in dry run mode. Use momentum engine for live trading."
+        }), 403
+
+    if copy_trader_thread and copy_trader_thread.is_alive():
+        return jsonify({"error": "Copy trader already running"}), 400
+
+    try:
+        bet_amount = data.get('bet_amount')
+        coin_bet_amounts = data.get('coin_bet_amounts')
+
+        # Share coin bet amounts from momentum engine if available
+        if not coin_bet_amounts and momentum_engine:
+            coin_bet_amounts = dict(momentum_engine.coin_bet_amounts)
+        if not bet_amount and momentum_engine:
+            bet_amount = momentum_engine.bet_amount
+
+        copy_trader = CopyTrader(
+            dry_run=True,
+            crypto_only=True,
+            on_trade=on_copy_trade,
+        )
+        if bet_amount:
+            copy_trader.bet_amount = float(bet_amount)
+        if coin_bet_amounts:
+            copy_trader.coin_bet_amounts = {k: float(v) for k, v in coin_bet_amounts.items()}
+
+        # Share positions with momentum engine
+        if momentum_engine:
+            copy_trader.positions = momentum_engine.positions
+
+        copy_trader.start()
+    except Exception as e:
+        print(f"[SERVER] Failed to start copy trader: {e}")
+        import traceback; traceback.print_exc()
+        copy_trader = None
+        return jsonify({"error": f"Failed to start: {e}"}), 500
+
+    stop_copy_trader.clear()
+    copy_trader_paused.clear()
+    copy_trader_thread = threading.Thread(target=copy_trader_loop, daemon=True)
+    copy_trader_thread.start()
+
     return jsonify({
-        "error": "Copy trader is disabled",
-        "message": "Copy trader has been disabled on the backend. Use the momentum engine instead."
-    }), 403
+        "success": True,
+        "message": "Copy trader started in DRY RUN mode",
+        "mode": "dry_run",
+    })
 
 
 @app.route('/api/copy-trader/stop', methods=['POST'])
@@ -2009,9 +2064,10 @@ def api_momentum_start():
         momentum_engine = None
         return jsonify({"error": f"Failed to start: {e}"}), 500
 
-    # Auto-pause copy trader when momentum is active
+    # Auto-pause copy trader when momentum is active (only in live mode)
+    # In dry run mode, both copy trader and momentum engine run together
     copy_trader_was_active = False
-    if copy_trader_thread and copy_trader_thread.is_alive() and not copy_trader_paused.is_set():
+    if live_mode and copy_trader_thread and copy_trader_thread.is_alive() and not copy_trader_paused.is_set():
         copy_trader_paused.set()
         copy_trader_was_active = True
         print("[MOMENTUM] Auto-paused copy trader polling (resolutions still running)", flush=True)
