@@ -1387,11 +1387,9 @@
                                                         <p className="text-xs font-mono text-slate-400">
                                                             {(momentum.win_rate || 0).toFixed(1)}%
                                                         </p>
-                                                        {(momentum.stop_losses || 0) > 0 && (
-                                                            <p className="text-xs font-mono text-yellow-400 mt-0.5" title={`Staked $${(momentum.sl_spent || 0).toFixed(2)}, recovered $${(momentum.sl_proceeds || 0).toFixed(2)}`}>
-                                                                {momentum.stop_losses} SL (saved ${(momentum.sl_proceeds || 0).toFixed(2)})
-                                                            </p>
-                                                        )}
+                                                        <p className="text-xs font-mono text-yellow-400 mt-0.5" title={`Staked $${(momentum.sl_spent || 0).toFixed(2)}, recovered $${(momentum.sl_proceeds || 0).toFixed(2)}`}>
+                                                            {momentum.stop_losses || 0} SL {(momentum.sl_proceeds || 0) > 0 ? `(saved $${(momentum.sl_proceeds || 0).toFixed(2)})` : ''}
+                                                        </p>
                                                     </div>
                                                 </div>
                                                 {momentum.open_staked > 0 && (
@@ -1418,14 +1416,12 @@
                                                 {momentum.open_positions || 0} / {momentum.resolved_positions || 0}
                                             </span>
                                         </div>
-                                        {(momentum.stop_losses || 0) > 0 && (
-                                            <div className="flex justify-between">
-                                                <span className="text-yellow-400">Stop Losses</span>
-                                                <span className="text-yellow-400 font-mono" title={`Staked $${(momentum.sl_spent || 0).toFixed(2)}, recovered $${(momentum.sl_proceeds || 0).toFixed(2)}`}>
-                                                    {momentum.stop_losses} (saved ${(momentum.sl_proceeds || 0).toFixed(2)})
-                                                </span>
-                                            </div>
-                                        )}
+                                        <div className="flex justify-between">
+                                            <span className="text-yellow-400">Stop Losses</span>
+                                            <span className="text-yellow-400 font-mono" title={`Staked $${(momentum.sl_spent || 0).toFixed(2)}, recovered $${(momentum.sl_proceeds || 0).toFixed(2)}`}>
+                                                {momentum.stop_losses || 0}{(momentum.sl_proceeds || 0) > 0 ? ` (saved $${(momentum.sl_proceeds || 0).toFixed(2)})` : ''}
+                                            </span>
+                                        </div>
                                         <div className="flex justify-between">
                                             <span className="text-slate-400">Entry Range</span>
                                             <span className="text-white font-mono">
