@@ -889,14 +889,17 @@ class MomentumEngine:
     def start(self):
         """Initialize the momentum engine."""
 
+        # No entry delays, no cooldowns, no re-entry min price gate, no probe sizing
+        # (applies to both demo and live — live is a 1:1 copy of demo behavior)
+        self._dry_run_no_delays = True
+        self._dry_run_no_probe = True
+
         # --- DRY RUN OVERRIDES ---
-        # Wider price range, no delays/cooldowns, no probe sizing
+        # Wider price range for backtesting
         if self.dry_run:
             self.min_entry_price = 0.85
             self.max_entry_price = 0.989
             self.interval_price_brackets = {}  # use global range for all intervals
-            self._dry_run_no_delays = True      # flag checked in scan loop
-            self._dry_run_no_probe = True       # use full lot size, no probe
 
         balance = self.positions.get("stats", {}).get("balance", ALGO_STARTING_BALANCE)
         lot_sizes = ", ".join(f"{c.upper()}=${a}" for c, a in sorted(self.coin_bet_amounts.items()))
@@ -912,9 +915,8 @@ class MomentumEngine:
             if other:
                 print(f"    {', '.join(other)}: global range ({self.min_entry_price*100:.0f}-{self.max_entry_price*100:.0f}¢)")
         print(f"  Re-entry: upward only (current > last buy)")
-        if self.dry_run:
-            print(f"  Delays/cooldowns: DISABLED (dry run)")
-            print(f"  Probe sizing: DISABLED (using dashboard lot sizes)")
+        print(f"  Delays/cooldowns: DISABLED")
+        print(f"  Probe sizing: DISABLED (using dashboard lot sizes)")
         print(f"  Lot sizes: {lot_sizes} (default: ${self.bet_amount})")
         print(f"  Balance: ${balance:.2f}")
         print(f"  Mode: {'DRY RUN' if self.dry_run else 'LIVE'}")
