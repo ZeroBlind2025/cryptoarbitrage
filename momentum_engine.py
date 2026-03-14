@@ -2006,7 +2006,7 @@ class MomentumEngine:
             if result == "WIN":
                 coin_data[coin]["wins"] += 1
                 coin_data[coin]["results"].append("W")
-            elif result == "LOSS":
+            elif result in ("LOSS", "STOP_LOSS"):
                 coin_data[coin]["losses"] += 1
                 coin_data[coin]["results"].append("L")
 
