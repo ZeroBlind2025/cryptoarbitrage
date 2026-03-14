@@ -66,6 +66,10 @@ FUNDER_ADDRESS = os.getenv("POLYMARKET_FUNDER_ADDRESS", os.getenv("POLYGON_ADDRE
 PRIVATE_KEY = os.getenv("POLYGON_PRIVATE_KEY", "")
 SIGNATURE_TYPE = int(os.getenv("POLYMARKET_SIGNATURE_TYPE", "2"))  # 0=EOA, 1=Poly proxy, 2=Gnosis Safe (most common)
 
+# Relayer API Key (simplest auth — create at polymarket.com/settings?tab=api-keys)
+# Just needs RELAYER_API_KEY + your EOA address. No rate limits from shared signer.
+RELAYER_API_KEY = os.getenv("POLYMARKET_RELAYER_API_KEY", "")
+
 # Builder credentials (from polymarket.com/settings?tab=builder)
 # IMPORTANT: These are BUILDER creds, NOT CLOB API creds. Get them from polymarket.com/settings?tab=builder
 # Set POLYMARKET_BUILDER_ENABLED=true to use builder mode (not needed for basic trading)
@@ -80,6 +84,7 @@ PROBE_AMOUNT = float(os.getenv("PROBE_AMOUNT", "10.0"))   # $ for first (probe) 
 POLL_INTERVAL = int(os.getenv("COPY_POLL_INTERVAL", "10"))  # seconds between checks
 ALGO_STARTING_BALANCE = float(os.getenv("ALGO_STARTING_BALANCE", "2300.0"))  # Starting balance for Poly Algo
 PRICE_BUFFER_BPS = int(os.getenv("COPY_PRICE_BUFFER_BPS", "50"))  # Max overbid vs target's price (50 bps = 0.5%)
+FOLLOW_UP_COOLDOWN = int(os.getenv("COPY_FOLLOW_UP_COOLDOWN", "30"))  # seconds between re-entries into same market
 STOP_LOSS_PCT = float(os.getenv("COPY_STOP_LOSS_PCT", "20"))  # Auto-sell when position drops this % from entry (0 = disabled)
 
 # Per-coin lot sizes ($ per copied bet, per coin)
@@ -424,7 +429,7 @@ CTF_REDEEM_ABI = json.loads("""[
     }
 ]""")
 
-# Minimal ABI for NegRiskAdapter redeemPositions (different signature)
+# Minimal ABI for NegRiskAdapter redeemPositions + getConditionId
 NEG_RISK_REDEEM_ABI = json.loads("""[
     {
         "inputs": [
@@ -435,10 +440,19 @@ NEG_RISK_REDEEM_ABI = json.loads("""[
         "outputs": [],
         "stateMutability": "nonpayable",
         "type": "function"
+    },
+    {
+        "inputs": [
+            {"name": "_questionId", "type": "bytes32"}
+        ],
+        "name": "getConditionId",
+        "outputs": [{"name": "", "type": "bytes32"}],
+        "stateMutability": "view",
+        "type": "function"
     }
 ]""")
 
-# Minimal ABI for ERC1155 balanceOf (to check token holdings before redeeming)
+# Minimal ABI for ERC1155 balanceOf + isApprovedForAll + setApprovalForAll
 ERC1155_BALANCE_ABI = json.loads("""[
     {
         "inputs": [
@@ -446,6 +460,35 @@ ERC1155_BALANCE_ABI = json.loads("""[
             {"name": "id", "type": "uint256"}
         ],
         "name": "balanceOf",
+        "outputs": [{"name": "", "type": "uint256"}],
+        "stateMutability": "view",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {"name": "account", "type": "address"},
+            {"name": "operator", "type": "address"}
+        ],
+        "name": "isApprovedForAll",
+        "outputs": [{"name": "", "type": "bool"}],
+        "stateMutability": "view",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {"name": "operator", "type": "address"},
+            {"name": "approved", "type": "bool"}
+        ],
+        "name": "setApprovalForAll",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {"name": "conditionId", "type": "bytes32"}
+        ],
+        "name": "payoutDenominator",
         "outputs": [{"name": "", "type": "uint256"}],
         "stateMutability": "view",
         "type": "function"
@@ -535,19 +578,128 @@ def _get_web3():
     return None
 
 
-def _check_neg_risk(condition_id: str) -> bool:
-    """Check if a market is neg_risk by querying the CLOB API."""
+def _check_neg_risk(condition_id: str, slug: str = "") -> bool:
+    """Check if a market is neg_risk by querying the CLOB API.
+
+    Falls back to slug-based detection for crypto updown markets which
+    are always neg_risk.  This covers cases where the CLOB API doesn't
+    return the neg_risk field (e.g. resolved/closed markets).
+    """
+    # Fast path: crypto updown markets are always neg_risk
+    if slug:
+        s = slug.lower()
+        if any(pattern in s for pattern in ["-updown-", "updown-5m", "updown-15m", "updown-30m", "updown-60m"]):
+            return True
+
     try:
         resp = requests.get(f"{CLOB_API}/markets/{condition_id}", timeout=10)
         if resp.status_code == 200:
-            return resp.json().get("neg_risk", False)
+            data = resp.json()
+            neg = data.get("neg_risk", None)
+            if neg is not None:
+                return bool(neg)
     except Exception:
         pass
-    return False
+
+    # Conservative fallback: treat as neg_risk if condition_id lookup failed
+    # Most Polymarket binary markets are neg_risk
+    return True
 
 
 # Polymarket gasless relay — pays gas so the EOA doesn't need MATIC
 RELAY_URL = "https://relayer-v2.polymarket.com"
+
+# Rate limiter for relayer /submit — 25 req/min limit, we target 24 req/min (2.5s gap)
+_relay_submit_times: list = []  # timestamps of recent /submit calls
+_RELAY_MAX_PER_MINUTE = 24  # stay just under the 25/min limit
+_RELAY_WINDOW = 60.0  # sliding window in seconds
+_RELAY_MIN_GAP = 2.5  # minimum seconds between /submit calls
+
+# Daily transaction cap — Unverified Builder tier = 100 tx/day, Verified = 3000 tx/day
+# Set via RELAY_DAILY_LIMIT env var; defaults to 90 (leaves 10 tx buffer for manual use)
+_RELAY_DAILY_LIMIT = int(os.getenv("RELAY_DAILY_LIMIT", "90"))
+_relay_daily_count = 0       # transactions submitted today
+_relay_daily_date = ""       # date string (YYYY-MM-DD UTC) for current count
+
+
+def _relay_daily_remaining() -> int:
+    """Return how many relay transactions remain for today (UTC)."""
+    global _relay_daily_count, _relay_daily_date
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if _relay_daily_date != today:
+        # New UTC day — reset counter
+        _relay_daily_count = 0
+        _relay_daily_date = today
+    return max(0, _RELAY_DAILY_LIMIT - _relay_daily_count)
+
+
+def _relay_daily_increment():
+    """Record one relay transaction for today's daily counter."""
+    global _relay_daily_count, _relay_daily_date
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if _relay_daily_date != today:
+        _relay_daily_count = 0
+        _relay_daily_date = today
+    _relay_daily_count += 1
+    remaining = _RELAY_DAILY_LIMIT - _relay_daily_count
+    print(f"[RELAY] Daily usage: {_relay_daily_count}/{_RELAY_DAILY_LIMIT} (remaining: {remaining})")
+
+
+def _relay_rate_limit_wait() -> bool:
+    """Block until we can safely send another /submit request.
+
+    Enforces:
+      1. Daily transaction cap (default 90/day, configurable via RELAY_DAILY_LIMIT)
+      2. Per-minute cap (24/min, under the 25/min hard limit)
+      3. Minimum gap between calls (2.5s)
+
+    Returns True if the request can proceed, False if the daily limit is exhausted.
+    """
+    import time as _t
+
+    # Check daily limit first — no point waiting if we're already at the cap
+    if _relay_daily_remaining() <= 0:
+        next_reset = datetime.now(timezone.utc).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        # next_reset is today 00:00 UTC which is in the past; add 1 day
+        from datetime import timedelta
+        next_reset += timedelta(days=1)
+        until_reset = (next_reset - datetime.now(timezone.utc)).total_seconds()
+        hours = int(until_reset // 3600)
+        mins = int((until_reset % 3600) // 60)
+        print(f"[RELAY] DAILY LIMIT REACHED ({_relay_daily_count}/{_RELAY_DAILY_LIMIT}). "
+              f"Resets in {hours}h {mins}m. Skipping relay — will queue for retry.")
+        return False
+
+    now = _t.time()
+
+    # Purge timestamps outside the sliding window
+    while _relay_submit_times and _relay_submit_times[0] < now - _RELAY_WINDOW:
+        _relay_submit_times.pop(0)
+
+    # Enforce minimum gap between calls
+    if _relay_submit_times:
+        gap = _RELAY_MIN_GAP - (now - _relay_submit_times[-1])
+        if gap > 0:
+            print(f"[RELAY] Rate limit: waiting {gap:.1f}s (min gap)")
+            _t.sleep(gap)
+            now = _t.time()
+
+    # Enforce per-minute cap
+    while len(_relay_submit_times) >= _RELAY_MAX_PER_MINUTE:
+        oldest = _relay_submit_times[0]
+        wait = (oldest + _RELAY_WINDOW) - now + 0.1  # +0.1s buffer
+        if wait > 0:
+            print(f"[RELAY] Rate limit: waiting {wait:.1f}s ({len(_relay_submit_times)}/{_RELAY_MAX_PER_MINUTE} in window)")
+            _t.sleep(wait)
+            now = _t.time()
+        # Re-purge after sleeping
+        while _relay_submit_times and _relay_submit_times[0] < now - _RELAY_WINDOW:
+            _relay_submit_times.pop(0)
+
+    _relay_submit_times.append(now)
+    return True
 RELAY_SIGN_URL = "https://builder-signing-server.vercel.app/sign"
 ADDRESS_ZERO = "0x" + "00" * 20
 
@@ -588,41 +740,99 @@ def _sign_safe_tx(account, safe_contract, to: str, call_data: str, nonce: int, w
 
 
 def _get_relay_headers(body_dict: dict) -> dict:
-    """Get signed headers for the Polymarket relay.
+    """Get signed headers for the Polymarket gasless relay.
 
-    Uses builder credentials if available, otherwise falls back to the
-    shared signing server.
+    Priority:
+    1. Relayer API Key (simplest, from polymarket.com/settings?tab=api-keys)
+    2. Builder creds (env vars) + derived L2 creds — own quota, no rate limits
+    3. Shared signing server — generates both header sets, but rate-limited
     """
     import json as _json
 
+    # --- Method 0: Relayer API Key (simplest, no HMAC needed) ---
+    if RELAYER_API_KEY:
+        eoa = os.getenv("POLYMARKET_ADDRESS", "")
+        if not eoa and PRIVATE_KEY:
+            try:
+                from eth_account import Account
+                eoa = Account.from_key(PRIVATE_KEY).address
+            except Exception:
+                pass
+        if eoa:
+            print(f"[REDEEM] Using Relayer API Key (key={RELAYER_API_KEY[:12]}...)")
+            return {
+                "RELAYER_API_KEY": RELAYER_API_KEY,
+                "RELAYER_API_KEY_ADDRESS": eoa,
+                "Content-Type": "application/json",
+            }
+
+    # --- Method 1: Builder credentials + L2 creds ---
     if BUILDER_ENABLED and BUILDER_API_KEY and BUILDER_API_SECRET and BUILDER_API_PASSPHRASE:
-        # Use our own builder creds — higher rate limits
         try:
+            from py_builder_signing_sdk.config import BuilderConfig, BuilderApiKeyCreds
             from py_clob_client.signer import Signer
             from py_clob_client.headers.headers import create_level_2_headers
-            from py_clob_client.clob_types import RequestArgs, ApiCreds
+            from py_clob_client.clob_types import RequestArgs
 
-            signer = Signer(private_key=PRIVATE_KEY, chain_id=137)
-            creds = ApiCreds(
-                api_key=BUILDER_API_KEY,
-                api_secret=BUILDER_API_SECRET,
-                api_passphrase=BUILDER_API_PASSPHRASE,
-            )
-            headers = create_level_2_headers(
-                signer=signer,
-                creds=creds,
-                request_args=RequestArgs(
-                    method="POST",
-                    request_path="/submit",
-                    body=body_dict,
+            # Generate builder-specific headers (POLY_BUILDER_*)
+            builder_config = BuilderConfig(
+                local_builder_creds=BuilderApiKeyCreds(
+                    key=BUILDER_API_KEY,
+                    secret=BUILDER_API_SECRET,
+                    passphrase=BUILDER_API_PASSPHRASE,
                 ),
-                builder=True,
             )
+            body_str = _json.dumps(body_dict)
+            builder_payload = builder_config.generate_builder_headers(
+                "POST", "/submit", body_str,
+            )
+            builder_headers = builder_payload.to_dict() if builder_payload else {}
+
+            # Generate L2 headers from derived CLOB creds
+            l2_headers = {}
+            if HAS_CLOB_CLIENT and PRIVATE_KEY:
+                from py_clob_client.client import ClobClient
+                if FUNDER_ADDRESS:
+                    client = ClobClient(
+                        CLOB_API, key=PRIVATE_KEY, chain_id=137,
+                        signature_type=SIGNATURE_TYPE, funder=FUNDER_ADDRESS,
+                    )
+                else:
+                    client = ClobClient(CLOB_API, key=PRIVATE_KEY, chain_id=137)
+                creds = client.derive_api_key()
+                if creds and creds.api_key:
+                    signer = Signer(private_key=PRIVATE_KEY, chain_id=137)
+                    l2_headers = create_level_2_headers(
+                        signer=signer,
+                        creds=creds,
+                        request_args=RequestArgs(
+                            method="POST",
+                            request_path="/submit",
+                            body=body_dict,
+                        ),
+                    )
+
+            headers = {**l2_headers, **builder_headers}
+            print(f"[REDEEM] Using builder creds (key={BUILDER_API_KEY[:12]}...)")
             return headers
         except Exception as e:
-            print(f"[REDEEM] Builder creds failed ({e}), falling back to shared signer")
+            print(f"[REDEEM] Builder creds failed ({e}), falling back to shared signer...")
 
-    # Fall back to shared signing server
+    # --- Method 2: Shared signing server (with retry for 429) ---
+    payload = {
+        "method": "POST",
+        "path": "/submit",
+        "body": _json.dumps(body_dict),
+    }
+    try:
+        resp = requests.post(RELAY_SIGN_URL, json=payload, timeout=15)
+        resp.raise_for_status()
+        return resp.json()
+    except requests.exceptions.HTTPError as e:
+        if e.response is not None and e.response.status_code == 429:
+            print(f"[REDEEM] Shared signer rate-limited (429), skipping relay — will queue for retry")
+        raise
+    # --- Method 3: Shared signing server (rate-limited) ---
     payload = {
         "method": "POST",
         "path": "/submit",
@@ -680,6 +890,10 @@ def _redeem_via_relay(w3, account, safe_contract, proxy_address: str,
 
     headers = _get_relay_headers(body)
 
+    # Enforce rate limit before hitting /submit (25 req/min + daily cap)
+    if not _relay_rate_limit_wait():
+        raise RuntimeError("Daily relay limit reached (429-prevention)")
+
     resp = requests.post(
         f"{RELAY_URL}/submit",
         headers=headers,
@@ -687,6 +901,10 @@ def _redeem_via_relay(w3, account, safe_contract, proxy_address: str,
         timeout=30,
     )
     resp.raise_for_status()
+
+    # Count this successful submission against the daily cap
+    _relay_daily_increment()
+
     result = resp.json()
 
     tx_hash = result.get("transactionHash")
@@ -717,6 +935,7 @@ def _exec_via_safe(w3, safe_address: str, to: str, call_data: bytes, account) ->
     )
 
     safe_nonce = safe.functions.nonce().call()
+    print(f"[REDEEM] Direct Safe nonce (on-chain): {safe_nonce}")
     call_data_hex = "0x" + call_data.hex()
 
     tx_hash_bytes = safe.functions.getTransactionHash(
@@ -766,7 +985,84 @@ def _exec_via_safe(w3, safe_address: str, to: str, call_data: bytes, account) ->
     return tx_hash.hex()
 
 
-def redeem_winning_position(condition_id: str, token_id: str = "", dry_run: bool = False):
+# Queue for redemptions that failed due to relay rate-limit / no gas.
+# Each entry: {"condition_id": str, "token_id": str, "slug": str, "attempts": int, "next_retry": float}
+_pending_redemptions: list = []
+_PENDING_MAX_ATTEMPTS = 10  # give up after this many total attempts (conserve daily quota)
+
+
+def _queue_pending_redemption(condition_id: str, token_id: str, slug: str, attempts: int = 1):
+    """Add a failed redemption to the retry queue.
+
+    Backoff is aggressive to conserve daily relay quota (100 tx/day on Unverified tier).
+    First retry after 30 min, then exponential up to 2 hour cap.
+    """
+    import time as _t
+    # Don't duplicate
+    for item in _pending_redemptions:
+        if item["condition_id"] == condition_id:
+            item["attempts"] = attempts
+            # Exponential backoff: 30min, 60min, 90min, 120min cap
+            item["next_retry"] = _t.time() + min(1800 * attempts, 7200)
+            return
+    _pending_redemptions.append({
+        "condition_id": condition_id,
+        "token_id": token_id,
+        "slug": slug,
+        "attempts": attempts,
+        "next_retry": _t.time() + 1800,  # 30 minutes before first retry
+    })
+    remaining = _relay_daily_remaining()
+    print(f"[REDEEM] Queued for retry (attempt {attempts}): condition={condition_id[:20]}... "
+          f"(daily relay remaining: {remaining})")
+
+
+def retry_pending_redemptions(dry_run: bool = False):
+    """Retry any queued redemptions whose backoff has elapsed. Call periodically.
+
+    Checks daily relay quota before each retry to avoid wasting transactions.
+    """
+    import time as _t
+    if not _pending_redemptions:
+        return
+    now = _t.time()
+    remaining = _relay_daily_remaining()
+    if remaining <= 0:
+        print(f"[REDEEM] Daily relay limit reached — skipping {len(_pending_redemptions)} pending redemption(s)")
+        return
+    still_pending = []
+    retried = 0
+    for item in _pending_redemptions:
+        if now < item["next_retry"]:
+            still_pending.append(item)
+            continue
+        if item["attempts"] >= _PENDING_MAX_ATTEMPTS:
+            print(f"[REDEEM] Giving up after {item['attempts']} attempts: {item['condition_id'][:20]}...")
+            continue
+        # Reserve some daily quota — don't burn all remaining on retries
+        if _relay_daily_remaining() <= 5:
+            print(f"[REDEEM] Only {_relay_daily_remaining()} relay tx left today — deferring remaining retries")
+            still_pending.append(item)
+            continue
+        print(f"[REDEEM] Retrying queued redemption (attempt {item['attempts']+1}): {item['condition_id'][:20]}...")
+        result = redeem_winning_position(
+            item["condition_id"], token_id=item["token_id"],
+            dry_run=dry_run, slug=item["slug"],
+        )
+        if result is True:
+            print(f"[REDEEM] Queued redemption succeeded!")
+            retried += 1
+        else:
+            item["attempts"] += 1
+            item["next_retry"] = now + min(1800 * item["attempts"], 7200)  # 30min increments, 2hr cap
+            still_pending.append(item)
+    _pending_redemptions[:] = still_pending
+    if _pending_redemptions:
+        print(f"[REDEEM] {len(_pending_redemptions)} redemption(s) still queued for retry "
+              f"(daily relay remaining: {_relay_daily_remaining()})")
+
+
+def redeem_winning_position(condition_id: str, token_id: str = "", dry_run: bool = False, slug: str = ""):
     """Redeem winning conditional tokens on-chain for USDC.
 
     After a market resolves, winning shares must be redeemed via the
@@ -849,52 +1145,47 @@ def redeem_winning_position(condition_id: str, token_id: str = "", dry_run: bool
             print(f"[REDEEM] Could not check balance (proceeding anyway): {e}")
 
     # Determine if neg_risk market
-    is_neg_risk = _check_neg_risk(condition_id)
+    is_neg_risk = _check_neg_risk(condition_id, slug=slug)
 
     if dry_run:
         print(f"[REDEEM] DRY RUN: would redeem condition={cid[:20]}... neg_risk={is_neg_risk} proxy={use_proxy}")
         return True
 
     try:
-        if is_neg_risk:
-            # NegRisk: call NegRiskAdapter.redeemPositions(conditionId, amounts)
-            contract_addr = NEG_RISK_ADAPTER_ADDRESS
-            contract = w3.eth.contract(
-                address=w3.to_checksum_address(contract_addr),
-                abi=NEG_RISK_REDEEM_ABI,
-            )
-            amount = token_balance
-            if amount == 0 and token_id:
-                try:
-                    ctf_token = w3.eth.contract(
-                        address=w3.to_checksum_address(CTF_CONTRACT_ADDRESS),
-                        abi=ERC1155_BALANCE_ABI,
-                    )
-                    tid_int = int(token_id, 16) if token_id.startswith("0x") else int(token_id)
-                    amount = ctf_token.functions.balanceOf(balance_wallet, tid_int).call()
-                except Exception:
-                    pass
+        # Both NegRisk and standard CLOB tokens are redeemed through the CTF directly.
+        # The NegRiskAdapter must NOT be used for CLOB tokens — it uses different
+        # internal token IDs, causing "SafeMath: subtraction overflow" errors.
+        # For CLOB tokens: CTF.redeemPositions(USDC, bytes32(0), conditionId, [1,2])
+        contract_addr = CTF_CONTRACT_ADDRESS
+        contract = w3.eth.contract(
+            address=w3.to_checksum_address(contract_addr),
+            abi=CTF_REDEEM_ABI,
+        )
 
-            if amount == 0:
-                print(f"[REDEEM] NegRisk: no token balance found, skipping")
+        # Check if condition is resolved on-chain before attempting redemption
+        try:
+            ctf_diag = w3.eth.contract(
+                address=w3.to_checksum_address(CTF_CONTRACT_ADDRESS),
+                abi=ERC1155_BALANCE_ABI,
+            )
+            payout_denom = ctf_diag.functions.payoutDenominator(condition_bytes).call()
+            print(f"[REDEEM] On-chain payoutDenominator={payout_denom} (0=not resolved)")
+            if payout_denom == 0:
+                print(f"[REDEEM] Condition NOT resolved on-chain yet — skipping")
                 return None
+        except Exception as diag_err:
+            print(f"[REDEEM] payoutDenominator check failed: {diag_err}")
 
-            print(f"[REDEEM] NegRisk redemption: condition={cid[:20]}... amount={amount}")
-            call_data = contract.encode_abi("redeemPositions", [condition_bytes, [amount]])
-        else:
-            # Standard binary: CTF.redeemPositions(collateral, parent, conditionId, indexSets)
-            contract_addr = CTF_CONTRACT_ADDRESS
-            contract = w3.eth.contract(
-                address=w3.to_checksum_address(contract_addr),
-                abi=CTF_REDEEM_ABI,
-            )
-            print(f"[REDEEM] Standard redemption: condition={cid[:20]}... indexSets=[1,2]")
-            call_data = contract.encode_abi("redeemPositions", [
-                w3.to_checksum_address(USDC_ADDRESS),
-                HASH_ZERO,
-                condition_bytes,
-                [1, 2],
-            ])
+        market_type = "NegRisk" if is_neg_risk else "Standard"
+        # Polymarket uses USDC.e as collateral (per docs). Try USDC.e first.
+        collateral = USDC_E_ADDRESS
+        print(f"[REDEEM] {market_type} CTF redemption: condition={cid[:20]}... collateral=USDC.e indexSets=[1,2]")
+        call_data = contract.encode_abi("redeemPositions", [
+            w3.to_checksum_address(collateral),
+            HASH_ZERO,
+            condition_bytes,
+            [1, 2],
+        ])
 
         if use_proxy:
             # Route through Polymarket's gasless relay (no MATIC needed on EOA)
@@ -902,6 +1193,8 @@ def redeem_winning_position(condition_id: str, token_id: str = "", dry_run: bool
                 address=w3.to_checksum_address(token_holder),
                 abi=GNOSIS_SAFE_ABI,
             )
+            # Try gasless relay once — on 429, queue for retry instead of blocking.
+            relay_err = None
             try:
                 tx_hex = _redeem_via_relay(
                     w3, account, safe_contract, token_holder,
@@ -909,24 +1202,32 @@ def redeem_winning_position(condition_id: str, token_id: str = "", dry_run: bool
                 )
                 print(f"[REDEEM] SUCCESS (gasless relay): condition={cid[:20]}... tx={tx_hex}")
                 return True
-            except Exception as relay_err:
-                print(f"[REDEEM] Gasless relay failed ({relay_err}), trying direct Safe tx...")
-                try:
-                    tx_hex = _exec_via_safe(w3, token_holder, contract_addr, bytes.fromhex(call_data[2:]), account)
-                    print(f"[REDEEM] SUCCESS (direct proxy): condition={cid[:20]}... tx={tx_hex}")
-                    return True
-                except Exception as direct_err:
-                    raise RuntimeError(f"Both relay ({relay_err}) and direct ({direct_err}) failed") from direct_err
+            except Exception as e:
+                relay_err = e
+                if "429" in str(e) or "Daily relay limit" in str(e):
+                    print(f"[REDEEM] Relay rate-limited ({e}), queuing for later retry (non-blocking)")
+                    _queue_pending_redemption(condition_id, token_id, slug)
+                    return False
+
+            print(f"[REDEEM] Gasless relay failed ({relay_err}), trying direct Safe tx...")
+            try:
+                tx_hex = _exec_via_safe(w3, token_holder, contract_addr, bytes.fromhex(call_data[2:]), account)
+                print(f"[REDEEM] SUCCESS (direct proxy): condition={cid[:20]}... tx={tx_hex}")
+                return True
+            except Exception as direct_err:
+                if "insufficient" in str(direct_err).lower():
+                    print(f"[REDEEM] Direct tx failed: EOA has insufficient MATIC for gas.")
+                    _queue_pending_redemption(condition_id, token_id, slug)
+                    return False
+                raise RuntimeError(f"Both relay ({relay_err}) and direct ({direct_err}) failed") from direct_err
         else:
-            # Direct EOA call
+            # Direct EOA call (USDC.e first per Polymarket docs)
             nonce = w3.eth.get_transaction_count(eoa_address)
             tx = contract.functions.redeemPositions(
-                *([condition_bytes, [token_balance]] if is_neg_risk else [
-                    w3.to_checksum_address(USDC_ADDRESS),
-                    HASH_ZERO,
-                    condition_bytes,
-                    [1, 2],
-                ])
+                w3.to_checksum_address(collateral),
+                HASH_ZERO,
+                condition_bytes,
+                [1, 2],
             ).build_transaction({
                 "chainId": 137,
                 "from": eoa_address,
@@ -940,41 +1241,40 @@ def redeem_winning_position(condition_id: str, token_id: str = "", dry_run: bool
                 print(f"[REDEEM] SUCCESS: condition={cid[:20]}... tx={tx_hash.hex()}")
                 return True
 
-            # Transaction reverted — try bridged USDC.e for standard markets
-            if not is_neg_risk:
-                print(f"[REDEEM] Native USDC failed, trying bridged USDC.e...")
-                nonce = w3.eth.get_transaction_count(eoa_address)
-                tx = contract.functions.redeemPositions(
-                    w3.to_checksum_address(USDC_E_ADDRESS),
-                    HASH_ZERO,
-                    condition_bytes,
-                    [1, 2],
-                ).build_transaction({
-                    "chainId": 137,
-                    "from": eoa_address,
-                    "nonce": nonce,
-                })
-                signed = w3.eth.account.sign_transaction(tx, private_key=PRIVATE_KEY)
-                tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-                receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
-                if receipt.status == 1:
-                    print(f"[REDEEM] SUCCESS (USDC.e): tx={tx_hash.hex()}")
-                    return True
+            # Transaction reverted — try native USDC as fallback collateral
+            print(f"[REDEEM] USDC.e failed, trying native USDC...")
+            nonce = w3.eth.get_transaction_count(eoa_address)
+            tx = contract.functions.redeemPositions(
+                w3.to_checksum_address(USDC_ADDRESS),
+                HASH_ZERO,
+                condition_bytes,
+                [1, 2],
+            ).build_transaction({
+                "chainId": 137,
+                "from": eoa_address,
+                "nonce": nonce,
+            })
+            signed = w3.eth.account.sign_transaction(tx, private_key=PRIVATE_KEY)
+            tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+            receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+            if receipt.status == 1:
+                print(f"[REDEEM] SUCCESS (native USDC): tx={tx_hash.hex()}")
+                return True
 
             print(f"[REDEEM] FAILED: transaction reverted")
             return False
 
     except Exception as e:
-        # If proxy call failed for standard market, try USDC.e through proxy
-        if use_proxy and not is_neg_risk and "reverted" in str(e).lower():
+        # If proxy call reverted (wrong collateral?), try native USDC as fallback
+        if use_proxy and "reverted" in str(e).lower():
             try:
-                print(f"[REDEEM] USDC failed, trying USDC.e via relay...")
+                print(f"[REDEEM] USDC.e failed via proxy, trying native USDC...")
                 contract = w3.eth.contract(
                     address=w3.to_checksum_address(CTF_CONTRACT_ADDRESS),
                     abi=CTF_REDEEM_ABI,
                 )
-                call_data_e = contract.encode_abi("redeemPositions", [
-                    w3.to_checksum_address(USDC_E_ADDRESS),
+                call_data_fb = contract.encode_abi("redeemPositions", [
+                    w3.to_checksum_address(USDC_ADDRESS),
                     HASH_ZERO,
                     condition_bytes,
                     [1, 2],
@@ -986,14 +1286,14 @@ def redeem_winning_position(condition_id: str, token_id: str = "", dry_run: bool
                 try:
                     tx_hex = _redeem_via_relay(
                         w3, account, safe_contract, token_holder,
-                        CTF_CONTRACT_ADDRESS, call_data_e,
+                        CTF_CONTRACT_ADDRESS, call_data_fb,
                     )
                 except Exception:
-                    tx_hex = _exec_via_safe(w3, token_holder, CTF_CONTRACT_ADDRESS, bytes.fromhex(call_data_e[2:]), account)
-                print(f"[REDEEM] SUCCESS (USDC.e via proxy): tx={tx_hex}")
+                    tx_hex = _exec_via_safe(w3, token_holder, CTF_CONTRACT_ADDRESS, bytes.fromhex(call_data_fb[2:]), account)
+                print(f"[REDEEM] SUCCESS (native USDC via proxy): tx={tx_hex}")
                 return True
             except Exception as e2:
-                print(f"[REDEEM] USDC.e proxy also failed: {e2}")
+                print(f"[REDEEM] Native USDC proxy also failed: {e2}")
                 return False
         print(f"[REDEEM] Error: {e}")
         return False
@@ -1057,10 +1357,12 @@ def sweep_unredeemed(dry_run: bool = False) -> dict:
 
         print(f"[SWEEP] Redeeming: {title} | size={size:.2f} | cid={condition_id[:20]}...", flush=True)
 
+        slug = pos.get("slug", "") or pos.get("market_slug", "") or ""
         result = redeem_winning_position(
             condition_id=condition_id,
             token_id=token_id,
             dry_run=dry_run,
+            slug=slug,
         )
 
         if result is True:
@@ -1255,7 +1557,7 @@ def get_latest_sells(wallet_address: str, limit: int = 20, verbose: bool = False
 
 
 def is_crypto_market(bet: dict) -> bool:
-    """Check if bet is on a crypto market (15, 30, or 60 min)"""
+    """Check if bet is on a crypto market (5, 15, 30, or 60 min)"""
     slug = bet.get("slug", "").lower()
     title = bet.get("title", "").lower()
 
@@ -1264,9 +1566,10 @@ def is_crypto_market(bet: dict) -> bool:
         if pattern in slug or pattern in title:
             return True
 
-    # Also check for specific crypto keywords and timeframes (15, 30, 60 min)
+    # Also check for specific crypto keywords and timeframes (5, 15, 30, 60 min)
     crypto_keywords = [
         "bitcoin", "ethereum", "solana", "xrp", "ripple",
+        "5m", "5-min", "5 min",
         "15m", "15-min", "15 min",
         "30m", "30-min", "30 min",
         "60m", "60-min", "60 min", "1h", "1-hour", "1 hour"
@@ -1336,6 +1639,27 @@ def get_clob_client() -> Optional["ClobClient"]:
 
 
 _balance_error_until = 0.0  # Timestamp until which we skip orders due to balance/allowance errors
+_balance_error_count = 0  # Consecutive balance errors — escalates pause duration
+
+
+def check_usdc_balance() -> Optional[float]:
+    """Check on-chain USDC balance of the trading wallet. Returns balance in $ or None on error."""
+    if not HAS_WEB3 or not PRIVATE_KEY:
+        return None
+    try:
+        w3 = _get_web3()
+        if not w3 or not w3.is_connected():
+            return None
+        # Check the proxy wallet (funder) if using proxy, else EOA
+        use_proxy = SIGNATURE_TYPE >= 1 and FUNDER_ADDRESS
+        wallet = w3.to_checksum_address(FUNDER_ADDRESS) if use_proxy else w3.eth.account.from_key(PRIVATE_KEY).address
+        # ERC20 balanceOf
+        erc20_abi = json.loads('[{"inputs":[{"name":"account","type":"address"}],"name":"balanceOf","outputs":[{"name":"","type":"uint256"}],"stateMutability":"view","type":"function"}]')
+        usdc = w3.eth.contract(address=w3.to_checksum_address(USDC_E_ADDRESS), abi=erc20_abi)
+        bal = usdc.functions.balanceOf(wallet).call()
+        return bal / 1e6  # USDC has 6 decimals
+    except Exception:
+        return None
 
 def place_bet(client: "ClobClient", token_id: str, amount: float, max_price: float = 0) -> dict:
     """Place a FOK market buy order. Returns fill details or empty dict on failure.
@@ -1344,11 +1668,19 @@ def place_bet(client: "ClobClient", token_id: str, amount: float, max_price: flo
     maker_amount (USDC) rounded to 2 decimals, taker_amount (shares) to 4.
     The price parameter caps the worst fill price.
     """
-    global _balance_error_until
+    global _balance_error_until, _balance_error_count
     if time.time() < _balance_error_until:
-        remaining = int(_balance_error_until - time.time())
-        print(f"[ALGO] Skipping order — insufficient balance/allowance (retry in {remaining}s)")
-        return {}
+        # Proactively check if balance has recovered (e.g. from a redemption)
+        bal = check_usdc_balance()
+        if bal is not None and bal >= amount:
+            print(f"[ALGO] Balance recovered (${bal:.2f}) — resuming trading!")
+            _balance_error_until = 0.0
+            _balance_error_count = 0
+        else:
+            remaining = int(_balance_error_until - time.time())
+            bal_str = f" (on-chain: ${bal:.2f})" if bal is not None else ""
+            print(f"[ALGO] Skipping order — insufficient balance{bal_str} (retry in {remaining}s)")
+            return {}
     try:
         # Use the price cap if provided, otherwise let the library calculate
         price = min(round(max_price, 2), 0.99) if max_price and max_price > 0 else 0
@@ -1386,9 +1718,12 @@ def place_bet(client: "ClobClient", token_id: str, amount: float, max_price: flo
     except Exception as e:
         error_str = str(e).lower()
         if "balance" in error_str or "allowance" in error_str:
-            _balance_error_until = time.time() + 300  # Pause orders for 5 minutes
+            _balance_error_count += 1
+            # Escalating pause: 2min, 4min, 8min, cap at 10min — balance check can resume early
+            pause = min(120 * (2 ** (_balance_error_count - 1)), 600)
+            _balance_error_until = time.time() + pause
             print(f"[ALGO] Order error (BALANCE/ALLOWANCE): {e}")
-            print(f"[ALGO] *** Pausing all orders for 5 minutes — deposit USDC or run setup_allowances.py ***")
+            print(f"[ALGO] *** Pausing orders for {pause//60}m{pause%60}s (attempt #{_balance_error_count}) — will auto-resume if balance recovers ***")
         else:
             print(f"[ALGO] Order error: {e}")
             import traceback; traceback.print_exc()
@@ -1452,6 +1787,7 @@ class CopyTrader:
         self.copied_sizes: set = set()  # Track (condition_id, target_size) to dedup re-scans
         self.entered_markets: dict = {}  # (condition_id, outcome_index) → entry_price
         self.market_entry_count: dict = {}  # (condition_id, outcome_index) → number of entries
+        self.last_trade_time: dict = {}  # (condition_id, outcome_index) → epoch timestamp of last trade
         self.max_entries_per_market = int(os.getenv("COPY_MAX_ENTRIES_PER_MARKET", "2"))  # Cap re-entries per market window
         self.target_name = get_profile_name(TARGET_ADDRESS)
         self.on_trade = on_trade  # Callback for dashboard integration
@@ -1795,6 +2131,16 @@ class CopyTrader:
             if condition_id and market_key in self.entered_markets:
                 print(f"[ALGO] Re-entry: {title} | {outcome} (price {price:.3f})")
 
+                # 30-second cooldown between re-entries — confirms direction before
+                # following up with full lot (prevents rapid-fire double entries)
+                last_t = self.last_trade_time.get(market_key, 0)
+                elapsed = time.time() - last_t
+                if elapsed < FOLLOW_UP_COOLDOWN:
+                    remaining = FOLLOW_UP_COOLDOWN - elapsed
+                    print(f"[ALGO] Skip (cooldown: {remaining:.0f}s remaining of {FOLLOW_UP_COOLDOWN}s): {title} | {outcome}")
+                    self.trades_skipped += 1
+                    continue
+
             # GUARD 2 disabled — no re-entry cap
             # GUARD 3 disabled — opposite side block removed
 
@@ -1896,6 +2242,9 @@ class CopyTrader:
 
             # Save position for tracking (if trade was successful or dry run)
             if trade_record["status"] in ["filled", "dry_run"]:
+                # Record trade time for follow-up cooldown
+                if condition_id:
+                    self.last_trade_time[market_key] = time.time()
                 # Record market entry — only store the FIRST entry price so
                 # subsequent conviction re-entries are compared against the
                 # original, not against an already-elevated price.
@@ -2303,8 +2652,14 @@ class CopyTrader:
                 if copied > 0:
                     print(f"[ALGO] Copied {copied} trade(s) this cycle")
 
+                # Check stop losses on every tick (WS prices are live)
+                self._check_stop_losses()
+
                 # Periodically check for resolved positions
                 self.check_resolutions()
+
+                # Retry any queued redemptions (rate-limited / failed earlier)
+                retry_pending_redemptions(dry_run=self.dry_run)
 
                 time.sleep(POLL_INTERVAL)
 
@@ -2426,6 +2781,7 @@ class CopyTrader:
                             condition_id=condition_id,
                             token_id=token_id,
                             dry_run=self.dry_run,
+                            slug=slug,
                         )
                         position["redeemed"] = bool(redeemed)
                         _log_copy_trade("redeem", {
@@ -2441,7 +2797,8 @@ class CopyTrader:
                         elif redeemed is None:
                             pass  # No-op: balance was 0, already logged by redeem function
                         else:
-                            print(f"[ALGO] Redemption failed for {position['market'][:30]} — redeem manually")
+                            print(f"[ALGO] Redemption failed for {position['market'][:30]} — queued for retry")
+                            _queue_pending_redemption(condition_id, token_id, slug)
                     except Exception as e:
                         position["redeemed"] = False
                         _log_copy_trade("redeem_error", {
@@ -2451,6 +2808,7 @@ class CopyTrader:
                             "error": str(e),
                         })
                         print(f"[ALGO] Redemption error: {e}")
+                        _queue_pending_redemption(condition_id, token_id, slug)
 
                 elif won is False:
                     pnl = -amount
