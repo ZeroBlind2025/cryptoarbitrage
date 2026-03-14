@@ -1402,7 +1402,7 @@
                                 {momentum.running && (
                                     <div className="space-y-2 text-sm">
                                         {/* P&L Hero */}
-                                        {(momentum.resolved_positions > 0 || momentum.total_pnl) && (
+                                        {(momentum.resolved_positions > 0 || !!momentum.total_pnl) && (
                                             <div className="mb-2 p-3 rounded-lg bg-gradient-to-r from-orange-900/30 to-amber-900/30 border border-orange-500/20">
                                                 <div className="flex items-center justify-between">
                                                     <div>
