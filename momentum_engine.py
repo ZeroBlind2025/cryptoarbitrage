@@ -1588,9 +1588,10 @@ class MomentumEngine:
         return entered
 
     def check_stop_losses(self) -> int:
-        """Auto-sell momentum positions that dropped STOP_LOSS_PCT% from entry.
+        """Auto-sell momentum positions that dropped STOP_LOSS_PCT% from peak.
 
-        Uses live WebSocket bid prices. Returns number of positions stopped out.
+        Trailing stop: tracks peak price seen since entry and triggers when
+        price drops STOP_LOSS_PCT% from that peak. Returns number stopped out.
         """
         if STOP_LOSS_PCT <= 0:
             return 0
@@ -1604,7 +1605,7 @@ class MomentumEngine:
             return 0
 
         stopped = 0
-        threshold = 1 - (STOP_LOSS_PCT / 100)  # e.g. 0.80 for 20% stop loss
+        threshold = 1 - (STOP_LOSS_PCT / 100)  # e.g. 0.65 for 35% trailing stop
         no_price_count = 0
 
         for position in momentum_open[:]:  # copy — list mutated during iteration
@@ -1620,7 +1621,13 @@ class MomentumEngine:
                 no_price_count += 1
                 continue
 
-            stop_price = entry_price * threshold
+            # Update peak price (trailing stop tracks highest price seen)
+            peak_price = position.get("peak_price", entry_price)
+            if live_price > peak_price:
+                peak_price = live_price
+                position["peak_price"] = peak_price
+
+            stop_price = peak_price * threshold
             if live_price >= stop_price:
                 continue  # price is fine
 
@@ -1632,12 +1639,13 @@ class MomentumEngine:
             outcome = position.get("outcome", "?")
             amount_spent = position.get("amount", 0)
             coin = detect_coin(position.get("slug", ""), title)
-            loss_pct = (1 - live_price / entry_price) * 100
+            drop_from_peak = (1 - live_price / peak_price) * 100
+            drop_from_entry = (1 - live_price / entry_price) * 100
 
             print(f"\n[MOMENTUM] *** STOP LOSS TRIGGERED ***", flush=True)
             print(f"       Market: {title}", flush=True)
-            print(f"       {outcome} | Entry: {entry_price*100:.1f}¢ -> Now: {live_price*100:.1f}¢ ({loss_pct:.1f}% drop)", flush=True)
-            print(f"       Stop level: {stop_price*100:.1f}¢ (-{STOP_LOSS_PCT:.0f}%)", flush=True)
+            print(f"       {outcome} | Entry: {entry_price*100:.1f}¢ | Peak: {peak_price*100:.1f}¢ | Now: {live_price*100:.1f}¢ ({drop_from_entry:.1f}% from entry)", flush=True)
+            print(f"       Stop level: {stop_price*100:.1f}¢ (-{STOP_LOSS_PCT:.0f}% from peak)", flush=True)
             print(f"       Selling {shares:.2f} shares", flush=True)
 
             trade_record = {
@@ -1650,6 +1658,7 @@ class MomentumEngine:
                 "reason": "stop_loss",
                 "shares": shares,
                 "entry_price": entry_price,
+                "peak_price": peak_price,
                 "stop_price": stop_price,
                 "trigger_price": live_price,
                 "coin": coin,
@@ -1703,7 +1712,7 @@ class MomentumEngine:
                         "pnl": stats["total_pnl"],
                         "equity": stats["balance"] + open_staked,
                         "event": "momentum_stop_loss",
-                        "detail": f"STOP LOSS {outcome} {title[:30]} loss={loss_pct:.1f}% pnl={pnl:+.2f} (returned ${proceeds:.2f})"
+                        "detail": f"STOP LOSS {outcome} {title[:30]} drop={drop_from_peak:.1f}%peak pnl={pnl:+.2f} (returned ${proceeds:.2f})"
                     })
                 except Exception:
                     pass
