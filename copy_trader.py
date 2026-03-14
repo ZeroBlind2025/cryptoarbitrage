@@ -85,7 +85,7 @@ POLL_INTERVAL = int(os.getenv("COPY_POLL_INTERVAL", "10"))  # seconds between ch
 ALGO_STARTING_BALANCE = float(os.getenv("ALGO_STARTING_BALANCE", "2300.0"))  # Starting balance for Poly Algo
 PRICE_BUFFER_BPS = int(os.getenv("COPY_PRICE_BUFFER_BPS", "50"))  # Max overbid vs target's price (50 bps = 0.5%)
 FOLLOW_UP_COOLDOWN = int(os.getenv("COPY_FOLLOW_UP_COOLDOWN", "30"))  # seconds between re-entries into same market
-STOP_LOSS_PCT = float(os.getenv("COPY_STOP_LOSS_PCT", "35"))  # Auto-sell when position drops this % from peak (0 = disabled)
+STOP_LOSS_PCT = float(os.getenv("COPY_STOP_LOSS_PCT", "25"))  # Auto-sell when position drops this % from peak (0 = disabled)
 
 # Per-coin lot sizes ($ per copied bet, per coin)
 # Override via env: COIN_BET_BTC=1.0  COIN_BET_ETH=2.0  COIN_BET_SOL=1.0
@@ -1611,8 +1611,24 @@ def get_clob_client() -> Optional["ClobClient"]:
         print(f"[ALGO]   funder={FUNDER_ADDRESS[:6]}...{FUNDER_ADDRESS[-4:]}, sig_type={SIGNATURE_TYPE}", flush=True)
 
     try:
-        # Minimal client setup - just key + chain_id
-        # Then layer on signature_type + funder only if funder is provided
+        # Build builder_config for order attribution if credentials are set
+        builder_config = None
+        if BUILDER_ENABLED and BUILDER_API_KEY and BUILDER_API_SECRET and BUILDER_API_PASSPHRASE:
+            try:
+                from py_builder_signing_sdk.config import BuilderConfig, BuilderApiKeyCreds
+                builder_config = BuilderConfig(
+                    local_builder_creds=BuilderApiKeyCreds(
+                        key=BUILDER_API_KEY,
+                        secret=BUILDER_API_SECRET,
+                        passphrase=BUILDER_API_PASSPHRASE,
+                    ),
+                )
+                print(f"[ALGO] Builder attribution enabled (key={BUILDER_API_KEY[:12]}...)", flush=True)
+            except ImportError:
+                print("[ALGO] py_builder_signing_sdk not installed — builder attribution disabled", flush=True)
+            except Exception as e:
+                print(f"[ALGO] Builder config failed ({e}) — attribution disabled", flush=True)
+
         if FUNDER_ADDRESS:
             client = ClobClient(
                 CLOB_API,
@@ -1620,12 +1636,14 @@ def get_clob_client() -> Optional["ClobClient"]:
                 chain_id=137,
                 signature_type=SIGNATURE_TYPE,
                 funder=FUNDER_ADDRESS,
+                builder_config=builder_config,
             )
         else:
             client = ClobClient(
                 CLOB_API,
                 key=PRIVATE_KEY,
                 chain_id=137,
+                builder_config=builder_config,
             )
 
         creds = client.create_or_derive_api_creds()
