@@ -67,9 +67,12 @@ from copy_trader import (
     PRICE_BUFFER_BPS,
     ALGO_STARTING_BALANCE,
     CRYPTO_SLUGS,
+    STOP_LOSS_PCT,
+    PRICE_BUFFER_BPS,
     detect_coin,
     get_clob_client,
     place_bet,
+    place_sell,
     load_positions,
     save_positions,
     get_active_crypto_tokens,
@@ -1583,6 +1586,140 @@ class MomentumEngine:
                             print(f"[MOMENTUM] Callback error: {e}", flush=True)
 
         return entered
+
+    def check_stop_losses(self) -> int:
+        """Auto-sell momentum positions that dropped STOP_LOSS_PCT% from entry.
+
+        Uses live WebSocket bid prices. Returns number of positions stopped out.
+        """
+        if STOP_LOSS_PCT <= 0 or not self.ws:
+            return 0
+
+        open_positions = self.positions.get("open", [])
+        momentum_open = [p for p in open_positions if p.get("source") == "momentum"]
+        if not momentum_open:
+            return 0
+
+        stopped = 0
+        threshold = 1 - (STOP_LOSS_PCT / 100)  # e.g. 0.80 for 20% stop loss
+
+        for position in momentum_open[:]:  # copy — list mutated during iteration
+            entry_price = position.get("entry_price", 0)
+            token_id = position.get("token_id", "")
+            if entry_price <= 0 or not token_id:
+                continue
+
+            # Get live bid (what we'd receive if selling now)
+            live_bid, _ = self.ws.get_best_prices(token_id)
+            if not live_bid or live_bid <= 0:
+                continue
+
+            stop_price = entry_price * threshold
+            if live_bid >= stop_price:
+                continue  # price is fine
+
+            # --- STOP LOSS TRIGGERED ---
+            condition_id = position.get("condition_id", "")
+            outcome_index = position.get("outcome_index", 0)
+            shares = position.get("potential_payout", 0)
+            title = position.get("market", "Unknown")[:50]
+            outcome = position.get("outcome", "?")
+            amount_spent = position.get("amount", 0)
+            coin = detect_coin(position.get("slug", ""), title)
+            loss_pct = (1 - live_bid / entry_price) * 100
+
+            print(f"\n[MOMENTUM] *** STOP LOSS TRIGGERED ***", flush=True)
+            print(f"       Market: {title}", flush=True)
+            print(f"       {outcome} | Entry: {entry_price*100:.1f}¢ -> Now: {live_bid*100:.1f}¢ ({loss_pct:.1f}% drop)", flush=True)
+            print(f"       Stop level: {stop_price*100:.1f}¢ (-{STOP_LOSS_PCT:.0f}%)", flush=True)
+            print(f"       Selling {shares:.2f} shares", flush=True)
+
+            trade_record = {
+                "id": f"momentum_sl_{position.get('id', '')}_{int(time.time())}",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "market": title,
+                "slug": position.get("slug", ""),
+                "outcome": outcome,
+                "side": "SELL",
+                "reason": "stop_loss",
+                "shares": shares,
+                "entry_price": entry_price,
+                "stop_price": stop_price,
+                "trigger_price": live_bid,
+                "coin": coin,
+                "source": "momentum",
+            }
+
+            if self.dry_run:
+                trade_record["price"] = live_bid
+                trade_record["status"] = "dry_run"
+            else:
+                if token_id and self.client and shares > 0:
+                    buffer = PRICE_BUFFER_BPS / 10000
+                    min_price = max(live_bid * (1 - buffer), 0.01)
+                    fill = place_sell(self.client, token_id, shares, min_price=min_price)
+                    if fill.get("success"):
+                        trade_record["status"] = "filled"
+                        fill_price = fill.get("fill_price") or live_bid
+                        trade_record["price"] = fill_price
+                        print(f"       STOP LOSS SELL EXECUTED! Fill: {fill_price:.4f}", flush=True)
+                    else:
+                        print(f"       STOP LOSS SELL FAILED!", flush=True)
+                        trade_record["status"] = "failed"
+                else:
+                    trade_record["status"] = "error"
+
+            if trade_record["status"] in ["filled", "dry_run"]:
+                sell_price = trade_record.get("price", 0)
+                if sell_price > 0 and shares > 0:
+                    proceeds = sell_price * shares
+                    pnl = proceeds - amount_spent
+                else:
+                    proceeds = 0
+                    pnl = -amount_spent
+
+                position["result"] = "STOP_LOSS"
+                position["won"] = False
+                position["pnl"] = pnl
+                position["proceeds"] = proceeds
+                position["sold_at"] = trade_record["timestamp"]
+                position["sell_price"] = sell_price
+
+                try:
+                    stats = self.positions["stats"]
+                    stats["total_pnl"] = stats.get("total_pnl", 0.0) + pnl
+                    stats["balance"] = stats.get("balance", ALGO_STARTING_BALANCE) + proceeds
+                    stats["losses"] = stats.get("losses", 0) + 1
+                    open_staked = sum(p.get("amount", 0) for p in self.positions.get("open", []) if p is not position)
+                    stats.setdefault("balance_history", []).append({
+                        "timestamp": trade_record["timestamp"],
+                        "balance": stats["balance"],
+                        "pnl": stats["total_pnl"],
+                        "equity": stats["balance"] + open_staked,
+                        "event": "momentum_stop_loss",
+                        "detail": f"STOP LOSS {outcome} {title[:30]} loss={loss_pct:.1f}% pnl={pnl:+.2f} (returned ${proceeds:.2f})"
+                    })
+                except Exception:
+                    pass
+
+                if position in self.positions.get("open", []):
+                    self.positions["open"].remove(position)
+                self.positions.setdefault("resolved", []).append(position)
+                save_positions(self.positions)
+                trade_record["pnl"] = pnl
+                print(f"       Position stopped out. PnL: ${pnl:+.2f} | Proceeds: ${proceeds:.2f}", flush=True)
+                stopped += 1
+
+            if self.on_trade:
+                try:
+                    self.on_trade(trade_record)
+                except Exception as e:
+                    print(f"[MOMENTUM] Stop loss callback error: {e}", flush=True)
+
+        if stopped > 0:
+            print(f"[MOMENTUM] {stopped} position(s) stopped out", flush=True)
+
+        return stopped
 
     def check_resolutions(self):
         """Check if any momentum-sourced open positions have resolved.
