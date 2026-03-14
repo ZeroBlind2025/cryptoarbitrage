@@ -85,6 +85,7 @@ POLL_INTERVAL = int(os.getenv("COPY_POLL_INTERVAL", "10"))  # seconds between ch
 ALGO_STARTING_BALANCE = float(os.getenv("ALGO_STARTING_BALANCE", "2300.0"))  # Starting balance for Poly Algo
 PRICE_BUFFER_BPS = int(os.getenv("COPY_PRICE_BUFFER_BPS", "50"))  # Max overbid vs target's price (50 bps = 0.5%)
 FOLLOW_UP_COOLDOWN = int(os.getenv("COPY_FOLLOW_UP_COOLDOWN", "30"))  # seconds between re-entries into same market
+STOP_LOSS_PCT = float(os.getenv("COPY_STOP_LOSS_PCT", "20.0"))  # Stop loss trigger: sell when price drops this % below entry
 
 # Per-coin lot sizes ($ per copied bet, per coin)
 # Override via env: COIN_BET_BTC=1.0  COIN_BET_ETH=2.0  COIN_BET_SOL=1.0
@@ -1912,6 +1913,7 @@ class CopyTrader:
         print(f"  Filter: {'Crypto only' if self.crypto_only else 'All markets'}")
         print(f"  Poll interval: {POLL_INTERVAL}s")
         print(f"  Price buffer: {PRICE_BUFFER_BPS} bps")
+        print(f"  Stop loss: {STOP_LOSS_PCT:.0f}%")
         print("=" * 60 + "\n")
 
         if not self.dry_run:
@@ -2474,6 +2476,157 @@ class CopyTrader:
 
         return copied
 
+    def _check_stop_losses(self) -> int:
+        """Check open positions against live WS prices and trigger stop-loss sells.
+
+        A stop loss fires when the live best-bid drops to (entry_price * (1 - STOP_LOSS_PCT/100)).
+        E.g. entry at 80¢ with 20% stop → trigger at 64¢.
+
+        Returns number of positions stopped out.
+        """
+        if not self.ws:
+            return 0
+
+        open_positions = self.positions.get("open", [])
+        if not open_positions:
+            return 0
+
+        stopped = 0
+
+        for position in open_positions[:]:  # Copy list — we may remove items
+            entry_price = position.get("entry_price", 0)
+            if entry_price <= 0:
+                continue
+
+            token_id = position.get("token_id", "")
+            if not token_id:
+                continue
+
+            # Get live bid from WebSocket
+            ws_bid, _ = self.ws.get_best_prices(token_id)
+            if not ws_bid or ws_bid <= 0:
+                continue
+
+            # Calculate stop-loss trigger price
+            stop_price = entry_price * (1.0 - STOP_LOSS_PCT / 100.0)
+
+            if ws_bid > stop_price:
+                continue  # Price is fine — no stop loss needed
+
+            # --- STOP LOSS TRIGGERED ---
+            shares = position.get("potential_payout", 0)
+            amount_spent = position.get("amount", 0)
+            title = position.get("market", "Unknown")[:50]
+            outcome = position.get("outcome", "?")
+            condition_id = position.get("condition_id", "")
+            outcome_index = position.get("outcome_index", 0)
+            market_key = (condition_id, outcome_index)
+            coin = detect_coin(position.get("slug", ""), title)
+
+            pct_drop = ((entry_price - ws_bid) / entry_price) * 100
+            print(f"\n[ALGO] *** STOP LOSS TRIGGERED ***")
+            print(f"       Market: {title}")
+            print(f"       {outcome} | Entry: {entry_price*100:.1f}¢ → Now: {ws_bid*100:.1f}¢ ({pct_drop:.1f}% drop)")
+            print(f"       Stop level: {stop_price*100:.1f}¢ (−{STOP_LOSS_PCT:.0f}%)")
+
+            trade_record = {
+                "id": f"stop_loss_{position.get('id', '')}_{int(time.time())}",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "market": title,
+                "slug": position.get("slug", ""),
+                "outcome": outcome,
+                "side": "SELL",
+                "reason": "stop_loss",
+                "shares": shares,
+                "entry_price": entry_price,
+                "stop_price": stop_price,
+                "trigger_price": ws_bid,
+                "coin": coin,
+                "source": position.get("source", "copy_trader"),
+            }
+
+            if self.dry_run:
+                trade_record["price"] = ws_bid
+                trade_record["status"] = "dry_run"
+            else:
+                if token_id and self.client and shares > 0:
+                    fill = place_sell(self.client, token_id, shares, min_price=0)
+                    if fill.get("success"):
+                        trade_record["status"] = "filled"
+                        fill_price = fill.get("fill_price") or ws_bid
+                        trade_record["price"] = fill_price
+                        print(f"       STOP LOSS SELL EXECUTED! Fill: {fill_price:.4f}")
+                    else:
+                        print(f"       STOP LOSS SELL FAILED!")
+                        trade_record["status"] = "failed"
+                else:
+                    trade_record["status"] = "error"
+
+            # Close position and record PnL
+            if trade_record["status"] in ["filled", "dry_run"]:
+                sell_price = trade_record.get("price", 0)
+                if sell_price > 0 and shares > 0:
+                    proceeds = sell_price * shares
+                    pnl = proceeds - amount_spent
+                else:
+                    proceeds = 0
+                    pnl = -amount_spent
+
+                position["result"] = "STOP_LOSS"
+                position["pnl"] = pnl
+                position["sold_at"] = trade_record["timestamp"]
+                position["sell_price"] = sell_price
+                position["stop_loss_pct"] = STOP_LOSS_PCT
+
+                # Update stats
+                try:
+                    stats = self.positions["stats"]
+                    stats["total_pnl"] = stats.get("total_pnl", 0.0) + pnl
+                    stats["balance"] = stats.get("balance", ALGO_STARTING_BALANCE) + proceeds
+                    stats["losses"] = stats.get("losses", 0) + 1
+                    stats["stop_losses"] = stats.get("stop_losses", 0) + 1
+                    open_staked = sum(p.get("amount", 0) for p in self.positions.get("open", []) if p is not position)
+                    stats.setdefault("balance_history", []).append({
+                        "timestamp": trade_record["timestamp"],
+                        "balance": stats["balance"],
+                        "pnl": stats["total_pnl"],
+                        "equity": stats["balance"] + open_staked,
+                        "event": "stop_loss",
+                        "detail": f"STOP LOSS {outcome} {title[:30]} pnl={pnl:+.2f}"
+                    })
+                except Exception:
+                    pass
+
+                if position in self.positions.get("open", []):
+                    self.positions["open"].remove(position)
+                if market_key in self.entered_markets:
+                    del self.entered_markets[market_key]
+                if market_key in self.market_entry_count:
+                    del self.market_entry_count[market_key]
+                self.positions.setdefault("resolved", []).append(position)
+                save_positions(self.positions)
+                trade_record["pnl"] = pnl
+                print(f"       Position closed. PnL: ${pnl:+.2f} | Proceeds: ${proceeds:.2f} | Balance: ${self.positions['stats'].get('balance', 0):.2f}")
+                stopped += 1
+
+            self.trade_history.append(trade_record)
+            _log_copy_trade(
+                "dry_run_stop_loss" if trade_record["status"] == "dry_run" else
+                "stop_loss" if trade_record["status"] == "filled" else "failed_stop_loss",
+                {k: v for k, v in trade_record.items() if k != "id"}
+            )
+            if self.on_trade:
+                try:
+                    self.on_trade(trade_record)
+                except Exception as e:
+                    print(f"[ALGO] Stop loss callback error: {e}")
+
+        if stopped > 0:
+            stats = self.positions.get("stats", {})
+            print(f"[ALGO] {stopped} position(s) stopped out. Balance: ${stats.get('balance', 0):.2f} | Equity: ${stats.get('balance', 0) + sum(p.get('amount', 0) for p in self.positions.get('open', [])):.2f}")
+
+        return stopped
+
     def run_once(self):
         """Single check iteration"""
         self.start()
@@ -2510,6 +2663,9 @@ class CopyTrader:
                 copied = self.check_and_copy()
                 if copied > 0:
                     print(f"[ALGO] Copied {copied} trade(s) this cycle")
+
+                # Check stop losses on every tick (WS prices are live)
+                self._check_stop_losses()
 
                 # Periodically check for resolved positions
                 self.check_resolutions()
