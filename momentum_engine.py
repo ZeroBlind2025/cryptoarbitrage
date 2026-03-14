@@ -889,14 +889,17 @@ class MomentumEngine:
     def start(self):
         """Initialize the momentum engine."""
 
+        # No entry delays, no cooldowns, no re-entry min price gate, no probe sizing
+        # (applies to both demo and live — live is a 1:1 copy of demo behavior)
+        self._dry_run_no_delays = True
+        self._dry_run_no_probe = True
+
         # --- DRY RUN OVERRIDES ---
-        # Wider price range, no delays/cooldowns, no probe sizing
+        # Wider price range for backtesting
         if self.dry_run:
             self.min_entry_price = 0.85
             self.max_entry_price = 0.989
             self.interval_price_brackets = {}  # use global range for all intervals
-            self._dry_run_no_delays = True      # flag checked in scan loop
-            self._dry_run_no_probe = True       # use full lot size, no probe
 
         balance = self.positions.get("stats", {}).get("balance", ALGO_STARTING_BALANCE)
         lot_sizes = ", ".join(f"{c.upper()}=${a}" for c, a in sorted(self.coin_bet_amounts.items()))
@@ -912,9 +915,8 @@ class MomentumEngine:
             if other:
                 print(f"    {', '.join(other)}: global range ({self.min_entry_price*100:.0f}-{self.max_entry_price*100:.0f}¢)")
         print(f"  Re-entry: upward only (current > last buy)")
-        if self.dry_run:
-            print(f"  Delays/cooldowns: DISABLED (dry run)")
-            print(f"  Probe sizing: DISABLED (using dashboard lot sizes)")
+        print(f"  Delays/cooldowns: DISABLED")
+        print(f"  Probe sizing: DISABLED (using dashboard lot sizes)")
         print(f"  Lot sizes: {lot_sizes} (default: ${self.bet_amount})")
         print(f"  Balance: ${balance:.2f}")
         print(f"  Mode: {'DRY RUN' if self.dry_run else 'LIVE'}")
@@ -1549,6 +1551,7 @@ class MomentumEngine:
                         "market": title,
                         "slug": slug,
                         "interval": market.get("interval", ""),
+                        "end_date": end_date.isoformat() if end_date else None,
                         "entry_price": price,
                         "amount": trade_amount,
                         "potential_payout": trade_amount / price if price > 0 else 0,
@@ -1794,14 +1797,21 @@ class MomentumEngine:
 
             if not result or not result.get("resolved"):
                 # Fallback: use live WebSocket price for resolution
-                # If price has hit an extreme (≤0.02 or ≥0.98), the market
-                # has effectively settled even if the API hasn't flagged it.
-                # This is critical for 60m markets which were never in the
-                # copy trader and may not resolve via target-trader checks.
+                # Only trigger in the final 10 seconds of a market to avoid
+                # false wins/losses from mid-window price spikes to 99¢.
                 live_price = self.get_live_price(token_id) if token_id else None
-                if live_price is not None and (live_price >= 0.98 or live_price <= 0.02):
+                _in_final_seconds = False
+                end_date_str = position.get("end_date")
+                if end_date_str:
+                    try:
+                        end_dt = datetime.fromisoformat(end_date_str) if isinstance(end_date_str, str) else end_date_str
+                        secs_left = (end_dt - datetime.now(timezone.utc)).total_seconds()
+                        _in_final_seconds = secs_left <= 10
+                    except Exception:
+                        pass
+                if _in_final_seconds and live_price is not None and (live_price >= 0.98 or live_price <= 0.02):
                     our_token_won = live_price >= 0.98
-                    print(f"[MOMENTUM] Price-based resolution: {position['market'][:30]} "
+                    print(f"[MOMENTUM] Price-based resolution (final 10s): {position['market'][:30]} "
                           f"| price={live_price:.4f} → {'WIN' if our_token_won else 'LOSS'}", flush=True)
                     result = {
                         "resolved": True,
