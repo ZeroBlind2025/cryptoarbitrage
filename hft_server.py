@@ -124,6 +124,7 @@ except Exception as e:
 momentum_engine: Optional["MomentumEngine"] = None
 momentum_thread: Optional[threading.Thread] = None
 stop_momentum = threading.Event()
+momentum_paused = threading.Event()  # When set, skip new scans but keep resolution running
 momentum_trades: deque = deque(maxlen=500)
 
 
@@ -239,8 +240,9 @@ def discover_markets() -> list[dict]:
     GAMMA_API = "https://gamma-api.polymarket.com"
     SPORTS_TAG_ID = 100639
 
-    # 15-minute market cryptos
+    # Crypto coin abbreviations and their full Polymarket slug names
     CRYPTO_SYMBOLS = ["btc", "eth", "sol", "xrp"]
+    COIN_FULL_NAMES = {"btc": "bitcoin", "eth": "ethereum", "sol": "solana", "xrp": "xrp"}
 
     markets = []
     crypto_found = 0
@@ -251,56 +253,64 @@ def discover_markets() -> list[dict]:
         current_ts = int(now.timestamp())
 
         # ============================================================
-        # FETCH CRYPTO 15-MIN MARKETS
+        # FETCH CRYPTO 5-MIN MARKETS (15m disabled)
         # ============================================================
-        print("[HFT] Searching for 15-min crypto markets...", flush=True)
+        print("[HFT] Searching for 5-min crypto markets...", flush=True)
 
-        # Generate timestamps for current and upcoming 15-min windows
-        # Round down to nearest 15 minutes
-        base_ts = (current_ts // 900) * 900  # 900 seconds = 15 minutes
+        # Generate timestamps for current and upcoming 5-min windows
+        # Round down to nearest 5 minutes
+        base_ts = (current_ts // 300) * 300  # 300 seconds = 5 minutes
 
         # Try multiple time offsets to catch active markets
         timestamps_to_try = [
             base_ts,          # Current window
-            base_ts + 900,    # Next window
-            base_ts + 1800,   # +30 min
-            base_ts - 900,    # Previous (might still be active)
-            base_ts - 1800,   # 2 windows back (settling)
+            base_ts + 300,    # Next window
+            base_ts + 600,    # +10 min
+            base_ts - 300,    # Previous (might still be active)
+            base_ts - 600,    # 2 windows back (settling)
         ]
 
-        # Search for each crypto symbol
+        # Search for each crypto symbol (try both full name and abbreviation)
         for symbol in CRYPTO_SYMBOLS:
+            full_name = COIN_FULL_NAMES.get(symbol, symbol)
             for ts in timestamps_to_try:
-                slug_pattern = f"{symbol}-updown-15m-{ts}"
+                # Polymarket uses full coin names in slugs (e.g. bitcoin-updown-5m-{ts})
+                slug_pattern = f"{full_name}-updown-5m-{ts}"
 
-                try:
-                    resp = requests.get(
-                        f"{GAMMA_API}/markets",
-                        params={"slug": slug_pattern},
-                        timeout=10
-                    )
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        if isinstance(data, list) and data:
-                            for raw in data:
-                                market_data = parse_market_data(raw)
-                                if market_data:
-                                    # Calculate minutes until resolution
-                                    end_ts = ts + 900  # 15 min after start
-                                    minutes_until = (end_ts - current_ts) / 60
-                                    if minutes_until > 0:
-                                        market_data["category"] = "crypto"
-                                        market_data["minutes_until"] = minutes_until
-                                        markets.append(market_data)
-                                        crypto_found += 1
-                                        print(f"[HFT] Found crypto: {slug_pattern} ({minutes_until:.1f}m)", flush=True)
-                except:
-                    pass
+                # Try both full name and abbreviated slugs
+                slug_variants = [slug_pattern]
+                if full_name != symbol:
+                    slug_variants.append(f"{symbol}-updown-5m-{ts}")
+
+                for sv in slug_variants:
+                    try:
+                        resp = requests.get(
+                            f"{GAMMA_API}/markets",
+                            params={"slug": sv},
+                            timeout=10
+                        )
+                        if resp.status_code == 200:
+                            data = resp.json()
+                            if isinstance(data, list) and data:
+                                for raw in data:
+                                    market_data = parse_market_data(raw)
+                                    if market_data:
+                                        # Calculate minutes until resolution
+                                        end_ts = ts + 300  # 5 min after start
+                                        minutes_until = (end_ts - current_ts) / 60
+                                        if minutes_until > 0:
+                                            market_data["category"] = "crypto"
+                                            market_data["minutes_until"] = minutes_until
+                                            markets.append(market_data)
+                                            crypto_found += 1
+                                            print(f"[HFT] Found crypto: {sv} ({minutes_until:.1f}m)", flush=True)
+                    except:
+                        pass
 
                 # Small delay to avoid rate limiting
                 time_module.sleep(0.05)
 
-        # Also try a general search for "updown-15m" patterns
+        # Also try a general search for "updown" patterns (excluding 15m)
         try:
             resp = requests.get(
                 f"{GAMMA_API}/markets",
@@ -315,7 +325,7 @@ def discover_markets() -> list[dict]:
                 all_markets = resp.json()
                 for raw in all_markets:
                     slug = raw.get("slug", "")
-                    if "updown" in slug.lower() or "up-or-down" in slug.lower():
+                    if ("updown" in slug.lower() or "up-or-down" in slug.lower()) and "-15m-" not in slug.lower():
                         # Check if we already have this market
                         if not any(m["slug"] == slug for m in markets):
                             market_data = parse_market_data(raw)
@@ -338,7 +348,7 @@ def discover_markets() -> list[dict]:
         except Exception as e:
             print(f"[HFT] General scan error: {e}", flush=True)
 
-        print(f"[HFT] Crypto 15m markets found: {crypto_found}", flush=True)
+        print(f"[HFT] Crypto markets found (15m disabled): {crypto_found}", flush=True)
 
         # ============================================================
         # SPORTS MARKETS DISABLED — momentum engine only uses crypto
@@ -1355,12 +1365,67 @@ def copy_trader_loop():
 
 @app.route('/api/copy-trader/start', methods=['POST'])
 def api_copy_trader_start():
-    """Start copy trading — DISABLED: copy trader is disabled to prevent
-    uncontrolled trading. Use momentum engine instead."""
+    """Start copy trading in dry run mode only.
+    Live copy trading remains disabled — use momentum engine for live."""
+    global copy_trader, copy_trader_thread, stop_copy_trader, copy_trader_paused
+
+    if not HAS_COPY_TRADER:
+        return jsonify({"error": "Copy trader module not available"}), 400
+
+    data = request.get_json() or {}
+    live_mode = data.get('live', False)
+
+    # Only allow dry run mode for copy trader
+    if live_mode:
+        return jsonify({
+            "error": "Copy trader is disabled for live trading",
+            "message": "Copy trader only runs in dry run mode. Use momentum engine for live trading."
+        }), 403
+
+    if copy_trader_thread and copy_trader_thread.is_alive():
+        return jsonify({"error": "Copy trader already running"}), 400
+
+    try:
+        bet_amount = data.get('bet_amount')
+        coin_bet_amounts = data.get('coin_bet_amounts')
+
+        # Share coin bet amounts from momentum engine if available
+        if not coin_bet_amounts and momentum_engine:
+            coin_bet_amounts = dict(momentum_engine.coin_bet_amounts)
+        if not bet_amount and momentum_engine:
+            bet_amount = momentum_engine.bet_amount
+
+        copy_trader = CopyTrader(
+            dry_run=True,
+            crypto_only=True,
+            on_trade=on_copy_trade,
+        )
+        if bet_amount:
+            copy_trader.bet_amount = float(bet_amount)
+        if coin_bet_amounts:
+            copy_trader.coin_bet_amounts = {k: float(v) for k, v in coin_bet_amounts.items()}
+
+        # Share positions with momentum engine
+        if momentum_engine:
+            copy_trader.positions = momentum_engine.positions
+
+        copy_trader.start()
+    except Exception as e:
+        print(f"[SERVER] Failed to start copy trader: {e}")
+        import traceback; traceback.print_exc()
+        copy_trader = None
+        return jsonify({"error": f"Failed to start: {e}"}), 500
+
+    stop_copy_trader.clear()
+    copy_trader_paused.clear()
+    copy_trader_thread = threading.Thread(target=copy_trader_loop, daemon=True)
+    copy_trader_thread.start()
+
     return jsonify({
-        "error": "Copy trader is disabled",
-        "message": "Copy trader has been disabled on the backend. Use the momentum engine instead."
-    }), 403
+        "success": True,
+        "message": "Copy trader started in DRY RUN mode",
+        "mode": "dry_run",
+    })
 
 
 @app.route('/api/copy-trader/stop', methods=['POST'])
@@ -1927,18 +1992,21 @@ def momentum_loop():
         try:
             loop_count += 1
 
-            entered = momentum_engine.scan_and_trade()
-            if entered > 0:
-                print(f"[MOMENTUM] Entered {entered} trade(s)", flush=True)
+            # Only scan for new trades if NOT paused
+            if not momentum_paused.is_set():
+                entered = momentum_engine.scan_and_trade()
+                if entered > 0:
+                    print(f"[MOMENTUM] Entered {entered} trade(s)", flush=True)
 
-            # Always check resolutions
+            # Always check resolutions (even when paused)
             momentum_engine.check_resolutions()
 
             # Heartbeat every ~5 min
             heartbeat_every = max(1, 300 // poll_s)
             if loop_count % heartbeat_every == 0:
                 stats = momentum_engine.get_stats()
-                print(f"[MOMENTUM] Heartbeat #{loop_count}: "
+                paused_label = "PAUSED" if momentum_paused.is_set() else "ACTIVE"
+                print(f"[MOMENTUM] Heartbeat #{loop_count}: {paused_label} | "
                       f"{stats['open_positions']} open | "
                       f"{stats['trades_entered']} entered | "
                       f"{stats['scans_completed']} scans", flush=True)
@@ -2000,14 +2068,16 @@ def api_momentum_start():
         momentum_engine = None
         return jsonify({"error": f"Failed to start: {e}"}), 500
 
-    # Auto-pause copy trader when momentum is active
+    # Auto-pause copy trader when momentum is active (only in live mode)
+    # In dry run mode, both copy trader and momentum engine run together
     copy_trader_was_active = False
-    if copy_trader_thread and copy_trader_thread.is_alive() and not copy_trader_paused.is_set():
+    if live_mode and copy_trader_thread and copy_trader_thread.is_alive() and not copy_trader_paused.is_set():
         copy_trader_paused.set()
         copy_trader_was_active = True
         print("[MOMENTUM] Auto-paused copy trader polling (resolutions still running)", flush=True)
 
     stop_momentum.clear()
+    momentum_paused.clear()
     momentum_thread = threading.Thread(target=momentum_loop, daemon=True)
     momentum_thread.start()
 
@@ -2052,6 +2122,48 @@ def api_momentum_stop():
     })
 
 
+@app.route('/api/momentum/pause', methods=['POST'])
+def api_momentum_pause():
+    """Pause momentum engine - stops new scans but keeps resolution running"""
+    global momentum_paused
+
+    if not momentum_thread or not momentum_thread.is_alive():
+        return jsonify({"error": "Momentum engine not running"}), 400
+
+    if momentum_paused.is_set():
+        return jsonify({"error": "Already paused"}), 400
+
+    momentum_paused.set()
+    open_count = len(momentum_engine.positions.get("open", [])) if momentum_engine else 0
+    print(f"[MOMENTUM] PAUSED - No new scans. Resolution engine still running for {open_count} open positions.", flush=True)
+
+    return jsonify({
+        "success": True,
+        "message": f"Paused. Resolution engine running for {open_count} open position(s).",
+        "open_positions": open_count,
+    })
+
+
+@app.route('/api/momentum/resume', methods=['POST'])
+def api_momentum_resume():
+    """Resume momentum engine scanning"""
+    global momentum_paused
+
+    if not momentum_thread or not momentum_thread.is_alive():
+        return jsonify({"error": "Momentum engine not running"}), 400
+
+    if not momentum_paused.is_set():
+        return jsonify({"error": "Not paused"}), 400
+
+    momentum_paused.clear()
+    print(f"[MOMENTUM] RESUMED - Now scanning for new trades again.", flush=True)
+
+    return jsonify({
+        "success": True,
+        "message": "Momentum engine resumed",
+    })
+
+
 @app.route('/api/momentum/status')
 def api_momentum_status():
     """Get momentum engine status"""
@@ -2059,7 +2171,7 @@ def api_momentum_status():
         return jsonify({"available": False, "running": False, "error": "Module not available"})
 
     running = momentum_thread and momentum_thread.is_alive()
-    status = {"available": True, "running": running}
+    status = {"available": True, "running": running, "paused": momentum_paused.is_set() if running else False}
 
     if momentum_engine:
         status.update(momentum_engine.get_stats())
@@ -2295,8 +2407,10 @@ def _get_momentum_data() -> dict:
         "paused_coins": [], "dry_run": True,
         "active_entries": {},
     }
+    running = momentum_thread and momentum_thread.is_alive()
     base = {
-        "running": momentum_thread and momentum_thread.is_alive(),
+        "running": running,
+        "paused": momentum_paused.is_set() if running else False,
     }
     try:
         if momentum_engine:

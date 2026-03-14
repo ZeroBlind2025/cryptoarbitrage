@@ -66,7 +66,7 @@ CRYPTO_KEYWORDS = [
     "bitcoin", "btc", "ethereum", "eth", "solana", "sol", "xrp", "ripple",
 ]
 UPDOWN_KEYWORDS = ["up or down", "updown", "up-or-down"]
-INTERVALS = ["5m", "15m", "30m", "60m", "1h"]
+INTERVALS = ["5m", "30m", "60m", "1h"]
 
 
 # =============================================================================
@@ -159,7 +159,6 @@ class MarketDiscovery:
         # Interval configs: (slug_tag, seconds_per_window)
         interval_configs = [
             ("5m", 300),
-            ("15m", 900),
             ("30m", 1800),
             ("1h", 3600),
         ]
@@ -373,7 +372,7 @@ class MarketDiscovery:
         now_ts = int(time.time())
 
         interval_configs = [
-            ("5m", 300), ("15m", 900), ("30m", 1800), ("1h", 3600),
+            ("5m", 300), ("30m", 1800), ("1h", 3600),
         ]
 
         searches = 0
@@ -407,7 +406,7 @@ class MarketDiscovery:
 
         # Also try slug_contains for partial matches
         slug_terms = [
-            "updown-5m", "updown-15m", "updown-30m", "updown-1h",
+            "updown-5m", "updown-30m", "updown-1h",
             "bitcoin-updown", "ethereum-updown", "solana-updown", "xrp-updown",
             "up-or-down",
         ]
@@ -646,7 +645,7 @@ class MarketDiscovery:
             if p1.upper() == "AM" and h1 == 12: h1 = 0
             if p2.upper() == "AM" and h2 == 12: h2 = 0
             diff = (h2 * 60 + m2) - (h1 * 60 + m1)
-            interval_map = {5: "5m", 15: "15m", 30: "30m", 60: "60m"}
+            interval_map = {5: "5m", 30: "30m", 60: "60m"}
             if diff in interval_map:
                 return interval_map[diff]
 
