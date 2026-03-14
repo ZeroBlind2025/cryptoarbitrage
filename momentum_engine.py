@@ -1957,6 +1957,8 @@ class MomentumEngine:
         m_wins = 0
         m_losses = 0
         m_stop_losses = 0
+        m_sl_proceeds = 0.0
+        m_sl_spent = 0.0
         m_total_pnl = 0.0
         for p in momentum_resolved:
             pnl = p.get("pnl", 0)
@@ -1967,6 +1969,8 @@ class MomentumEngine:
                 m_losses += 1
             if p.get("result") == "STOP_LOSS":
                 m_stop_losses += 1
+                m_sl_proceeds += float(p.get("proceeds", 0) or 0)
+                m_sl_spent += float(p.get("amount", 0) or 0)
             m_total_pnl += float(pnl) if pnl else 0.0
 
         m_total = m_wins + m_losses
@@ -2017,6 +2021,8 @@ class MomentumEngine:
             "wins": m_wins,
             "losses": m_losses,
             "stop_losses": m_stop_losses,
+            "sl_proceeds": m_sl_proceeds,
+            "sl_spent": m_sl_spent,
             "total_pnl": m_total_pnl,
             "win_rate": m_win_rate,
             "open_staked": m_open_staked,

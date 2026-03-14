@@ -2392,8 +2392,13 @@ class CopyTrader:
                 position["result"] = "STOP_LOSS"
                 position["won"] = False
                 position["pnl"] = pnl
+                position["proceeds"] = proceeds
                 position["sold_at"] = trade_record["timestamp"]
                 position["sell_price"] = sell_price
+
+                # Use momentum-prefixed event so it appears in momentum balance chart
+                pos_source = position.get("source", "copy_trader")
+                event_name = "momentum_stop_loss" if pos_source == "momentum" else "stop_loss"
 
                 try:
                     stats = self.positions["stats"]
@@ -2406,8 +2411,8 @@ class CopyTrader:
                         "balance": stats["balance"],
                         "pnl": stats["total_pnl"],
                         "equity": stats["balance"] + open_staked,
-                        "event": "stop_loss",
-                        "detail": f"STOP LOSS {outcome} {title[:30]} loss={loss_pct:.1f}% pnl={pnl:+.2f}"
+                        "event": event_name,
+                        "detail": f"STOP LOSS {outcome} {title[:30]} loss={loss_pct:.1f}% pnl={pnl:+.2f} (returned ${proceeds:.2f})"
                     })
                 except Exception:
                     pass
