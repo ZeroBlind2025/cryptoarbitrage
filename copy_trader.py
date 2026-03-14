@@ -2390,6 +2390,7 @@ class CopyTrader:
                     pnl = -amount_spent
 
                 position["result"] = "STOP_LOSS"
+                position["won"] = False
                 position["pnl"] = pnl
                 position["sold_at"] = trade_record["timestamp"]
                 position["sell_price"] = sell_price

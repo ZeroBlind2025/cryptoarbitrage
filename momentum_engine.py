@@ -1956,6 +1956,7 @@ class MomentumEngine:
         # Compute momentum-specific P&L from resolved positions
         m_wins = 0
         m_losses = 0
+        m_stop_losses = 0
         m_total_pnl = 0.0
         for p in momentum_resolved:
             pnl = p.get("pnl", 0)
@@ -1964,6 +1965,8 @@ class MomentumEngine:
                 m_wins += 1
             elif won is False:
                 m_losses += 1
+            if p.get("result") == "STOP_LOSS":
+                m_stop_losses += 1
             m_total_pnl += float(pnl) if pnl else 0.0
 
         m_total = m_wins + m_losses
@@ -2013,6 +2016,7 @@ class MomentumEngine:
             "resolved_positions": len(momentum_resolved),
             "wins": m_wins,
             "losses": m_losses,
+            "stop_losses": m_stop_losses,
             "total_pnl": m_total_pnl,
             "win_rate": m_win_rate,
             "open_staked": m_open_staked,

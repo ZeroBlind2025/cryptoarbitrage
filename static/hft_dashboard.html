@@ -1419,6 +1419,11 @@
                                                         <p className="text-xs font-mono text-slate-400">
                                                             {(momentum.win_rate || 0).toFixed(1)}%
                                                         </p>
+                                                        {(momentum.stop_losses || 0) > 0 && (
+                                                            <p className="text-xs font-mono text-yellow-400 mt-0.5">
+                                                                {momentum.stop_losses} stop loss{momentum.stop_losses !== 1 ? 'es' : ''}
+                                                            </p>
+                                                        )}
                                                     </div>
                                                 </div>
                                                 {momentum.open_staked > 0 && (
