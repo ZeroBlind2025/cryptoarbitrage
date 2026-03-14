@@ -1442,9 +1442,6 @@
                                             </div>
                                         )}
 
-                                        {/* Balance Chart */}
-                                        <BalanceChart history={momentum.balance_history || []} />
-
                                         {/* Per-Coin Performance for Momentum */}
                                         <CoinROI coinRoi={momentum.coin_roi} copyTrader={momentum} fetchData={fetchData} apiPrefix="/api/momentum" />
                                     </div>
