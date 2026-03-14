@@ -1998,7 +1998,8 @@ def momentum_loop():
                 if entered > 0:
                     print(f"[MOMENTUM] Entered {entered} trade(s)", flush=True)
 
-            # Always check resolutions (even when paused)
+            # Always check stop losses and resolutions (even when paused)
+            momentum_engine.check_stop_losses()
             momentum_engine.check_resolutions()
 
             # Heartbeat every ~5 min
