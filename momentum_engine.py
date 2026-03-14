@@ -1592,7 +1592,10 @@ class MomentumEngine:
 
         Uses live WebSocket bid prices. Returns number of positions stopped out.
         """
-        if STOP_LOSS_PCT <= 0 or not self.ws:
+        if STOP_LOSS_PCT <= 0:
+            return 0
+        if not self.ws:
+            print("[MOMENTUM] SL check skipped: no WebSocket", flush=True)
             return 0
 
         open_positions = self.positions.get("open", [])
@@ -1602,6 +1605,7 @@ class MomentumEngine:
 
         stopped = 0
         threshold = 1 - (STOP_LOSS_PCT / 100)  # e.g. 0.80 for 20% stop loss
+        no_price_count = 0
 
         for position in momentum_open[:]:  # copy — list mutated during iteration
             entry_price = position.get("entry_price", 0)
@@ -1609,13 +1613,15 @@ class MomentumEngine:
             if entry_price <= 0 or not token_id:
                 continue
 
-            # Get live bid (what we'd receive if selling now)
-            live_bid, _ = self.ws.get_best_prices(token_id)
-            if not live_bid or live_bid <= 0:
+            # Get live price — use ask (same as get_live_price) since bids
+            # are often empty in short-term crypto prediction markets.
+            live_price = self.get_live_price(token_id)
+            if not live_price or live_price <= 0:
+                no_price_count += 1
                 continue
 
             stop_price = entry_price * threshold
-            if live_bid >= stop_price:
+            if live_price >= stop_price:
                 continue  # price is fine
 
             # --- STOP LOSS TRIGGERED ---
@@ -1626,11 +1632,11 @@ class MomentumEngine:
             outcome = position.get("outcome", "?")
             amount_spent = position.get("amount", 0)
             coin = detect_coin(position.get("slug", ""), title)
-            loss_pct = (1 - live_bid / entry_price) * 100
+            loss_pct = (1 - live_price / entry_price) * 100
 
             print(f"\n[MOMENTUM] *** STOP LOSS TRIGGERED ***", flush=True)
             print(f"       Market: {title}", flush=True)
-            print(f"       {outcome} | Entry: {entry_price*100:.1f}¢ -> Now: {live_bid*100:.1f}¢ ({loss_pct:.1f}% drop)", flush=True)
+            print(f"       {outcome} | Entry: {entry_price*100:.1f}¢ -> Now: {live_price*100:.1f}¢ ({loss_pct:.1f}% drop)", flush=True)
             print(f"       Stop level: {stop_price*100:.1f}¢ (-{STOP_LOSS_PCT:.0f}%)", flush=True)
             print(f"       Selling {shares:.2f} shares", flush=True)
 
@@ -1645,22 +1651,22 @@ class MomentumEngine:
                 "shares": shares,
                 "entry_price": entry_price,
                 "stop_price": stop_price,
-                "trigger_price": live_bid,
+                "trigger_price": live_price,
                 "coin": coin,
                 "source": "momentum",
             }
 
             if self.dry_run:
-                trade_record["price"] = live_bid
+                trade_record["price"] = live_price
                 trade_record["status"] = "dry_run"
             else:
                 if token_id and self.client and shares > 0:
                     buffer = PRICE_BUFFER_BPS / 10000
-                    min_price = max(live_bid * (1 - buffer), 0.01)
+                    min_price = max(live_price * (1 - buffer), 0.01)
                     fill = place_sell(self.client, token_id, shares, min_price=min_price)
                     if fill.get("success"):
                         trade_record["status"] = "filled"
-                        fill_price = fill.get("fill_price") or live_bid
+                        fill_price = fill.get("fill_price") or live_price
                         trade_record["price"] = fill_price
                         print(f"       STOP LOSS SELL EXECUTED! Fill: {fill_price:.4f}", flush=True)
                     else:
@@ -1718,6 +1724,8 @@ class MomentumEngine:
 
         if stopped > 0:
             print(f"[MOMENTUM] {stopped} position(s) stopped out", flush=True)
+        elif no_price_count > 0:
+            print(f"[MOMENTUM] SL check: {len(momentum_open)} positions, {no_price_count} had no live price", flush=True)
 
         return stopped
 
