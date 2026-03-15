@@ -1617,18 +1617,6 @@ class MomentumEngine:
             if entry_price <= 0 or not token_id:
                 continue
 
-            # Only enforce stop loss in the final 30 seconds of a market
-            # to avoid getting stopped out by normal mid-window volatility.
-            end_date_str = position.get("end_date")
-            if end_date_str:
-                try:
-                    end_dt = datetime.fromisoformat(end_date_str) if isinstance(end_date_str, str) else end_date_str
-                    secs_left = (end_dt - datetime.now(timezone.utc)).total_seconds()
-                    if secs_left > 30:
-                        continue
-                except Exception:
-                    pass
-
             # Get live price — use ask (same as get_live_price) since bids
             # are often empty in short-term crypto prediction markets.
             live_price = self.get_live_price(token_id)
