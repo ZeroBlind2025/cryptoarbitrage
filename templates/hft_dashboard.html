@@ -1388,7 +1388,7 @@
                                                             {(momentum.win_rate || 0).toFixed(1)}%
                                                         </p>
                                                         <p className="text-xs font-mono text-yellow-400 mt-0.5" title={`Staked $${(momentum.sl_spent || 0).toFixed(2)}, recovered $${(momentum.sl_proceeds || 0).toFixed(2)}`}>
-                                                            {momentum.stop_losses || 0} SL {(momentum.sl_proceeds || 0) > 0 ? `(recovered $${(momentum.sl_proceeds || 0).toFixed(2)})` : ''}
+                                                            {momentum.stop_losses || 0} SL {(momentum.sl_spent || 0) > 0 ? `(lost $${((momentum.sl_spent || 0) - (momentum.sl_proceeds || 0)).toFixed(2)}, recovered $${(momentum.sl_proceeds || 0).toFixed(2)})` : ''}
                                                         </p>
                                                     </div>
                                                 </div>
@@ -1419,7 +1419,7 @@
                                         <div className="flex justify-between">
                                             <span className="text-yellow-400">Stop Losses</span>
                                             <span className="text-yellow-400 font-mono" title={`Staked $${(momentum.sl_spent || 0).toFixed(2)}, recovered $${(momentum.sl_proceeds || 0).toFixed(2)}`}>
-                                                {momentum.stop_losses || 0}{(momentum.sl_proceeds || 0) > 0 ? ` (saved $${(momentum.sl_proceeds || 0).toFixed(2)})` : ''}
+                                                {momentum.stop_losses || 0}{(momentum.sl_spent || 0) > 0 ? ` (lost $${((momentum.sl_spent || 0) - (momentum.sl_proceeds || 0)).toFixed(2)}, recovered $${(momentum.sl_proceeds || 0).toFixed(2)})` : ''}
                                             </span>
                                         </div>
                                         <div className="flex justify-between">
