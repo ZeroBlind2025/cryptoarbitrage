@@ -2502,10 +2502,23 @@ class CopyTrader:
         stopped = 0
         threshold = 1 - (STOP_LOSS_PCT / 100)  # e.g. 0.80 for 20% stop loss
 
+        # Build set of condition_ids that are fully hedged (both sides held)
+        hedged_cids: set = set()
+        for p in open_positions:
+            if p.get("source") == "arb_hedge":
+                cid = p.get("condition_id", "")
+                if cid:
+                    hedged_cids.add(cid)
+
         for position in open_positions[:]:  # copy — list mutated during iteration
             entry_price = position.get("entry_price", 0)
             token_id = position.get("token_id", "")
             if entry_price <= 0 or not token_id:
+                continue
+
+            # Skip hedged positions — both sides locked in, SL would break the arb
+            cid = position.get("condition_id", "")
+            if cid and cid in hedged_cids:
                 continue
 
             # Get live bid (what we'd actually receive if selling now)

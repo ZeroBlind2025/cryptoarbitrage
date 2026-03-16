@@ -1703,6 +1703,11 @@ class MomentumEngine:
             if entry_price <= 0 or not token_id:
                 continue
 
+            # Skip hedged positions — both sides locked in, SL would break the arb
+            cid = position.get("condition_id", "")
+            if cid and cid in self.hedged_markets:
+                continue
+
             # Get live price — use ask (same as get_live_price) since bids
             # are often empty in short-term crypto prediction markets.
             live_price = self.get_live_price(token_id)
