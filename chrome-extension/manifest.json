@@ -1,0 +1,21 @@
+{
+  "manifest_version": 3,
+  "name": "Polymarket Auto-Redeemer",
+  "version": "1.0",
+  "description": "Auto-refreshes Polymarket portfolio and clicks claim/redeem buttons to avoid API 429 rate limits.",
+  "permissions": ["alarms", "storage"],
+  "host_permissions": ["https://polymarket.com/*"],
+  "content_scripts": [
+    {
+      "matches": ["https://polymarket.com/portfolio*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html"
+  }
+}
