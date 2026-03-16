@@ -1848,8 +1848,9 @@ class MomentumEngine:
         self.last_resolution_check = now
 
         open_positions = self.positions.get("open", [])
-        # Only check positions from this engine
-        momentum_positions = [p for p in open_positions if p.get("source") == "momentum"]
+        # Only check positions from this engine (including its arb hedges)
+        momentum_positions = [p for p in open_positions if p.get("source") == "momentum"
+                              or (p.get("source") == "arb_hedge" and str(p.get("hedge_of", "")).startswith("momentum_"))]
         if not momentum_positions:
             return
 
@@ -2199,9 +2200,11 @@ class MomentumEngine:
         """Get current stats for dashboard."""
         stats = self.positions.get("stats", {})
         open_positions = list(self.positions.get("open", []))
-        # Only count momentum-sourced positions
-        momentum_open = [p for p in open_positions if p.get("source") == "momentum"]
-        momentum_resolved = [p for p in self.positions.get("resolved", []) if p.get("source") == "momentum"]
+        # Count momentum-sourced positions AND their arb hedges
+        momentum_open = [p for p in open_positions if p.get("source") == "momentum"
+                         or (p.get("source") == "arb_hedge" and str(p.get("hedge_of", "")).startswith("momentum_"))]
+        momentum_resolved = [p for p in self.positions.get("resolved", []) if p.get("source") == "momentum"
+                             or (p.get("source") == "arb_hedge" and str(p.get("hedge_of", "")).startswith("momentum_"))]
 
         # Compute momentum-specific P&L from resolved positions
         m_wins = 0

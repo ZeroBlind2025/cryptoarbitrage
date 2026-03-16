@@ -2872,7 +2872,9 @@ class CopyTrader:
             return
 
         # Only check non-momentum positions (momentum has its own check_resolutions)
-        copy_positions = [p for p in open_positions if p.get("source") != "momentum"]
+        # Also exclude momentum-engine hedges — those are checked by the momentum engine
+        copy_positions = [p for p in open_positions if p.get("source") != "momentum"
+                          and not (p.get("source") == "arb_hedge" and str(p.get("hedge_of", "")).startswith("momentum_"))]
         if not copy_positions:
             return
 
@@ -3295,8 +3297,12 @@ class CopyTrader:
         # Snapshot lists to avoid RuntimeError from concurrent mutation
         all_open = list(self.positions.get("open", []))
         # Per-engine counts (copy-only for the detailed section)
-        open_positions = [p for p in all_open if p.get("source") != "momentum"]
-        resolved_positions = [p for p in self.positions.get("resolved", []) if p.get("source") != "momentum"]
+        # Exclude momentum positions AND momentum-engine hedges (those show on momentum dashboard)
+        def _is_momentum(p):
+            return p.get("source") == "momentum" or (
+                p.get("source") == "arb_hedge" and str(p.get("hedge_of", "")).startswith("momentum_"))
+        open_positions = [p for p in all_open if not _is_momentum(p)]
+        resolved_positions = [p for p in self.positions.get("resolved", []) if not _is_momentum(p)]
         # Equity uses ALL open positions (copy + momentum) so the hero reflects total exposure
         all_open_staked = sum(p.get("amount", 0) for p in all_open)
         equity = self._safe_float(balance + all_open_staked)
