@@ -1461,7 +1461,7 @@ class MomentumEngine:
                             and p.get("source") in ("momentum", "copy")
                         )
 
-                        arb = calc_arb_hedge(price, total_primary)
+                        arb = calc_arb_hedge(last_buy_price, total_primary)
                         if arb:
                             opp_ask = None
                             if self.ws:
