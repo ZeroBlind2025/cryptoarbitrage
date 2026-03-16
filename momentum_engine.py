@@ -1434,38 +1434,9 @@ class MomentumEngine:
                     print(f"  REJECT opposite_held: already hold other side of {_mkt_label}", flush=True)
                     continue
 
-                # --- GUARD: Max entries per market ---
-                if market_key in self.market_entry_count:
-                    if self.market_entry_count[market_key] >= self.max_entries_per_market:
-                        print(f"  REJECT max_entries: {self.market_entry_count[market_key]}/{self.max_entries_per_market} for {_mkt_label} {outcome}", flush=True)
-                        continue
-
-                # --- GUARD: Cooldown between re-entries ---
-                # Prevents rapid-fire follow-ups (e.g. PROBE → RE-ENTRY in 2s)
-                # SKIP in dry run mode — no cooldowns.
-                if market_key in self.entered_markets and not getattr(self, '_dry_run_no_delays', False):
-                    cooldown = FOLLOW_UP_COOLDOWN_15M if interval == "15m" else FOLLOW_UP_COOLDOWN
-                    last_t = self.last_trade_time.get(market_key, 0)
-                    elapsed = time.time() - last_t
-                    if elapsed < cooldown:
-                        remaining = cooldown - elapsed
-                        _mkt_label_short = (question or slug)[:50]
-                        print(f"[MOMENTUM] Skip (cooldown: {remaining:.0f}s remaining of {cooldown}s): {_mkt_label_short} {outcome}", flush=True)
-                        self.trades_skipped += 1
-                        continue
-
-                # --- GUARD: Re-entry minimum price ---
-                # Only re-enter once price has pushed past 89.9¢ — confirms strength.
-                # SKIP in dry run mode — no re-entry min price gate.
-                if market_key in self.entered_markets and price <= REENTRY_MIN_PRICE and not getattr(self, '_dry_run_no_delays', False):
-                    print(f"[MOMENTUM] Skip re-entry (price {price*100:.1f}¢ <= {REENTRY_MIN_PRICE*100:.1f}¢ min): {(question or slug)[:50]} {outcome}", flush=True)
-                    self.trades_skipped += 1
-                    continue
-
                 # --- HEDGE TRIGGER: Price risen 5¢+ above probe → hedge opposite side ---
-                # Instead of re-buying primary, we buy the opposite side for arb.
-                # The 5¢ gap means the market has moved enough that the opposite
-                # side is cheap enough for a profitable hedge.
+                # This runs BEFORE the max-entries / cooldown guards because
+                # it's not a re-entry on primary — it's a hedge on the opposite side.
                 is_first_entry = market_key not in self.entered_markets
                 if market_key in self.entered_markets:
                     last_buy_price = self.entered_markets[market_key]
