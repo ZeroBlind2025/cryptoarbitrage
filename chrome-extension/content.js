@@ -48,18 +48,37 @@
     return new Promise((r) => setTimeout(r, ms));
   }
 
-  // After clicking any confirmation modals that may appear
+  // After clicking redeem, handle confirmation dialogs and MetaMask approve
+  // buttons. Loops until no more approve/confirm buttons appear, since each
+  // redemption may spawn a separate MetaMask approval.
   async function handleConfirmationDialogs() {
-    await sleep(1000);
-    const confirmPatterns = [/^confirm$/i, /^yes$/i, /^ok$/i, /^submit$/i];
-    const allButtons = document.querySelectorAll('button, [role="button"]');
-    for (const btn of allButtons) {
-      const text = (btn.textContent || "").trim();
-      if (confirmPatterns.some((re) => re.test(text)) && !btn.disabled && btn.offsetParent !== null) {
-        btn.click();
-        console.log(`[AutoRedeem] Confirmed dialog: "${text}"`);
-        await sleep(1000);
+    const confirmPatterns = [/^confirm$/i, /^yes$/i, /^ok$/i, /^submit$/i, /^approve$/i];
+    const MAX_ROUNDS = 30; // up to 30 rounds (~60s max) to handle many redemptions
+    let round = 0;
+    let consecutiveEmpty = 0;
+
+    while (round < MAX_ROUNDS && consecutiveEmpty < 3) {
+      round++;
+      await sleep(2000);
+      const allButtons = document.querySelectorAll('button, [role="button"]');
+      let found = 0;
+      for (const btn of allButtons) {
+        const text = (btn.textContent || "").trim();
+        if (confirmPatterns.some((re) => re.test(text)) && !btn.disabled && btn.offsetParent !== null) {
+          btn.click();
+          found++;
+          console.log(`[AutoRedeem] Clicked dialog button: "${text}" (round ${round})`);
+          await sleep(1500);
+        }
       }
+      if (found > 0) {
+        consecutiveEmpty = 0;
+      } else {
+        consecutiveEmpty++;
+      }
+    }
+    if (round > 0) {
+      console.log(`[AutoRedeem] Confirmation loop done after ${round} round(s)`);
     }
   }
 
