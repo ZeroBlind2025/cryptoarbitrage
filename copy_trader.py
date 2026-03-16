@@ -2897,7 +2897,14 @@ class CopyTrader:
             # Use cached result if we already checked this condition_id this cycle
             cache_key = condition_id or slug or token_id
             if cache_key in _resolution_cache:
-                result = _resolution_cache[cache_key]
+                result = dict(_resolution_cache[cache_key])  # copy — don't mutate cache
+                # Re-derive our_token_won for THIS position's token_id
+                # (probe and hedge share condition_id but have different tokens)
+                winning_tid = result.get("winning_token_id", "")
+                if winning_tid and token_id:
+                    result["our_token_won"] = (str(token_id).strip() == str(winning_tid).strip())
+                elif "our_token_won" in result:
+                    del result["our_token_won"]  # stale — fall through to outcome/index match
             else:
                 result = get_market_resolution(
                     condition_id=condition_id,
