@@ -87,8 +87,8 @@ from copy_trader import (
 # CONFIGURATION
 # =============================================================================
 
-# Minimum price to enter a market (85 cents = 0.85)
-MIN_ENTRY_PRICE = float(os.getenv("MOMENTUM_MIN_ENTRY_PRICE", "0.85"))
+# Minimum price to enter a market (75 cents = 0.75)
+MIN_ENTRY_PRICE = float(os.getenv("MOMENTUM_MIN_ENTRY_PRICE", "0.75"))
 
 # Maximum price to enter — 98.9¢ cap filters out 99¢+ "last second" entries
 # that linger at market close and likely wouldn't fill in live trading
