@@ -103,7 +103,7 @@ MAX_ENTRY_PRICE = float(os.getenv("MOMENTUM_MAX_ENTRY_PRICE", "0.989"))
 # 5m  bracket: 85-<98.9¢ (uber conservative)
 # ---------------------------------------------------------------------------
 INTERVAL_PRICE_BRACKETS: dict[str, list[tuple[float, float]]] = {
-    "5m":  [(0.85, 0.989)],
+    "5m":  [(0.75, 0.989)],
 }
 
 # How often to poll prices (seconds)
@@ -902,7 +902,7 @@ class MomentumEngine:
         # --- DRY RUN OVERRIDES ---
         # Wider price range for backtesting
         if self.dry_run:
-            self.min_entry_price = 0.85
+            self.min_entry_price = 0.75
             self.max_entry_price = 0.989
             self.interval_price_brackets = {}  # use global range for all intervals
 
