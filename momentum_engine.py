@@ -69,10 +69,14 @@ from copy_trader import (
     CRYPTO_SLUGS,
     STOP_LOSS_PCT,
     PRICE_BUFFER_BPS,
+    ARB_HEDGE_ENABLED,
+    ARB_HEDGE_GAP,
+    ARB_HEDGE_MIN_ENTRY,
     detect_coin,
     get_clob_client,
     place_bet,
     place_sell,
+    calc_arb_hedge,
     load_positions,
     save_positions,
     get_active_crypto_tokens,
@@ -1578,6 +1582,106 @@ class MomentumEngine:
 
                     save_positions(self.positions)
                     print(f"           Position saved. Balance: ${self.positions['stats'].get('balance', 0):.2f}", flush=True)
+
+                    # --- ARBITRAGE HEDGE: Enter opposite side for guaranteed profit ---
+                    if (ARB_HEDGE_ENABLED
+                            and is_first_entry
+                            and price >= ARB_HEDGE_MIN_ENTRY
+                            and other_token_id
+                            and trade_record.get("status") == "filled"):
+                        try:
+                            arb = calc_arb_hedge(price, trade_amount)
+                            if arb:
+                                # Get live ask on opposite side
+                                opp_ask = None
+                                if self.ws:
+                                    _, opp_ask = self.ws.get_best_prices(other_token_id)
+                                opp_price_ok = opp_ask is not None and opp_ask <= arb["hedge_max_price"]
+
+                                if opp_price_ok or self.dry_run:
+                                    buffer = PRICE_BUFFER_BPS / 10000
+                                    hedge_limit = min(opp_ask * (1 + buffer), arb["hedge_max_price"]) if opp_ask else arb["hedge_max_price"]
+                                    # Recalculate based on actual ask for tighter sizing
+                                    actual_gap = round(1 - price - hedge_limit, 4)
+                                    actual_arb = calc_arb_hedge(price, trade_amount, gap=actual_gap) if actual_gap > 0 else None
+                                    hedge_amt = actual_arb["hedge_amount"] if actual_arb else arb["hedge_amount"]
+                                    hedge_max = hedge_limit
+                                    arb_info = actual_arb or arb
+
+                                    other_outcome = market["outcomes"][1 - oi]
+                                    print(f"\n[ARB] HEDGE: {title}", flush=True)
+                                    print(f"       Primary: {outcome} @ {price*100:.1f}¢ (${trade_amount:.2f})", flush=True)
+                                    print(f"       Hedge:   {other_outcome} @ {hedge_max*100:.1f}¢ (${hedge_amt:.2f})", flush=True)
+                                    print(f"       Total cost: ${arb_info['total_cost']:.2f} | "
+                                          f"Profit either way: +${arb_info['profit_if_primary_wins']:.2f} / +${arb_info['profit_if_hedge_wins']:.2f}", flush=True)
+
+                                    if not self.dry_run:
+                                        hedge_fill = place_bet(self.client, other_token_id, hedge_amt, max_price=hedge_max)
+                                        if hedge_fill.get("success"):
+                                            h_price = hedge_fill.get("fill_price", hedge_max)
+                                            print(f"[ARB] HEDGE FILLED @ {h_price*100:.1f}¢!", flush=True)
+                                            hedge_position = {
+                                                "id": f"arb_{trade_record['id']}",
+                                                "timestamp": datetime.now(timezone.utc).isoformat(),
+                                                "condition_id": condition_id,
+                                                "token_id": other_token_id,
+                                                "outcome_index": 1 - oi,
+                                                "outcome": other_outcome,
+                                                "market": title,
+                                                "slug": slug,
+                                                "interval": market.get("interval", ""),
+                                                "end_date": end_date.isoformat() if end_date else None,
+                                                "entry_price": h_price,
+                                                "amount": hedge_amt,
+                                                "potential_payout": hedge_amt / h_price if h_price > 0 else 0,
+                                                "dry_run": False,
+                                                "source": "arb_hedge",
+                                                "hedge_of": trade_record["id"],
+                                            }
+                                            self.positions["open"].append(hedge_position)
+                                            self.total_spent += hedge_amt
+                                            stats = self.positions["stats"]
+                                            stats["balance"] = stats.get("balance", ALGO_STARTING_BALANCE) - hedge_amt
+                                            save_positions(self.positions)
+                                            _log_trade("arb_hedge", {
+                                                "market": title, "outcome": other_outcome,
+                                                "price": h_price, "amount": hedge_amt,
+                                                "primary_outcome": outcome, "primary_price": price,
+                                                "condition_id": condition_id,
+                                            })
+                                        else:
+                                            print(f"[ARB] Hedge order FAILED — primary position unhedged", flush=True)
+                                    else:
+                                        print(f"[ARB] DRY RUN — hedge would execute @ {hedge_max*100:.1f}¢", flush=True)
+                                        hedge_position = {
+                                            "id": f"arb_{trade_record['id']}",
+                                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                                            "condition_id": condition_id,
+                                            "token_id": other_token_id,
+                                            "outcome_index": 1 - oi,
+                                            "outcome": other_outcome,
+                                            "market": title,
+                                            "slug": slug,
+                                            "interval": market.get("interval", ""),
+                                            "entry_price": hedge_max,
+                                            "amount": hedge_amt,
+                                            "potential_payout": hedge_amt / hedge_max if hedge_max > 0 else 0,
+                                            "dry_run": True,
+                                            "source": "arb_hedge",
+                                            "hedge_of": trade_record["id"],
+                                        }
+                                        self.positions["open"].append(hedge_position)
+                                        save_positions(self.positions)
+                                elif opp_ask is not None:
+                                    print(f"[ARB] Skip hedge: opposite ask {opp_ask*100:.1f}¢ > max {arb['hedge_max_price']*100:.1f}¢ (no gap)", flush=True)
+                                else:
+                                    print(f"[ARB] Skip hedge: no WS price for opposite token", flush=True)
+                            else:
+                                if price >= ARB_HEDGE_MIN_ENTRY:
+                                    print(f"[ARB] Skip hedge: no profitable arb at {price*100:.1f}¢ with {ARB_HEDGE_GAP*100:.0f}¢ gap", flush=True)
+                        except Exception as e:
+                            print(f"[ARB] Hedge error (non-fatal): {e}", flush=True)
+                            import traceback; traceback.print_exc()
 
                     self.trades_entered += 1
 
