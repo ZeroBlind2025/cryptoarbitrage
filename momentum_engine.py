@@ -840,6 +840,7 @@ class MomentumEngine:
         # that can flip between API calls).
         self.entered_markets: dict = {}
         self.market_entry_count: dict = {}
+        self.hedged_markets: set = set()  # condition_ids already arb-hedged
         self.last_trade_time: dict = {}  # (condition_id, token_id) → epoch timestamp
 
         # Position tracking — share the same dict as copy trader when available
@@ -948,8 +949,17 @@ class MomentumEngine:
                 # so this is the safest conservative default
                 self.entered_markets[mk] = ep
                 self.market_entry_count[mk] = self.market_entry_count.get(mk, 0) + 1
+        # Seed hedged_markets from existing arb_hedge positions
+        for pos in self.positions.get("open", []):
+            if pos.get("source") == "arb_hedge":
+                cid = pos.get("condition_id", "")
+                if cid:
+                    self.hedged_markets.add(cid)
+
         if self.entered_markets:
             print(f"[MOMENTUM] Resumed {len(self.entered_markets)} active entries from open positions", flush=True)
+        if self.hedged_markets:
+            print(f"[MOMENTUM] Resumed {len(self.hedged_markets)} arb-hedged markets from open positions", flush=True)
 
     def _on_ws_price(self, ws_asset_id: str, bid: float, ask: float):
         """Handle WS price update — cache it and try to map to our markets."""
@@ -1584,11 +1594,22 @@ class MomentumEngine:
                     print(f"           Position saved. Balance: ${self.positions['stats'].get('balance', 0):.2f}", flush=True)
 
                     # --- ARBITRAGE HEDGE: Enter opposite side for guaranteed profit ---
+                    if not ARB_HEDGE_ENABLED:
+                        print(f"[ARB] Hedge disabled (ARB_HEDGE_ENABLED=false)", flush=True)
+                    elif condition_id in self.hedged_markets:
+                        print(f"[ARB] Skip: already hedged {title}", flush=True)
+                    elif price < ARB_HEDGE_MIN_ENTRY:
+                        print(f"[ARB] Skip: price {price*100:.1f}¢ < min {ARB_HEDGE_MIN_ENTRY*100:.0f}¢", flush=True)
+                    elif not other_token_id:
+                        print(f"[ARB] Skip: no other_token_id for {title}", flush=True)
+                    elif trade_record.get("status") != "filled" and not self.dry_run:
+                        print(f"[ARB] Skip: trade not filled ({trade_record.get('status')})", flush=True)
+
                     if (ARB_HEDGE_ENABLED
-                            and is_first_entry
+                            and condition_id not in self.hedged_markets
                             and price >= ARB_HEDGE_MIN_ENTRY
                             and other_token_id
-                            and trade_record.get("status") == "filled"):
+                            and (trade_record.get("status") == "filled" or self.dry_run)):
                         try:
                             arb = calc_arb_hedge(price, trade_amount)
                             if arb:
@@ -1643,6 +1664,7 @@ class MomentumEngine:
                                             stats = self.positions["stats"]
                                             stats["balance"] = stats.get("balance", ALGO_STARTING_BALANCE) - hedge_amt
                                             save_positions(self.positions)
+                                            self.hedged_markets.add(condition_id)
                                             _log_trade("arb_hedge", {
                                                 "market": title, "outcome": other_outcome,
                                                 "price": h_price, "amount": hedge_amt,
@@ -1671,6 +1693,7 @@ class MomentumEngine:
                                             "hedge_of": trade_record["id"],
                                         }
                                         self.positions["open"].append(hedge_position)
+                                        self.hedged_markets.add(condition_id)
                                         save_positions(self.positions)
                                 elif opp_ask is not None:
                                     print(f"[ARB] Skip hedge: opposite ask {opp_ask*100:.1f}¢ > max {arb['hedge_max_price']*100:.1f}¢ (no gap)", flush=True)
