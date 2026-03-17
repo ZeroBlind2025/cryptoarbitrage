@@ -69,8 +69,6 @@ from copy_trader import (
     CRYPTO_SLUGS,
     STOP_LOSS_PCT,
     PRICE_BUFFER_BPS,
-    ARB_HEDGE_ENABLED,
-    ARB_HEDGE_GAP,
     ARB_HEDGE_MIN_ENTRY,
     detect_coin,
     get_clob_client,
@@ -89,6 +87,8 @@ from copy_trader import (
 
 # Minimum price to enter a market (75 cents = 0.75)
 MIN_ENTRY_PRICE = float(os.getenv("MOMENTUM_MIN_ENTRY_PRICE", "0.75"))
+MOMENTUM_HEDGE_ENABLE = os.getenv("MOMENTUM_HEDGE_ENABLE", "true").lower() == "true"
+MOMENTUM_HEDGE_PCT = float(os.getenv("MOMENTUM_HEDGE_PCT", "5"))  # Gap in cents (e.g. 5 = 5¢)
 
 # Maximum price to enter — 98.9¢ cap filters out 99¢+ "last second" entries
 # that linger at market close and likely wouldn't fill in live trading
@@ -103,7 +103,7 @@ MAX_ENTRY_PRICE = float(os.getenv("MOMENTUM_MAX_ENTRY_PRICE", "0.989"))
 # 5m  bracket: 85-<98.9¢ (uber conservative)
 # ---------------------------------------------------------------------------
 INTERVAL_PRICE_BRACKETS: dict[str, list[tuple[float, float]]] = {
-    "5m":  [(0.75, 0.989)],
+    "5m":  [(MIN_ENTRY_PRICE, 0.989)],
 }
 
 # How often to poll prices (seconds)
@@ -902,7 +902,6 @@ class MomentumEngine:
         # --- DRY RUN OVERRIDES ---
         # Wider price range for backtesting
         if self.dry_run:
-            self.min_entry_price = 0.75
             self.max_entry_price = 0.989
             self.interval_price_brackets = {}  # use global range for all intervals
 
@@ -919,6 +918,7 @@ class MomentumEngine:
             other = [i for i in INTERVALS if i not in self.interval_price_brackets]
             if other:
                 print(f"    {', '.join(other)}: global range ({self.min_entry_price*100:.0f}-{self.max_entry_price*100:.0f}¢)")
+        print(f"  Hedge: {'ENABLED' if MOMENTUM_HEDGE_ENABLE else 'DISABLED'} | gap: {MOMENTUM_HEDGE_PCT:.0f}¢")
         print(f"  Re-entry: upward only (current > last buy)")
         print(f"  Delays/cooldowns: DISABLED")
         print(f"  Probe sizing: DISABLED (using dashboard lot sizes)")
@@ -1442,12 +1442,12 @@ class MomentumEngine:
                     last_buy_price = self.entered_markets[market_key]
                     price_rise = round(price - last_buy_price, 4)
 
-                    if price_rise < ARB_HEDGE_GAP:
+                    if price_rise < MOMENTUM_HEDGE_PCT / 100:
                         # Not enough movement — skip silently (fires every cycle)
                         continue
 
                     # Price has risen 5¢+ — trigger hedge instead of re-entry
-                    if (ARB_HEDGE_ENABLED
+                    if (MOMENTUM_HEDGE_ENABLE
                             and other_token_id
                             and condition_id not in self.hedged_markets):
                         title = (question or slug)[:50]
@@ -1556,7 +1556,7 @@ class MomentumEngine:
                     else:
                         if condition_id in self.hedged_markets:
                             pass  # already hedged, silent
-                        elif not ARB_HEDGE_ENABLED:
+                        elif not MOMENTUM_HEDGE_ENABLE:
                             print(f"[ARB] Hedge disabled", flush=True)
 
                     # No re-entry on primary — hedge replaces re-entry
