@@ -2463,6 +2463,9 @@ class CopyTrader:
                                             "hedge_of": trade_record["id"],
                                         }
                                         self.positions["open"].append(hedge_position)
+                                        # Deduct balance for dry-run hedge so equity stays accurate
+                                        stats = self.positions["stats"]
+                                        stats["balance"] = stats.get("balance", ALGO_STARTING_BALANCE) - hedge_amt
                                         save_positions(self.positions)
                                 else:
                                     print(f"[ARB] Skip hedge: opposite ask {opp_ask*100:.1f}¢ > max {arb['hedge_max_price']*100:.1f}¢ (no gap)")

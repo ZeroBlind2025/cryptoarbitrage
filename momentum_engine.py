@@ -1543,6 +1543,9 @@ class MomentumEngine:
                                     }
                                     self.positions["open"].append(hedge_position)
                                     self.hedged_markets.add(condition_id)
+                                    # Deduct balance for dry-run hedge so equity stays accurate
+                                    stats = self.positions["stats"]
+                                    stats["balance"] = stats.get("balance", ALGO_STARTING_BALANCE) - hedge_amt
                                     save_positions(self.positions)
                             elif opp_ask is not None:
                                 print(f"[ARB] Skip: opposite ask {opp_ask*100:.1f}¢ > max {arb['hedge_max_price']*100:.1f}¢", flush=True)
