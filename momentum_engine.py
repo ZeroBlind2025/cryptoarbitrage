@@ -110,7 +110,7 @@ INTERVAL_PRICE_BRACKETS: dict[str, list[tuple[float, float]]] = {
 POLL_INTERVAL = int(os.getenv("MOMENTUM_POLL_INTERVAL", "1"))
 
 # Max entries per market (same as copy trader default)
-MAX_ENTRIES_PER_MARKET = int(os.getenv("COPY_MAX_ENTRIES_PER_MARKET", "2"))
+MAX_ENTRIES_PER_MARKET = int(os.getenv("MOMENTUM_MAX_ENTRIES_PER_MARKET", "2"))
 
 # Cooldown between re-entries into the same market (seconds).
 # Prevents rapid-fire follow-ups when price ticks up within the same scan cycle.
@@ -919,7 +919,7 @@ class MomentumEngine:
             if other:
                 print(f"    {', '.join(other)}: global range ({self.min_entry_price*100:.0f}-{self.max_entry_price*100:.0f}¢)")
         print(f"  Hedge: {'ENABLED' if MOMENTUM_HEDGE_ENABLE else 'DISABLED'} | gap: {MOMENTUM_HEDGE_PCT:.0f}¢")
-        print(f"  Re-entry: upward only (current > last buy)")
+        print(f"  Re-entry: upward only, max {self.max_entries_per_market} entries/market")
         print(f"  Delays/cooldowns: DISABLED")
         print(f"  Probe sizing: DISABLED (using dashboard lot sizes)")
         print(f"  Lot sizes: {lot_sizes} (default: ${self.bet_amount})")
@@ -1557,16 +1557,25 @@ class MomentumEngine:
                         if condition_id in self.hedged_markets:
                             pass  # already hedged, silent
                         elif not MOMENTUM_HEDGE_ENABLE:
-                            print(f"[ARB] Hedge disabled", flush=True)
+                            pass  # hedge disabled — fall through to re-entry
 
-                    # No re-entry on primary — hedge replaces re-entry
-                    continue
+                    # If hedge was placed or already hedged, skip re-entry
+                    if condition_id in self.hedged_markets:
+                        continue
 
-                # --- ENTER THE TRADE (probe only) ---
+                    # --- RE-ENTRY GATE: allow re-entry if under max entries ---
+                    entry_count = self.market_entry_count.get(market_key, 0)
+                    if entry_count >= self.max_entries_per_market:
+                        continue  # hit max entries for this market
+
+                    # Update last buy price for upward-only tracking
+                    # (fall through to ENTER THE TRADE block below)
+
+                # --- ENTER THE TRADE (probe / re-entry) ---
                 full_lot = self.coin_bet_amounts.get(coin, self.bet_amount)
                 trade_amount = PROBE_AMOUNT if not getattr(self, '_dry_run_no_probe', False) else full_lot
                 title = (question or slug)[:50]
-                entry_type = "PROBE"
+                entry_type = "RE-ENTRY" if not is_first_entry else "PROBE"
 
                 print(f"\n[MOMENTUM] ENTERING {coin.upper()} {outcome} @ {price*100:.1f}¢ ({entry_type})", flush=True)
                 print(f"           Market: {title}", flush=True)
