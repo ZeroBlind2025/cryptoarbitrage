@@ -90,6 +90,9 @@ MIN_ENTRY_PRICE = float(os.getenv("MOMENTUM_MIN_ENTRY_PRICE", "0.75"))
 MOMENTUM_HEDGE_ENABLE = os.getenv("MOMENTUM_HEDGE_ENABLE", "true").lower() == "true"
 MOMENTUM_HEDGE_PCT = float(os.getenv("MOMENTUM_HEDGE_PCT", "5"))  # Gap in cents (e.g. 5 = 5¢)
 
+MOMENTUM_5M_MARKET = os.getenv("MOMENTUM_5M_MARKET", "true").lower() == "true"
+MOMENTUM_15M_MARKET = os.getenv("MOMENTUM_15M_MARKET", "false").lower() == "true"
+
 # Maximum price to enter — 98.9¢ cap filters out 99¢+ "last second" entries
 # that linger at market close and likely wouldn't fill in live trading
 MAX_ENTRY_PRICE = float(os.getenv("MOMENTUM_MAX_ENTRY_PRICE", "0.989"))
@@ -156,7 +159,9 @@ COIN_SLUG_NAMES = {
     "sol": "solana",
     "xrp": "xrp",
 }
-INTERVALS = ["5m", "15m"]
+INTERVALS = [i for i in ["5m", "15m"] if
+             (i == "5m" and MOMENTUM_5M_MARKET) or
+             (i == "15m" and MOMENTUM_15M_MARKET)]
 
 # Interval detection patterns for question text
 # e.g. "9:00AM-9:15AM" = 15m, "9:00AM-9:05AM" = 5m, "12PM" (hourly) = 60m
@@ -918,6 +923,7 @@ class MomentumEngine:
             other = [i for i in INTERVALS if i not in self.interval_price_brackets]
             if other:
                 print(f"    {', '.join(other)}: global range ({self.min_entry_price*100:.0f}-{self.max_entry_price*100:.0f}¢)")
+        print(f"  Markets: {', '.join(INTERVALS) if INTERVALS else 'NONE (all disabled!)'}")
         print(f"  Hedge: {'ENABLED' if MOMENTUM_HEDGE_ENABLE else 'DISABLED'} | gap: {MOMENTUM_HEDGE_PCT:.0f}¢")
         print(f"  Re-entry: upward only, max {self.max_entries_per_market} entries/market")
         print(f"  Delays/cooldowns: DISABLED")
