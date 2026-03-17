@@ -1442,9 +1442,14 @@ class MomentumEngine:
                     last_buy_price = self.entered_markets[market_key]
                     price_rise = round(price - last_buy_price, 4)
 
-                    if price_rise < MOMENTUM_HEDGE_PCT / 100:
-                        # Not enough movement — skip silently (fires every cycle)
-                        continue
+                    if MOMENTUM_HEDGE_ENABLE:
+                        # Hedge mode: require minimum gap before triggering hedge
+                        if price_rise < MOMENTUM_HEDGE_PCT / 100:
+                            continue
+                    else:
+                        # Re-entry mode: just require upward movement
+                        if price_rise <= 0:
+                            continue
 
                     # Price has risen 5¢+ — trigger hedge instead of re-entry
                     if (MOMENTUM_HEDGE_ENABLE
