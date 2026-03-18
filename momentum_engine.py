@@ -1361,9 +1361,7 @@ class MomentumEngine:
                 minutes_left = market.get("minutes_until_close")
 
             # --- GUARD: Market must still be open ---
-            if minutes_left is not None and minutes_left < MIN_MINUTES_BEFORE_CLOSE:
-                _close_label = f"{coin.upper()}_{market.get('interval', '')} {slug[:30]}"
-                print(f"[MOMENTUM] SKIP {_close_label}: {minutes_left:.1f}m left < {MIN_MINUTES_BEFORE_CLOSE:.1f}m min", flush=True)
+            if minutes_left is not None and minutes_left < 0:
                 continue
 
             # --- GUARD: Market must be old enough (entry delay) ---
