@@ -926,7 +926,9 @@ class MomentumEngine:
         print(f"  Markets: {', '.join(INTERVALS) if INTERVALS else 'NONE (all disabled!)'}")
         print(f"  Hedge: {'ENABLED' if MOMENTUM_HEDGE_ENABLE else 'DISABLED'} | gap: {MOMENTUM_HEDGE_PCT:.0f}¢")
         print(f"  Re-entry: upward only, max {self.max_entries_per_market} entries/market")
-        print(f"  Delays/cooldowns: DISABLED")
+        _delay_status = "DISABLED" if getattr(self, '_dry_run_no_delays', False) else "ENABLED"
+        _delay_info = ", ".join(f"{k}={int(v*60)}s" for k, v in MARKET_ENTRY_DELAY.items()) if _delay_status == "ENABLED" else ""
+        print(f"  Delays/cooldowns: {_delay_status}" + (f" ({_delay_info})" if _delay_info else ""))
         print(f"  Probe sizing: DISABLED (using dashboard lot sizes)")
         print(f"  Lot sizes: {lot_sizes} (default: ${self.bet_amount})")
         print(f"  Balance: ${balance:.2f}")
@@ -1359,8 +1361,7 @@ class MomentumEngine:
                 minutes_left = market.get("minutes_until_close")
 
             # --- GUARD: Market must still be open ---
-            if minutes_left is not None and minutes_left < MIN_MINUTES_BEFORE_CLOSE:
-                # Market is closed or about to close — skip
+            if minutes_left is not None and minutes_left < 0:
                 continue
 
             # --- GUARD: Market must be old enough (entry delay) ---
@@ -1425,9 +1426,12 @@ class MomentumEngine:
                     brackets = self.interval_price_brackets[interval]
                     in_bracket = any(lo <= price < hi for lo, hi in brackets)
                     if not in_bracket:
+                        _ranges = " | ".join(f"{lo*100:.0f}-{hi*100:.0f}¢" for lo, hi in brackets)
+                        print(f"  REJECT price_range: {_mkt_label} {outcome} @ {price*100:.1f}¢ not in [{_ranges}]", flush=True)
                         continue
                 else:
                     if price < self.min_entry_price or price > self.max_entry_price:
+                        print(f"  REJECT price_range: {_mkt_label} {outcome} @ {price*100:.1f}¢ outside {self.min_entry_price*100:.0f}-{self.max_entry_price*100:.0f}¢", flush=True)
                         continue
 
                 # --- Price qualifies! Log that we're evaluating this candidate ---
