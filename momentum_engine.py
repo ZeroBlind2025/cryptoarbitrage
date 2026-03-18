@@ -126,16 +126,16 @@ REENTRY_MIN_PRICE = float(os.getenv("MOMENTUM_REENTRY_MIN_PRICE", "0.899"))  # o
 MIN_MINUTES_BEFORE_CLOSE = float(os.getenv("MOMENTUM_MIN_MINUTES_BEFORE_CLOSE", "1.0"))
 
 # ---------------------------------------------------------------------------
-# Market entry delay — wait N minutes after a market opens before entering.
+# Market entry delay — wait N seconds after a market opens before entering.
 # Early-market prices are volatile and reversals are common.  By waiting,
 # we only enter once the direction has stabilised.
 #
-#  5m market  → wait 2 minutes (40% of duration)
-# 15m market  → wait 9 minutes (60% of duration)
+#  5m market  → wait 180s (3 min)
+# 15m market  → wait 540s (9 min)
 # ---------------------------------------------------------------------------
 MARKET_ENTRY_DELAY: dict[str, float] = {
-    "5m":  float(os.getenv("MOMENTUM_ENTRY_DELAY_5M",  "2")),
-    "15m": float(os.getenv("MOMENTUM_ENTRY_DELAY_15M", "9")),
+    "5m":  float(os.getenv("MOMENTUM_5M_ENTRY_DELAY",  "180")) / 60,
+    "15m": float(os.getenv("MOMENTUM_15M_ENTRY_DELAY", "540")) / 60,
 }
 
 # Interval durations in minutes (used to derive market start time from end time)
