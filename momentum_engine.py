@@ -899,10 +899,10 @@ class MomentumEngine:
     def start(self):
         """Initialize the momentum engine."""
 
-        # No entry delays, no cooldowns, no re-entry min price gate, no probe sizing
-        # (applies to both demo and live — live is a 1:1 copy of demo behavior)
-        self._dry_run_no_delays = True
+        # No probe sizing (applies to both demo and live)
         self._dry_run_no_probe = True
+        # Entry delays: only skip for dry runs
+        self._dry_run_no_delays = self.dry_run
 
         # --- DRY RUN OVERRIDES ---
         # Wider price range for backtesting
@@ -1385,6 +1385,10 @@ class MomentumEngine:
                             print(f"[MOMENTUM] DELAY {_delay_label}: market age {market_age_minutes:.1f}m < {entry_delay:.0f}m delay "
                                   f"(wait {_wait_display} more)", flush=True)
                             continue
+                        else:
+                            # Delay satisfied — log that we're past the wait
+                            _delay_label = f"{coin.upper()}_{interval} {slug[:30]}"
+                            print(f"[MOMENTUM] DELAY OK {_delay_label}: market age {market_age_minutes:.1f}m >= {entry_delay:.0f}m delay", flush=True)
 
             # Build a short label for rejection logging
             _mkt_label = f"{coin.upper()}_{market['interval']} {slug[:30]}"
