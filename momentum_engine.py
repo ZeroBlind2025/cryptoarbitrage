@@ -901,8 +901,8 @@ class MomentumEngine:
 
         # No probe sizing (applies to both demo and live)
         self._dry_run_no_probe = True
-        # Entry delays: only skip for dry runs
-        self._dry_run_no_delays = self.dry_run
+        # Entry delays: enforce even in dry runs
+        self._dry_run_no_delays = False
 
         # --- DRY RUN OVERRIDES ---
         # Wider price range for backtesting
