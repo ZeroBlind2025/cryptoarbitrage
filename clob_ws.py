@@ -92,6 +92,25 @@ class CLOBWebSocket:
         self.price_changes = 0
         self.last_message_time: Optional[datetime] = None
 
+    # How long without messages before we consider the WS stale (seconds)
+    STALE_TIMEOUT = 120  # 2 minutes
+
+    def is_stale(self) -> bool:
+        """Return True if no messages received in STALE_TIMEOUT seconds."""
+        if self.last_message_time is None:
+            return True
+        elapsed = (datetime.now() - self.last_message_time).total_seconds()
+        return elapsed > self.STALE_TIMEOUT
+
+    def force_reconnect(self):
+        """Force close and reconnect the WebSocket."""
+        print(f"[CLOB WS] Force reconnect triggered (stale for >{self.STALE_TIMEOUT}s)", flush=True)
+        if self.ws:
+            try:
+                self.ws.close()
+            except Exception:
+                pass
+
     def start(self):
         """Start the WebSocket connection"""
         if self.running:
