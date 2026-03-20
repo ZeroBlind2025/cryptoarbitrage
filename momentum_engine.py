@@ -1120,12 +1120,14 @@ class MomentumEngine:
                     return token_id, None, "empty"
                 elif resp.status_code == 429:
                     return token_id, None, "ratelimit"
-            except Exception:
-                pass
-            return token_id, None, "error"
+                else:
+                    return token_id, None, f"http_{resp.status_code}"
+            except Exception as e:
+                return token_id, None, f"error:{e}"
 
         fetched = 0
         empty = 0
+        errors = 0
         from concurrent.futures import ThreadPoolExecutor, as_completed
         with ThreadPoolExecutor(max_workers=8) as pool:
             futures = {pool.submit(_fetch_one, tid): tid for tid in tokens_to_fetch}
@@ -1138,8 +1140,11 @@ class MomentumEngine:
                     empty += 1
                 elif status == "ratelimit":
                     print(f"[MOMENTUM] CLOB REST rate limited after {fetched} fetches", flush=True)
+                else:
+                    errors += 1
 
-        print(f"[MOMENTUM] CLOB REST: {fetched} prices, {empty} empty "
+        err_str = f", {errors} errors" if errors else ""
+        print(f"[MOMENTUM] CLOB REST: {fetched} prices, {empty} empty{err_str} "
               f"({len(tokens_to_fetch)} tokens queried)", flush=True)
 
     def _check_5m_boundary(self) -> list[dict]:
@@ -1239,6 +1244,14 @@ class MomentumEngine:
         Returns number of trades entered this cycle.
         """
         self.scans_completed += 1
+
+        # --- WS health check: force reconnect if stale ---
+        if self.ws and self.ws.is_stale():
+            last_msg = self.ws.last_message_time
+            elapsed = (datetime.now() - last_msg).total_seconds() if last_msg else float('inf')
+            print(f"[MOMENTUM] WS STALE: no messages in {elapsed:.0f}s, forcing reconnect", flush=True)
+            self.ws.force_reconnect()
+
         self._refresh_ws_tokens()
 
         # Fast 5m boundary check — grab new markets immediately when
@@ -1286,8 +1299,19 @@ class MomentumEngine:
             self._fetch_clob_prices_batch(markets)
             self._last_clob_fetch = now
 
-        # Diagnostic: log price source stats every 30 scans (~30s)
+        # Diagnostic: log WS + price source stats every 30 scans (~30s)
         if self.scans_completed % 30 == 1:
+            # WS connection health
+            if self.ws:
+                ws_connected = self.ws.connected
+                ws_msgs = self.ws.messages_received
+                ws_last = self.ws.last_message_time
+                ws_age = f"{(datetime.now() - ws_last).total_seconds():.0f}s ago" if ws_last else "never"
+                ws_stale = self.ws.is_stale()
+                stale_tag = " STALE!" if ws_stale else ""
+                print(f"[MOMENTUM] WS health: connected={ws_connected} msgs={ws_msgs} last_msg={ws_age}{stale_tag}", flush=True)
+            else:
+                print("[MOMENTUM] WS health: not initialized", flush=True)
             ws_direct = 0
             ws_mapped = 0
             clob_count = 0
@@ -1418,6 +1442,9 @@ class MomentumEngine:
                 else:
                     price = gamma_price
                     _price_src = "gamma"
+                    # Warn once per scan when using gamma fallback (likely stale)
+                    if self.scans_completed % 60 == 1:
+                        print(f"  WARN gamma_fallback: {_mkt_label} {outcome} no live price, using gamma={gamma_price*100:.1f}¢", flush=True)
 
                 # --- FILTER: Price must be in range ---
                 # Use per-interval brackets if defined, else global min/max
@@ -1847,6 +1874,23 @@ class MomentumEngine:
                 self.positions.setdefault("resolved", []).append(position)
                 save_positions(self.positions)
                 trade_record["pnl"] = pnl
+                # Log to JSONL trade log (was missing — caused SL count mismatch)
+                _log_trade("resolved", {
+                    "id": position.get("id", ""),
+                    "coin": position.get("slug", "").split("-")[0] if position.get("slug") else "",
+                    "interval": position.get("interval", ""),
+                    "outcome": position.get("outcome", ""),
+                    "entry_price": position.get("entry_price", 0),
+                    "amount": amount_spent,
+                    "result": "STOP_LOSS",
+                    "pnl": pnl,
+                    "won": False,
+                    "slug": position.get("slug", ""),
+                    "market": position.get("market", ""),
+                    "condition_id": position.get("condition_id", ""),
+                    "entered_at": position.get("timestamp", ""),
+                    "sell_price": sell_price,
+                })
                 print(f"       Position stopped out. PnL: ${pnl:+.2f} | Proceeds: ${proceeds:.2f}", flush=True)
                 stopped += 1
 
