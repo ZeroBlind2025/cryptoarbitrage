@@ -52,7 +52,7 @@
   // buttons. Loops until no more approve/confirm buttons appear, since each
   // redemption may spawn a separate MetaMask approval.
   async function handleConfirmationDialogs() {
-    const confirmPatterns = [/^confirm$/i, /^yes$/i, /^ok$/i, /^submit$/i, /^approve$/i];
+    const confirmPatterns = [/^confirm$/i, /^yes$/i, /^ok$/i, /^submit$/i, /^approve$/i, /^claim/i, /^redeem/i];
     const MAX_ROUNDS = 30; // up to 30 rounds (~60s max) to handle many redemptions
     let round = 0;
     let consecutiveEmpty = 0;
