@@ -905,10 +905,7 @@ class MomentumEngine:
         self._dry_run_no_delays = False
 
         # --- DRY RUN OVERRIDES ---
-        # Wider price range for backtesting
-        if self.dry_run:
-            self.max_entry_price = 0.989
-            self.interval_price_brackets = {}  # use global range for all intervals
+        # None — dry run uses identical rules to live mode
 
         balance = self.positions.get("stats", {}).get("balance", ALGO_STARTING_BALANCE)
         lot_sizes = ", ".join(f"{c.upper()}=${a}" for c, a in sorted(self.coin_bet_amounts.items()))
@@ -1509,12 +1506,16 @@ class MomentumEngine:
 
                         arb = calc_arb_hedge(last_buy_price, total_primary)
                         if arb:
-                            opp_ask = None
-                            if self.ws:
-                                _, opp_ask = self.ws.get_best_prices(other_token_id)
+                            # Use full price chain (WS → WS cache → CLOB REST → gamma)
+                            opp_ask = self.get_live_price(other_token_id)
+                            if opp_ask is None:
+                                # Fallback to gamma price for opposite side
+                                opp_gamma = market["prices"][1 - oi] if (1 - oi) < len(market.get("prices", [])) else None
+                                if opp_gamma is not None:
+                                    opp_ask = opp_gamma
 
                             opp_price_ok = opp_ask is not None and opp_ask <= arb["hedge_max_price"]
-                            if opp_price_ok or self.dry_run:
+                            if opp_price_ok:
                                 buffer = PRICE_BUFFER_BPS / 10000
                                 hedge_limit = min(opp_ask * (1 + buffer), arb["hedge_max_price"]) if opp_ask else arb["hedge_max_price"]
                                 actual_gap = round(1 - price - hedge_limit, 4)
