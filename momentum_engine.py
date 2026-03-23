@@ -85,8 +85,8 @@ from copy_trader import (
 # CONFIGURATION
 # =============================================================================
 
-# Minimum price to enter a market (75 cents = 0.75)
-MIN_ENTRY_PRICE = float(os.getenv("MOMENTUM_MIN_ENTRY_PRICE", "0.75"))
+# Minimum price to enter a market (88 cents = 0.88)
+MIN_ENTRY_PRICE = float(os.getenv("MOMENTUM_MIN_ENTRY_PRICE", "0.88"))
 MOMENTUM_HEDGE_ENABLE = os.getenv("MOMENTUM_HEDGE_ENABLE", "true").lower() == "true"
 MOMENTUM_HEDGE_PCT = float(os.getenv("MOMENTUM_HEDGE_PCT", "5"))  # Gap in cents (e.g. 5 = 5¢)
 
