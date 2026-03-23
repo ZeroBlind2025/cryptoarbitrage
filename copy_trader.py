@@ -2567,10 +2567,9 @@ class CopyTrader:
                 trade_record["status"] = "dry_run"
             else:
                 if token_id and self.client and shares > 0:
-                    buffer = PRICE_BUFFER_BPS / 10000
-                    min_price = max(live_bid * (1 - buffer), 0.01)
-                    print(f"       Sell limit: {min_price:.4f} (live bid {live_bid:.4f} - {PRICE_BUFFER_BPS}bps)")
-                    fill = place_sell(self.client, token_id, shares, min_price=min_price)
+                    # Stop loss = emergency exit. Sell at any available price.
+                    print(f"       Sell limit: 0.01 (emergency exit, any bid)")
+                    fill = place_sell(self.client, token_id, shares, min_price=0.01)
                     if fill.get("success"):
                         trade_record["status"] = "filled"
                         fill_price = fill.get("fill_price") or live_bid

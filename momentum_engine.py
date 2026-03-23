@@ -1851,9 +1851,9 @@ class MomentumEngine:
                 trade_record["status"] = "dry_run"
             else:
                 if token_id and self.client and shares > 0:
-                    buffer = PRICE_BUFFER_BPS / 10000
-                    min_price = max(live_price * (1 - buffer), 0.01)
-                    fill = place_sell(self.client, token_id, shares, min_price=min_price)
+                    # Stop loss = emergency exit. Use min_price=1¢ to sell at
+                    # whatever bid is available. Getting out matters more than price.
+                    fill = place_sell(self.client, token_id, shares, min_price=0.01)
                     if fill.get("success"):
                         trade_record["status"] = "filled"
                         fill_price = fill.get("fill_price") or live_price
