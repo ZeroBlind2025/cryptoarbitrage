@@ -2114,7 +2114,11 @@ class MomentumEngine:
                     if redeemed is True:
                         print(f"[MOMENTUM] Auto-redeemed: {position['market'][:30]}", flush=True)
                     elif redeemed is None:
-                        pass  # No-op: balance was 0, already logged by redeem function
+                        # None means either balance=0 (already redeemed) or
+                        # payoutDenominator=0 (not resolved on-chain yet).
+                        # Queue for retry — oracle usually settles within minutes.
+                        print(f"[MOMENTUM] Not redeemable yet (oracle pending) — queuing retry: {position['market'][:30]}", flush=True)
+                        _queue_pending_redemption(condition_id, token_id, slug)
                     else:
                         print(f"[MOMENTUM] Redemption failed for {position['market'][:30]} — queued for retry", flush=True)
                         _queue_pending_redemption(condition_id, token_id, slug)
