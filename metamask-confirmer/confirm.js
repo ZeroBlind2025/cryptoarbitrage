@@ -112,25 +112,57 @@ async function mainLoop(browser, handled) {
 
 async function tryClickConfirm(page) {
   try {
+    // Wait a moment for MetaMask React UI to render
+    await sleep(500);
+
     const result = await page.evaluate((texts) => {
-      const buttons = document.querySelectorAll('button, [role="button"]');
+      const buttons = document.querySelectorAll('button, [role="button"], div[data-testid]');
       const allBtnTexts = [];
       for (const btn of buttons) {
         const btnText = (btn.textContent || "").trim().toLowerCase();
         allBtnTexts.push(btnText);
-        if (texts.includes(btnText) && !btn.disabled) {
+        // Use substring matching — MetaMask buttons say "Sign message",
+        // "Confirm transaction", "Approve spending", etc.
+        const matchedKeyword = texts.find((t) => btnText === t || btnText.startsWith(t + " ") || btnText.startsWith(t + "\n"));
+        if (matchedKeyword && !btn.disabled) {
           btn.click();
-          return { clicked: btnText, allButtons: allBtnTexts };
+          return { clicked: btnText, matchedKeyword, allButtons: allBtnTexts };
         }
       }
       return { clicked: null, allButtons: allBtnTexts };
     }, CONFIRM_TEXTS);
 
     if (result?.clicked) {
-      console.log(`[MetaMask-Confirmer] Clicked "${result.clicked}" at ${new Date().toLocaleTimeString()}`);
+      console.log(`[MetaMask-Confirmer] Clicked "${result.clicked}" (matched: "${result.matchedKeyword}") at ${new Date().toLocaleTimeString()}`);
       return true;
-    } else if (result?.allButtons?.length > 0) {
-      console.log(`[MetaMask-Confirmer] Found extension page (${page.url()}) with buttons: [${result.allButtons.join(", ")}] — no match`);
+    }
+
+    // Try MetaMask data-testid buttons as fallback (e.g., confirm-footer-button)
+    const testIdResult = await page.evaluate(() => {
+      const selectors = [
+        '[data-testid="confirm-footer-button"]',
+        '[data-testid="confirmation-submit-button"]',
+        '[data-testid="page-container-footer-next"]',
+        '[data-testid="request-signature__sign"]',
+        '[data-testid="signature-request-scroll-button"]',
+      ];
+      for (const sel of selectors) {
+        const el = document.querySelector(sel);
+        if (el && !el.disabled) {
+          el.click();
+          return { clicked: sel };
+        }
+      }
+      return null;
+    });
+
+    if (testIdResult?.clicked) {
+      console.log(`[MetaMask-Confirmer] Clicked testid "${testIdResult.clicked}" at ${new Date().toLocaleTimeString()}`);
+      return true;
+    }
+
+    if (result?.allButtons?.length > 0) {
+      console.log(`[MetaMask-Confirmer] Extension page (${page.url()}) buttons: [${result.allButtons.join(", ")}] — no match`);
     }
   } catch {
     // Page may have closed between listing and evaluating — that's fine
