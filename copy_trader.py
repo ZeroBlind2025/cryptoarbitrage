@@ -87,6 +87,7 @@ ALGO_STARTING_BALANCE = float(os.getenv("ALGO_STARTING_BALANCE", "2300.0"))  # S
 PRICE_BUFFER_BPS = int(os.getenv("COPY_PRICE_BUFFER_BPS", "50"))  # Max overbid vs target's price (50 bps = 0.5%)
 FOLLOW_UP_COOLDOWN = int(os.getenv("COPY_FOLLOW_UP_COOLDOWN", "30"))  # seconds between re-entries into same market
 STOP_LOSS_PCT = float(os.getenv("COPY_STOP_LOSS_PCT", "55"))  # Auto-sell when position drops this % from peak (0 = disabled)
+MIN_ENTRY_PRICE = float(os.getenv("COPY_MIN_ENTRY_PRICE", "0.88"))  # Skip trades below this price (0 = disabled)
 
 # Arbitrage hedge settings
 ARB_HEDGE_ENABLED = os.getenv("ARB_HEDGE_ENABLED", "true").lower() == "true"
@@ -2203,7 +2204,11 @@ class CopyTrader:
                 self.trades_skipped += 1
                 continue
 
-            # Price band filter disabled — copy all prices exactly as target trades
+            # Global minimum entry price filter
+            if MIN_ENTRY_PRICE > 0 and price < MIN_ENTRY_PRICE:
+                print(f"[ALGO] Skip (price {price*100:.1f}¢ < min {MIN_ENTRY_PRICE*100:.1f}¢): {title}")
+                self.trades_skipped += 1
+                continue
 
             # Check if we already have this position
             # Try multiple field names for condition_id (API may use camelCase or snake_case)
