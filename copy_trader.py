@@ -1008,15 +1008,15 @@ def _queue_pending_redemption(condition_id: str, token_id: str, slug: str, attem
     for item in _pending_redemptions:
         if item["condition_id"] == condition_id:
             item["attempts"] = attempts
-            # Exponential backoff: 30min, 60min, 90min, 120min cap
-            item["next_retry"] = _t.time() + min(1800 * attempts, 7200)
+            # Backoff: 2min, 5min, 10min, 15min, 30min cap
+            item["next_retry"] = _t.time() + min(120 * (2 ** (attempts - 1)), 1800)
             return
     _pending_redemptions.append({
         "condition_id": condition_id,
         "token_id": token_id,
         "slug": slug,
         "attempts": attempts,
-        "next_retry": _t.time() + 1800,  # 30 minutes before first retry
+        "next_retry": _t.time() + 120,  # 2 minutes before first retry (oracle usually settles fast)
     })
     remaining = _relay_daily_remaining()
     print(f"[REDEEM] Queued for retry (attempt {attempts}): condition={condition_id[:20]}... "
@@ -1060,7 +1060,7 @@ def retry_pending_redemptions(dry_run: bool = False):
             retried += 1
         else:
             item["attempts"] += 1
-            item["next_retry"] = now + min(1800 * item["attempts"], 7200)  # 30min increments, 2hr cap
+            item["next_retry"] = now + min(120 * (2 ** (item["attempts"] - 1)), 1800)  # 2min, 4min, 8min... 30min cap
             still_pending.append(item)
     _pending_redemptions[:] = still_pending
     if _pending_redemptions:
@@ -3013,7 +3013,9 @@ class CopyTrader:
                         if redeemed is True:
                             print(f"[ALGO] Auto-redeemed: {position['market'][:30]}")
                         elif redeemed is None:
-                            pass  # No-op: balance was 0, already logged by redeem function
+                            # Oracle not settled on-chain yet — queue for retry
+                            print(f"[ALGO] Not redeemable yet (oracle pending) — queuing retry: {position['market'][:30]}")
+                            _queue_pending_redemption(condition_id, token_id, slug)
                         else:
                             print(f"[ALGO] Redemption failed for {position['market'][:30]} — queued for retry")
                             _queue_pending_redemption(condition_id, token_id, slug)
