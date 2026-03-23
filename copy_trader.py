@@ -622,8 +622,8 @@ _RELAY_WINDOW = 60.0  # sliding window in seconds
 _RELAY_MIN_GAP = 2.5  # minimum seconds between /submit calls
 
 # Daily transaction cap — Unverified Builder tier = 100 tx/day, Verified = 3000 tx/day
-# Set via RELAY_DAILY_LIMIT env var; defaults to 90 (leaves 10 tx buffer for manual use)
-_RELAY_DAILY_LIMIT = int(os.getenv("RELAY_DAILY_LIMIT", "90"))
+# Set via RELAY_DAILY_LIMIT env var; defaults to 48 (spread across 30-min intervals over 24h)
+_RELAY_DAILY_LIMIT = int(os.getenv("RELAY_DAILY_LIMIT", "48"))
 _relay_daily_count = 0       # transactions submitted today
 _relay_daily_date = ""       # date string (YYYY-MM-DD UTC) for current count
 
@@ -1918,7 +1918,7 @@ class CopyTrader:
         self.positions = load_positions()
 
         self.last_resolution_check = 0
-        self.resolution_check_interval = 60  # Check every 60 seconds
+        self.resolution_check_interval = 1800  # Check every 30 minutes (relayer has 100 tx/day limit)
 
         # WebSocket for real-time prices (replaces stale REST prices)
         self.ws: Optional["CLOBWebSocket"] = None
