@@ -9,8 +9,8 @@
   const BETWEEN_CLICKS_MS = 1500; // pause between clicking multiple buttons
 
   // Selectors / text patterns for claimable buttons.
-  // Polymarket uses different labels depending on context.
-  const CLAIM_PATTERNS = [/^claim$/i, /^redeem$/i, /^claim\s+\$/i, /^redeem\s+\$/i];
+  // Only match "Claim" — "Redeem" also appears on losing positions and must be avoided.
+  const CLAIM_PATTERNS = [/^claim$/i, /^claim\s+\$/i];
 
   function findClaimButtons() {
     const buttons = document.querySelectorAll('button, [role="button"], a[class*="btn"]');

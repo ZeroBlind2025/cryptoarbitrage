@@ -3,7 +3,7 @@
   "name": "Polymarket Auto-Redeemer + MetaMask Confirmer",
   "version": "1.1",
   "description": "Auto-redeems Polymarket positions and confirms MetaMask popups.",
-  "permissions": ["alarms", "storage", "tabs", "debugger"],
+  "permissions": ["alarms", "storage", "tabs", "debugger", "webNavigation"],
   "host_permissions": ["https://polymarket.com/*"],
   "content_scripts": [
     {
