@@ -1,0 +1,12 @@
+{
+  "name": "metamask-confirmer",
+  "version": "1.0.0",
+  "description": "Auto-clicks MetaMask Confirm/Done buttons for Polymarket claims",
+  "main": "confirm.js",
+  "scripts": {
+    "start": "node confirm.js"
+  },
+  "dependencies": {
+    "puppeteer-core": "^24.0.0"
+  }
+}

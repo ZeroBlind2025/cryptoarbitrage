@@ -1027,6 +1027,16 @@ class MomentumEngine:
                     continue
             token_ids.extend(m.get("token_ids", []))
 
+        # CRITICAL: Also subscribe to tokens from open positions — they may
+        # have rotated out of the scan list but still need live prices for
+        # stop-loss checks.
+        token_set = set(token_ids)
+        for pos in self.positions.get("open", []):
+            tid = pos.get("token_id", "")
+            if tid and tid not in token_set:
+                token_ids.append(tid)
+                token_set.add(tid)
+
         # Fallback to generic fetch only if we have no cached markets yet
         if not token_ids:
             token_ids = get_active_crypto_tokens()
@@ -1078,6 +1088,7 @@ class MomentumEngine:
         """
         self._clob_price_cache = {}
         tokens_to_fetch = []
+        seen_tokens = set()
 
         for m in markets:
             # Skip resolved markets (0/1 prices)
@@ -1085,12 +1096,29 @@ class MomentumEngine:
             if len(prices) == 2 and prices[0] in (0.0, 1.0) and prices[1] in (0.0, 1.0):
                 continue
             for tid in m.get("token_ids", []):
+                seen_tokens.add(tid)
                 # Skip tokens that already have live WS prices
                 if self.ws:
                     _, ws_ask = self.ws.get_best_prices(tid)
                     if ws_ask is not None:
                         continue
                 # Also skip if already in ws_price_cache
+                ws_id = self._market_token_to_ws.get(tid)
+                if tid in self._ws_price_cache or (ws_id and ws_id in self._ws_price_cache):
+                    continue
+                tokens_to_fetch.append(tid)
+
+        # CRITICAL: Also fetch prices for open position tokens that aren't in
+        # the scan list — needed for stop-loss price checks.
+        for pos in self.positions.get("open", []):
+            tid = pos.get("token_id", "")
+            if tid and tid not in seen_tokens:
+                seen_tokens.add(tid)
+                # Same WS skip logic
+                if self.ws:
+                    _, ws_ask = self.ws.get_best_prices(tid)
+                    if ws_ask is not None:
+                        continue
                 ws_id = self._market_token_to_ws.get(tid)
                 if tid in self._ws_price_cache or (ws_id and ws_id in self._ws_price_cache):
                     continue
@@ -1903,8 +1931,16 @@ class MomentumEngine:
 
         if stopped > 0:
             print(f"[MOMENTUM] {stopped} position(s) stopped out", flush=True)
-        elif no_price_count > 0:
-            print(f"[MOMENTUM] SL check: {len(momentum_open)} positions, {no_price_count} had no live price", flush=True)
+        if no_price_count > 0:
+            # Log details for positions missing prices (critical for debugging)
+            missing_tokens = []
+            for p in momentum_open:
+                tid = p.get("token_id", "")
+                if tid and not self.get_live_price(tid):
+                    in_scan = any(tid in m.get("token_ids", []) for m in self._cached_markets)
+                    missing_tokens.append(f"{p.get('market', '?')[:25]}(scan={in_scan},tid={tid[:12]}...)")
+            print(f"[MOMENTUM] SL check: {len(momentum_open)} positions, {no_price_count} had no live price: "
+                  f"{'; '.join(missing_tokens[:3])}", flush=True)
 
         return stopped
 

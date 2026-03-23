@@ -1,6 +1,6 @@
 // Polymarket Auto-Redeemer — Content Script
 // Runs on polymarket.com/portfolio* pages.
-// Finds and clicks all "Claim" / "Redeem" buttons, then schedules a page
+// Finds and clicks all "Claim" buttons, then schedules a page
 // refresh every 15 minutes to pick up newly resolved markets.
 
 (function () {
@@ -10,7 +10,7 @@
 
   // Selectors / text patterns for claimable buttons.
   // Polymarket uses different labels depending on context.
-  const CLAIM_PATTERNS = [/^claim$/i, /^redeem$/i, /^claim\s+\$/i, /^redeem\s+\$/i];
+  const CLAIM_PATTERNS = [/^claim$/i, /^claim\s+\$/i];
 
   function findClaimButtons() {
     const buttons = document.querySelectorAll('button, [role="button"], a[class*="btn"]');
@@ -52,7 +52,7 @@
   // buttons. Loops until no more approve/confirm buttons appear, since each
   // redemption may spawn a separate MetaMask approval.
   async function handleConfirmationDialogs() {
-    const confirmPatterns = [/^confirm$/i, /^yes$/i, /^ok$/i, /^submit$/i, /^approve$/i];
+    const confirmPatterns = [/^claim/i, /^confirm$/i, /^done$/i, /^yes$/i, /^ok$/i, /^submit$/i, /^approve$/i];
     const MAX_ROUNDS = 30; // up to 30 rounds (~60s max) to handle many redemptions
     let round = 0;
     let consecutiveEmpty = 0;
