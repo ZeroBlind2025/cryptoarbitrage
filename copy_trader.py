@@ -67,8 +67,9 @@ PRIVATE_KEY = os.getenv("POLYGON_PRIVATE_KEY", "")
 SIGNATURE_TYPE = int(os.getenv("POLYMARKET_SIGNATURE_TYPE", "2"))  # 0=EOA, 1=Poly proxy, 2=Gnosis Safe (most common)
 
 # Relayer API Key (simplest auth — create at polymarket.com/settings?tab=api-keys)
-# Just needs RELAYER_API_KEY + your EOA address. No rate limits from shared signer.
+# RELAYER_API_KEY + the address it was created for. No rate limits from shared signer.
 RELAYER_API_KEY = os.getenv("POLYMARKET_RELAYER_API_KEY", "")
+RELAYER_ADDRESS = os.getenv("POLYMARKET_RELAYER_ADDRESS", "")  # address tied to the relayer key
 
 # Builder credentials (from polymarket.com/settings?tab=builder)
 # IMPORTANT: These are BUILDER creds, NOT CLOB API creds. Get them from polymarket.com/settings?tab=builder
@@ -756,18 +757,19 @@ def _get_relay_headers(body_dict: dict) -> dict:
 
     # --- Method 0: Relayer API Key (simplest, no HMAC needed) ---
     if RELAYER_API_KEY:
-        eoa = os.getenv("POLYMARKET_ADDRESS", "")
-        if not eoa and PRIVATE_KEY:
+        # Use the dedicated relayer address if set, otherwise fall back to EOA
+        addr = RELAYER_ADDRESS or os.getenv("POLYMARKET_ADDRESS", "")
+        if not addr and PRIVATE_KEY:
             try:
                 from eth_account import Account
-                eoa = Account.from_key(PRIVATE_KEY).address
+                addr = Account.from_key(PRIVATE_KEY).address
             except Exception:
                 pass
-        if eoa:
-            print(f"[REDEEM] Using Relayer API Key (key={RELAYER_API_KEY[:12]}...)")
+        if addr:
+            print(f"[REDEEM] Using Relayer API Key (key={RELAYER_API_KEY[:12]}..., addr={addr[:10]}...)")
             return {
                 "RELAYER_API_KEY": RELAYER_API_KEY,
-                "RELAYER_API_KEY_ADDRESS": eoa,
+                "RELAYER_API_KEY_ADDRESS": addr,
                 "Content-Type": "application/json",
             }
 
