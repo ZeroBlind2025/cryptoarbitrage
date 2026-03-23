@@ -1500,6 +1500,21 @@ class MomentumEngine:
                     print(f"  REJECT opposite_held: already hold other side of {_mkt_label}", flush=True)
                     continue
 
+                # --- GUARD: No re-entry below existing price for same coin ---
+                # Prevents entering a new time-window market (different condition_id)
+                # at a price lower than what we already hold for this coin+outcome.
+                # e.g. if we hold BTC Yes @ 95¢, don't enter a new BTC Yes @ 90¢.
+                best_existing_price = 0
+                for pos in self.positions.get("open", []):
+                    if (pos.get("source") == "momentum"
+                            and detect_coin(pos.get("slug", ""), pos.get("market", "")) == coin
+                            and pos.get("outcome", "").lower() == outcome.lower()
+                            and pos.get("entry_price", 0) > best_existing_price):
+                        best_existing_price = pos["entry_price"]
+                if best_existing_price > 0 and price < best_existing_price:
+                    print(f"  REJECT lower_reentry: {_mkt_label} {outcome} @ {price*100:.1f}¢ < existing {best_existing_price*100:.1f}¢", flush=True)
+                    continue
+
                 # --- HEDGE TRIGGER: Price risen 5¢+ above probe → hedge opposite side ---
                 # This runs BEFORE the max-entries / cooldown guards because
                 # it's not a re-entry on primary — it's a hedge on the opposite side.
