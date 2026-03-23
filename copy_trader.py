@@ -66,9 +66,29 @@ FUNDER_ADDRESS = os.getenv("POLYMARKET_FUNDER_ADDRESS", os.getenv("POLYGON_ADDRE
 PRIVATE_KEY = os.getenv("POLYGON_PRIVATE_KEY", "")
 SIGNATURE_TYPE = int(os.getenv("POLYMARKET_SIGNATURE_TYPE", "2"))  # 0=EOA, 1=Poly proxy, 2=Gnosis Safe (most common)
 
-# Relayer API Key (simplest auth — create at polymarket.com/settings?tab=api-keys)
-# Just needs RELAYER_API_KEY + your EOA address. No rate limits from shared signer.
-RELAYER_API_KEY = os.getenv("POLYMARKET_RELAYER_API_KEY", "019d188b-1868-7806-88bd-634199feb295")
+# Relayer API Keys — multiple keys rotate to avoid per-key daily limits (100 tx/day each).
+# Set POLYMARKET_RELAYER_API_KEYS as comma-separated list, or use individual
+# POLYMARKET_RELAYER_API_KEY_1, _2, _3 etc.  Falls back to single POLYMARKET_RELAYER_API_KEY.
+def _load_relayer_keys() -> list:
+    """Load all relayer API keys from environment."""
+    # Method 1: comma-separated list
+    keys_csv = os.getenv("POLYMARKET_RELAYER_API_KEYS", "")
+    if keys_csv:
+        return [k.strip() for k in keys_csv.split(",") if k.strip()]
+    # Method 2: numbered env vars (_1, _2, _3, ...)
+    numbered = []
+    for i in range(1, 20):
+        k = os.getenv(f"POLYMARKET_RELAYER_API_KEY_{i}", "")
+        if k:
+            numbered.append(k)
+    if numbered:
+        return numbered
+    # Method 3: single key (backward compat)
+    single = os.getenv("POLYMARKET_RELAYER_API_KEY", "019d188b-1868-7806-88bd-634199feb295")
+    return [single] if single else []
+
+RELAYER_API_KEYS: list = _load_relayer_keys()
+RELAYER_API_KEY = RELAYER_API_KEYS[0] if RELAYER_API_KEYS else ""  # backward compat
 RELAYER_ADDRESS = os.getenv("POLYMARKET_ADDRESS", "0x14d24f7691408ca906163658ec17079aa6eaf612")
 
 # Builder credentials (from polymarket.com/settings?tab=builder)
@@ -622,34 +642,61 @@ _RELAY_MAX_PER_MINUTE = 24  # stay just under the 25/min limit
 _RELAY_WINDOW = 60.0  # sliding window in seconds
 _RELAY_MIN_GAP = 2.5  # minimum seconds between /submit calls
 
-# Daily transaction cap — Unverified Builder tier = 100 tx/day, Verified = 3000 tx/day
-# Set via RELAY_DAILY_LIMIT env var; defaults to 48 (spread across 30-min intervals over 24h)
+# Daily transaction cap per key — Unverified Builder tier = 100 tx/day, Verified = 3000 tx/day
+# Set via RELAY_DAILY_LIMIT env var; defaults to 48 per key (spread across 30-min intervals over 24h)
 _RELAY_DAILY_LIMIT = int(os.getenv("RELAY_DAILY_LIMIT", "48"))
-_relay_daily_count = 0       # transactions submitted today
-_relay_daily_date = ""       # date string (YYYY-MM-DD UTC) for current count
+_relay_daily_counts: dict = {}   # {key: count} transactions submitted today per key
+_relay_daily_date = ""           # date string (YYYY-MM-DD UTC) for current counts
+_relay_current_key_idx = 0       # index into RELAYER_API_KEYS for round-robin
+
+
+def _relay_reset_if_new_day():
+    """Reset all per-key counters if UTC date has changed."""
+    global _relay_daily_counts, _relay_daily_date
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if _relay_daily_date != today:
+        _relay_daily_counts = {}
+        _relay_daily_date = today
+
+
+def _relay_key_remaining(key: str) -> int:
+    """Return how many relay transactions remain for a specific key today."""
+    _relay_reset_if_new_day()
+    return max(0, _RELAY_DAILY_LIMIT - _relay_daily_counts.get(key, 0))
 
 
 def _relay_daily_remaining() -> int:
-    """Return how many relay transactions remain for today (UTC)."""
-    global _relay_daily_count, _relay_daily_date
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    if _relay_daily_date != today:
-        # New UTC day — reset counter
-        _relay_daily_count = 0
-        _relay_daily_date = today
-    return max(0, _RELAY_DAILY_LIMIT - _relay_daily_count)
+    """Return total relay transactions remaining across ALL keys today (UTC)."""
+    _relay_reset_if_new_day()
+    return sum(_relay_key_remaining(k) for k in RELAYER_API_KEYS) if RELAYER_API_KEYS else 0
 
 
-def _relay_daily_increment():
+def _relay_pick_key() -> str:
+    """Pick the next relayer API key with remaining daily quota (round-robin)."""
+    global _relay_current_key_idx
+    if not RELAYER_API_KEYS:
+        return ""
+    _relay_reset_if_new_day()
+    n = len(RELAYER_API_KEYS)
+    for _ in range(n):
+        key = RELAYER_API_KEYS[_relay_current_key_idx % n]
+        _relay_current_key_idx = (_relay_current_key_idx + 1) % n
+        if _relay_key_remaining(key) > 0:
+            return key
+    return ""  # all keys exhausted
+
+
+def _relay_daily_increment(key: str = ""):
     """Record one relay transaction for today's daily counter."""
-    global _relay_daily_count, _relay_daily_date
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    if _relay_daily_date != today:
-        _relay_daily_count = 0
-        _relay_daily_date = today
-    _relay_daily_count += 1
-    remaining = _RELAY_DAILY_LIMIT - _relay_daily_count
-    print(f"[RELAY] Daily usage: {_relay_daily_count}/{_RELAY_DAILY_LIMIT} (remaining: {remaining})")
+    _relay_reset_if_new_day()
+    if not key and RELAYER_API_KEYS:
+        key = RELAYER_API_KEYS[0]
+    _relay_daily_counts[key] = _relay_daily_counts.get(key, 0) + 1
+    key_count = _relay_daily_counts[key]
+    total_remaining = _relay_daily_remaining()
+    key_short = key[:12] + "..." if len(key) > 12 else key
+    print(f"[RELAY] Key {key_short} usage: {key_count}/{_RELAY_DAILY_LIMIT} | "
+          f"total remaining across {len(RELAYER_API_KEYS)} key(s): {total_remaining}")
 
 
 def _relay_rate_limit_wait() -> bool:
@@ -675,7 +722,9 @@ def _relay_rate_limit_wait() -> bool:
         until_reset = (next_reset - datetime.now(timezone.utc)).total_seconds()
         hours = int(until_reset // 3600)
         mins = int((until_reset % 3600) // 60)
-        print(f"[RELAY] DAILY LIMIT REACHED ({_relay_daily_count}/{_RELAY_DAILY_LIMIT}). "
+        total_used = sum(_relay_daily_counts.values())
+        total_cap = _RELAY_DAILY_LIMIT * len(RELAYER_API_KEYS) if RELAYER_API_KEYS else _RELAY_DAILY_LIMIT
+        print(f"[RELAY] ALL KEYS EXHAUSTED ({total_used}/{total_cap} across {len(RELAYER_API_KEYS)} key(s)). "
               f"Resets in {hours}h {mins}m. Skipping relay — will queue for retry.")
         return False
 
@@ -757,7 +806,9 @@ def _get_relay_headers(body_dict: dict) -> dict:
     import json as _json
 
     # --- Method 0: Relayer API Key (simplest, no HMAC needed) ---
-    if RELAYER_API_KEY:
+    # Pick the next key with remaining daily quota (round-robin across all keys)
+    active_key = _relay_pick_key() if RELAYER_API_KEYS else ""
+    if active_key:
         eoa = RELAYER_ADDRESS or os.getenv("POLYMARKET_ADDRESS", "")
         if not eoa and PRIVATE_KEY:
             try:
@@ -766,11 +817,15 @@ def _get_relay_headers(body_dict: dict) -> dict:
             except Exception:
                 pass
         if eoa:
-            print(f"[REDEEM] Using Relayer API Key (key={RELAYER_API_KEY[:12]}...)")
+            key_idx = RELAYER_API_KEYS.index(active_key) + 1 if active_key in RELAYER_API_KEYS else "?"
+            remaining = _relay_key_remaining(active_key)
+            print(f"[REDEEM] Using Relayer API Key {key_idx}/{len(RELAYER_API_KEYS)} "
+                  f"(key={active_key[:12]}... remaining={remaining})")
             return {
-                "RELAYER_API_KEY": RELAYER_API_KEY,
+                "RELAYER_API_KEY": active_key,
                 "RELAYER_API_KEY_ADDRESS": eoa,
                 "Content-Type": "application/json",
+                "_active_relay_key": active_key,  # internal: used by _relay_daily_increment
             }
 
     # --- Method 1: Builder credentials + L2 creds ---
@@ -896,6 +951,7 @@ def _redeem_via_relay(w3, account, safe_contract, proxy_address: str,
     }
 
     headers = _get_relay_headers(body)
+    active_key = headers.pop("_active_relay_key", "")  # internal tracking, don't send to relay
 
     # Enforce rate limit before hitting /submit (25 req/min + daily cap)
     if not _relay_rate_limit_wait():
@@ -909,8 +965,8 @@ def _redeem_via_relay(w3, account, safe_contract, proxy_address: str,
     )
     resp.raise_for_status()
 
-    # Count this successful submission against the daily cap
-    _relay_daily_increment()
+    # Count this successful submission against the specific key's daily cap
+    _relay_daily_increment(active_key)
 
     result = resp.json()
 
@@ -2856,7 +2912,10 @@ class CopyTrader:
         self.start()
 
         ws_status = "WebSocket active" if self.ws and self.ws.connected else "REST only"
+        relay_cap = _RELAY_DAILY_LIMIT * len(RELAYER_API_KEYS) if RELAYER_API_KEYS else 0
         print(f"[ALGO] Starting continuous monitoring (every {POLL_INTERVAL}s, {ws_status})...")
+        print(f"[ALGO] Relayer keys: {len(RELAYER_API_KEYS)} loaded | "
+              f"daily cap: {relay_cap} tx ({_RELAY_DAILY_LIMIT}/key)")
         print("[ALGO] Press Ctrl+C to stop\n")
 
         try:
