@@ -22,7 +22,7 @@ const CHROME_DEBUG_PORT = (() => {
 })();
 
 const POLL_MS = 1500;
-const CONFIRM_TEXTS = ["confirm", "done"];
+const CONFIRM_TEXTS = ["confirm", "done", "sign", "got it", "next", "approve", "connect"];
 
 async function main() {
   console.log(`[MetaMask-Confirmer] Connecting to Chrome on port ${CHROME_DEBUG_PORT}...`);
@@ -45,9 +45,10 @@ async function main() {
       for (const page of pages) {
         const url = page.url();
 
-        // MetaMask notification popups have URLs like:
-        // chrome-extension://<id>/notification.html
-        if (!url.includes("notification.html") && !url.includes("confirm")) continue;
+        // MetaMask popups can be notification.html, popup.html, home.html, etc.
+        if (!url.includes("chrome-extension://")) continue;
+        // Skip the background/service-worker page
+        if (url.includes("_generated_background_page") || url === "about:blank") continue;
         if (handled.has(url + page._target._targetId)) continue;
 
         const clicked = await tryClickConfirm(page);
@@ -87,7 +88,8 @@ async function mainLoop(browser, handled) {
 
       for (const page of pages) {
         const url = page.url();
-        if (!url.includes("notification.html") && !url.includes("confirm")) continue;
+        if (!url.includes("chrome-extension://")) continue;
+        if (url.includes("_generated_background_page") || url === "about:blank") continue;
 
         const targetId = page._target?._targetId || url;
         if (handled.has(url + targetId)) continue;
@@ -112,19 +114,23 @@ async function tryClickConfirm(page) {
   try {
     const result = await page.evaluate((texts) => {
       const buttons = document.querySelectorAll('button, [role="button"]');
+      const allBtnTexts = [];
       for (const btn of buttons) {
         const btnText = (btn.textContent || "").trim().toLowerCase();
+        allBtnTexts.push(btnText);
         if (texts.includes(btnText) && !btn.disabled) {
           btn.click();
-          return btnText;
+          return { clicked: btnText, allButtons: allBtnTexts };
         }
       }
-      return null;
+      return { clicked: null, allButtons: allBtnTexts };
     }, CONFIRM_TEXTS);
 
-    if (result) {
-      console.log(`[MetaMask-Confirmer] Clicked "${result}" at ${new Date().toLocaleTimeString()}`);
+    if (result?.clicked) {
+      console.log(`[MetaMask-Confirmer] Clicked "${result.clicked}" at ${new Date().toLocaleTimeString()}`);
       return true;
+    } else if (result?.allButtons?.length > 0) {
+      console.log(`[MetaMask-Confirmer] Found extension page (${page.url()}) with buttons: [${result.allButtons.join(", ")}] — no match`);
     }
   } catch {
     // Page may have closed between listing and evaluating — that's fine
