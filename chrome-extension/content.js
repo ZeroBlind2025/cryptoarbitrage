@@ -48,12 +48,12 @@
     return new Promise((r) => setTimeout(r, ms));
   }
 
-  // After clicking redeem, handle confirmation dialogs and MetaMask approve
-  // buttons. Loops until no more approve/confirm buttons appear, since each
-  // redemption may spawn a separate MetaMask approval.
-  async function handleConfirmationDialogs() {
-    const confirmPatterns = [/^confirm$/i, /^yes$/i, /^ok$/i, /^submit$/i, /^approve$/i];
-    const MAX_ROUNDS = 30; // up to 30 rounds (~60s max) to handle many redemptions
+  // Handle Polymarket-side confirmation dialogs (e.g. "are you sure?" modals).
+  // MetaMask popup confirmations are handled by the background service worker
+  // via chrome.debugger (see background.js).
+  async function handlePolymarketDialogs() {
+    const confirmPatterns = [/^confirm$/i, /^yes$/i, /^ok$/i, /^submit$/i];
+    const MAX_ROUNDS = 10;
     let round = 0;
     let consecutiveEmpty = 0;
 
@@ -78,7 +78,7 @@
       }
     }
     if (round > 0) {
-      console.log(`[AutoRedeem] Confirmation loop done after ${round} round(s)`);
+      console.log(`[AutoRedeem] Dialog loop done after ${round} round(s)`);
     }
   }
 
@@ -106,7 +106,7 @@
       console.log(`[AutoRedeem] Found ${buttons.length} claimable button(s)`);
       const clicked = await clickButtons(buttons);
       console.log(`[AutoRedeem] Clicked ${clicked} button(s)`);
-      await handleConfirmationDialogs();
+      await handlePolymarketDialogs();
     }
 
     // Log to storage for popup display

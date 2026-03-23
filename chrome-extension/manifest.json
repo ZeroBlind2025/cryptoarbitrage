@@ -1,9 +1,9 @@
 {
   "manifest_version": 3,
-  "name": "Polymarket Auto-Redeemer",
-  "version": "1.0",
-  "description": "Auto-refreshes Polymarket portfolio and clicks claim/redeem buttons to avoid API 429 rate limits.",
-  "permissions": ["alarms", "storage"],
+  "name": "Polymarket Auto-Redeemer + MetaMask Confirmer",
+  "version": "1.1",
+  "description": "Auto-redeems Polymarket positions and confirms MetaMask popups.",
+  "permissions": ["alarms", "storage", "tabs", "debugger"],
   "host_permissions": ["https://polymarket.com/*"],
   "content_scripts": [
     {
