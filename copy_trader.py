@@ -66,7 +66,7 @@ FUNDER_ADDRESS = os.getenv("POLYMARKET_FUNDER_ADDRESS", os.getenv("POLYGON_ADDRE
 PRIVATE_KEY = os.getenv("POLYGON_PRIVATE_KEY", "")
 SIGNATURE_TYPE = int(os.getenv("POLYMARKET_SIGNATURE_TYPE", "2"))  # 0=EOA, 1=Poly proxy, 2=Gnosis Safe (most common)
 
-# Relayer API Keys — multiple keys rotate to avoid per-key daily limits (100 tx/day each).
+# Relayer API Keys — multiple keys rotate for load distribution.
 # Set POLYMARKET_RELAYER_API_KEYS as comma-separated list, or use individual
 # POLYMARKET_RELAYER_API_KEY_1, _2, _3 etc.  Falls back to single POLYMARKET_RELAYER_API_KEY.
 def _load_relayer_keys() -> list:
@@ -661,15 +661,13 @@ def _check_neg_risk(condition_id: str, slug: str = "") -> bool:
 RELAY_URL = "https://relayer-v2.polymarket.com"
 
 # Rate limiter for relayer /submit — 25 req/min limit, we target 24 req/min (2.5s gap)
+# NOTE: Relayer API keys have NO daily limit (confirmed by Polymarket). Only per-minute
+# and min-gap rate limits are enforced here to avoid 429s.
 _relay_submit_times: list = []  # timestamps of recent /submit calls
 _RELAY_MAX_PER_MINUTE = 24  # stay just under the 25/min limit
 _RELAY_WINDOW = 60.0  # sliding window in seconds
 _RELAY_MIN_GAP = 2.5  # minimum seconds between /submit calls
-
-# Daily transaction cap per key — Unverified Builder tier = 100 tx/day, Verified = 3000 tx/day
-# Set via RELAY_DAILY_LIMIT env var; defaults to 48 per key (spread across 30-min intervals over 24h)
-_RELAY_DAILY_LIMIT = int(os.getenv("RELAY_DAILY_LIMIT", "48"))
-_relay_daily_counts: dict = {}   # {key: count} transactions submitted today per key
+_relay_daily_counts: dict = {}   # {key: count} transactions submitted today per key (tracking only)
 _relay_daily_date = ""           # date string (YYYY-MM-DD UTC) for current counts
 _relay_current_key_idx = 0       # index into RELAYER_API_KEYS for round-robin
 
@@ -683,74 +681,44 @@ def _relay_reset_if_new_day():
         _relay_daily_date = today
 
 
-def _relay_key_remaining(key: str) -> int:
-    """Return how many relay transactions remain for a specific key today."""
-    _relay_reset_if_new_day()
-    return max(0, _RELAY_DAILY_LIMIT - _relay_daily_counts.get(key, 0))
-
-
 def _relay_daily_remaining() -> int:
-    """Return total relay transactions remaining across ALL keys today (UTC)."""
-    _relay_reset_if_new_day()
-    return sum(_relay_key_remaining(k) for k in RELAYER_API_KEYS) if RELAYER_API_KEYS else 0
+    """Return -1 (unlimited) — relayer keys have no daily cap."""
+    return -1
 
 
 def _relay_pick_key() -> str:
-    """Pick the next relayer API key with remaining daily quota (round-robin)."""
+    """Pick the next relayer API key (round-robin). No daily quota check needed."""
     global _relay_current_key_idx
     if not RELAYER_API_KEYS:
         return ""
-    _relay_reset_if_new_day()
-    n = len(RELAYER_API_KEYS)
-    for _ in range(n):
-        key = RELAYER_API_KEYS[_relay_current_key_idx % n]
-        _relay_current_key_idx = (_relay_current_key_idx + 1) % n
-        if _relay_key_remaining(key) > 0:
-            return key
-    return ""  # all keys exhausted
+    key = RELAYER_API_KEYS[_relay_current_key_idx % len(RELAYER_API_KEYS)]
+    _relay_current_key_idx = (_relay_current_key_idx + 1) % len(RELAYER_API_KEYS)
+    return key
 
 
 def _relay_daily_increment(key: str = ""):
-    """Record one relay transaction for today's daily counter."""
+    """Record one relay transaction for logging/observability (no cap enforced)."""
     _relay_reset_if_new_day()
     if not key and RELAYER_API_KEYS:
         key = RELAYER_API_KEYS[0]
     _relay_daily_counts[key] = _relay_daily_counts.get(key, 0) + 1
     key_count = _relay_daily_counts[key]
-    total_remaining = _relay_daily_remaining()
+    total_today = sum(_relay_daily_counts.values())
     key_short = key[:12] + "..." if len(key) > 12 else key
-    print(f"[RELAY] Key {key_short} usage: {key_count}/{_RELAY_DAILY_LIMIT} | "
-          f"total remaining across {len(RELAYER_API_KEYS)} key(s): {total_remaining}")
+    print(f"[RELAY] Key {key_short} usage today: {key_count} | "
+          f"total across {len(RELAYER_API_KEYS)} key(s): {total_today}")
 
 
 def _relay_rate_limit_wait() -> bool:
     """Block until we can safely send another /submit request.
 
     Enforces:
-      1. Daily transaction cap (default 90/day, configurable via RELAY_DAILY_LIMIT)
-      2. Per-minute cap (24/min, under the 25/min hard limit)
-      3. Minimum gap between calls (2.5s)
+      1. Per-minute cap (24/min, under the 25/min hard limit)
+      2. Minimum gap between calls (2.5s)
 
-    Returns True if the request can proceed, False if the daily limit is exhausted.
+    Returns True when the request can proceed.
     """
     import time as _t
-
-    # Check daily limit first — no point waiting if we're already at the cap
-    if _relay_daily_remaining() <= 0:
-        next_reset = datetime.now(timezone.utc).replace(
-            hour=0, minute=0, second=0, microsecond=0
-        )
-        # next_reset is today 00:00 UTC which is in the past; add 1 day
-        from datetime import timedelta
-        next_reset += timedelta(days=1)
-        until_reset = (next_reset - datetime.now(timezone.utc)).total_seconds()
-        hours = int(until_reset // 3600)
-        mins = int((until_reset % 3600) // 60)
-        total_used = sum(_relay_daily_counts.values())
-        total_cap = _RELAY_DAILY_LIMIT * len(RELAYER_API_KEYS) if RELAYER_API_KEYS else _RELAY_DAILY_LIMIT
-        print(f"[RELAY] ALL KEYS EXHAUSTED ({total_used}/{total_cap} across {len(RELAYER_API_KEYS)} key(s)). "
-              f"Resets in {hours}h {mins}m. Skipping relay — will queue for retry.")
-        return False
 
     now = _t.time()
 
@@ -842,9 +810,8 @@ def _get_relay_headers(body_dict: dict) -> dict:
                 pass
         if eoa:
             key_idx = RELAYER_API_KEYS.index(active_key) + 1 if active_key in RELAYER_API_KEYS else "?"
-            remaining = _relay_key_remaining(active_key)
             print(f"[REDEEM] Using Relayer API Key {key_idx}/{len(RELAYER_API_KEYS)} "
-                  f"(key={active_key[:12]}... remaining={remaining})")
+                  f"(key={active_key[:12]}...)")
             return {
                 "RELAYER_API_KEY": active_key,
                 "RELAYER_API_KEY_ADDRESS": eoa,
@@ -977,9 +944,8 @@ def _redeem_via_relay(w3, account, safe_contract, proxy_address: str,
     headers = _get_relay_headers(body)
     active_key = headers.pop("_active_relay_key", "")  # internal tracking, don't send to relay
 
-    # Enforce rate limit before hitting /submit (25 req/min + daily cap)
-    if not _relay_rate_limit_wait():
-        raise RuntimeError("Daily relay limit reached (429-prevention)")
+    # Enforce per-minute rate limit before hitting /submit
+    _relay_rate_limit_wait()
 
     resp = requests.post(
         f"{RELAY_URL}/submit",
@@ -989,7 +955,7 @@ def _redeem_via_relay(w3, account, safe_contract, proxy_address: str,
     )
     resp.raise_for_status()
 
-    # Count this successful submission against the specific key's daily cap
+    # Track this submission for observability
     _relay_daily_increment(active_key)
 
     result = resp.json()
@@ -1081,8 +1047,8 @@ _PENDING_MAX_ATTEMPTS = 10  # give up after this many total attempts (conserve d
 def _queue_pending_redemption(condition_id: str, token_id: str, slug: str, attempts: int = 1):
     """Add a failed redemption to the retry queue.
 
-    Backoff is aggressive to conserve daily relay quota (100 tx/day on Unverified tier).
-    First retry after 30 min, then exponential up to 2 hour cap.
+    Backoff gives the relay time to recover from transient errors.
+    First retry after 2 min, then exponential up to 30 min cap.
     """
     import time as _t
     # Don't duplicate
@@ -1099,24 +1065,15 @@ def _queue_pending_redemption(condition_id: str, token_id: str, slug: str, attem
         "attempts": attempts,
         "next_retry": _t.time() + 120,  # 2 minutes before first retry (oracle usually settles fast)
     })
-    remaining = _relay_daily_remaining()
-    print(f"[REDEEM] Queued for retry (attempt {attempts}): condition={condition_id[:20]}... "
-          f"(daily relay remaining: {remaining})")
+    print(f"[REDEEM] Queued for retry (attempt {attempts}): condition={condition_id[:20]}...")
 
 
 def retry_pending_redemptions(dry_run: bool = False):
-    """Retry any queued redemptions whose backoff has elapsed. Call periodically.
-
-    Checks daily relay quota before each retry to avoid wasting transactions.
-    """
+    """Retry any queued redemptions whose backoff has elapsed. Call periodically."""
     import time as _t
     if not _pending_redemptions:
         return
     now = _t.time()
-    remaining = _relay_daily_remaining()
-    if remaining <= 0:
-        print(f"[REDEEM] Daily relay limit reached — skipping {len(_pending_redemptions)} pending redemption(s)")
-        return
     still_pending = []
     retried = 0
     for item in _pending_redemptions:
@@ -1125,11 +1082,6 @@ def retry_pending_redemptions(dry_run: bool = False):
             continue
         if item["attempts"] >= _PENDING_MAX_ATTEMPTS:
             print(f"[REDEEM] Giving up after {item['attempts']} attempts: {item['condition_id'][:20]}...")
-            continue
-        # Reserve some daily quota — don't burn all remaining on retries
-        if _relay_daily_remaining() <= 5:
-            print(f"[REDEEM] Only {_relay_daily_remaining()} relay tx left today — deferring remaining retries")
-            still_pending.append(item)
             continue
         print(f"[REDEEM] Retrying queued redemption (attempt {item['attempts']+1}): {item['condition_id'][:20]}...")
         result = redeem_winning_position(
@@ -1145,8 +1097,7 @@ def retry_pending_redemptions(dry_run: bool = False):
             still_pending.append(item)
     _pending_redemptions[:] = still_pending
     if _pending_redemptions:
-        print(f"[REDEEM] {len(_pending_redemptions)} redemption(s) still queued for retry "
-              f"(daily relay remaining: {_relay_daily_remaining()})")
+        print(f"[REDEEM] {len(_pending_redemptions)} redemption(s) still queued for retry")
 
 
 def redeem_winning_position(condition_id: str, token_id: str = "", dry_run: bool = False, slug: str = ""):
@@ -1291,7 +1242,7 @@ def redeem_winning_position(condition_id: str, token_id: str = "", dry_run: bool
                 return True
             except Exception as e:
                 relay_err = e
-                if "429" in str(e) or "Daily relay limit" in str(e):
+                if "429" in str(e):
                     print(f"[REDEEM] Relay rate-limited ({e}), queuing for later retry (non-blocking)")
                     _queue_pending_redemption(condition_id, token_id, slug)
                     return False
@@ -1999,7 +1950,7 @@ class CopyTrader:
         self.positions = load_positions()
 
         self.last_resolution_check = 0
-        self.resolution_check_interval = 1800  # Check every 30 minutes (relayer has 100 tx/day limit)
+        self.resolution_check_interval = 1800  # Check every 30 minutes
 
         # WebSocket for real-time prices (replaces stale REST prices)
         self.ws: Optional["CLOBWebSocket"] = None
@@ -2936,10 +2887,8 @@ class CopyTrader:
         self.start()
 
         ws_status = "WebSocket active" if self.ws and self.ws.connected else "REST only"
-        relay_cap = _RELAY_DAILY_LIMIT * len(RELAYER_API_KEYS) if RELAYER_API_KEYS else 0
         print(f"[ALGO] Starting continuous monitoring (every {POLL_INTERVAL}s, {ws_status})...")
-        print(f"[ALGO] Relayer keys: {len(RELAYER_API_KEYS)} loaded | "
-              f"daily cap: {relay_cap} tx ({_RELAY_DAILY_LIMIT}/key)")
+        print(f"[ALGO] Relayer keys: {len(RELAYER_API_KEYS)} loaded (no daily cap)")
         print("[ALGO] Press Ctrl+C to stop\n")
 
         try:
