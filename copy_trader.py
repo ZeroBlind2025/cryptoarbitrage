@@ -84,7 +84,7 @@ def _load_relayer_keys() -> list:
     if numbered:
         return numbered
     # Method 3: single key (backward compat)
-    single = os.getenv("POLYMARKET_RELAYER_API_KEY", "019d188b-1868-7806-88bd-634199feb295")
+    single = os.getenv("POLYMARKET_RELAYER_API_KEY", "")
     return [single] if single else []
 
 RELAYER_API_KEYS: list = _load_relayer_keys()
@@ -571,7 +571,7 @@ GNOSIS_SAFE_ABI = json.loads("""[
 
 
 POLYGON_RPC_FALLBACKS = [
-    "https://polygon-mainnet.g.alchemy.com/v2/S3PJkQkcYoIJiE9iaUxFc",
+    "https://polygon-mainnet.g.alchemy.com/v2/hJJlCWUOYFpkfSwZaghpq",
     "https://polygon-bor-rpc.publicnode.com",
     "https://polygon.llamarpc.com",
     "https://rpc.ankr.com/polygon",
@@ -579,10 +579,32 @@ POLYGON_RPC_FALLBACKS = [
 ]
 
 
+_w3_cached = None  # cached Web3 instance
+_w3_cached_at = 0.0  # timestamp of last successful connection
+_W3_CACHE_TTL = 300  # re-validate every 5 minutes
+
+
 def _get_web3():
-    """Lazy-initialize a Web3 connection to Polygon with fallback RPCs."""
+    """Lazy-initialize a Web3 connection to Polygon with fallback RPCs.
+
+    Caches the connection to avoid re-connecting (and burning RPC requests)
+    on every call.  Re-validates every 5 minutes.
+    """
+    global _w3_cached, _w3_cached_at
+    import time as _t
+
     if not HAS_WEB3:
         return None
+
+    # Return cached connection if still valid
+    now = _t.time()
+    if _w3_cached and (now - _w3_cached_at) < _W3_CACHE_TTL:
+        try:
+            if _w3_cached.is_connected():
+                return _w3_cached
+        except Exception:
+            pass
+        _w3_cached = None  # stale, reconnect
 
     # Try user-configured RPC first, then fallbacks
     rpc_urls = []
@@ -597,6 +619,8 @@ def _get_web3():
             w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
             if w3.is_connected():
                 print(f"[RPC] Connected via {rpc_url[:40]}...")
+                _w3_cached = w3
+                _w3_cached_at = now
                 return w3
         except Exception:
             continue
