@@ -663,10 +663,10 @@ RELAY_URL = "https://relayer-v2.polymarket.com"
 # Rate limiter for relayer /submit — 25 req/min limit, we target 24 req/min (2.5s gap)
 # NOTE: Relayer API keys have NO daily limit (confirmed by Polymarket). Only per-minute
 # and min-gap rate limits are enforced here to avoid 429s.
-_relay_submit_times: list = []  # timestamps of recent /submit calls
-_RELAY_MAX_PER_MINUTE = 24  # stay just under the 25/min limit
+_relay_submit_times: list = []  # timestamps of recent relay calls (nonce + submit)
+_RELAY_MAX_PER_MINUTE = 10  # each redemption = 2 calls (nonce+submit), so 10 redemptions = 20 reqs/min (under 25 hard limit)
 _RELAY_WINDOW = 60.0  # sliding window in seconds
-_RELAY_MIN_GAP = 2.5  # minimum seconds between /submit calls
+_RELAY_MIN_GAP = 5.0  # minimum seconds between redemptions (~2 calls each)
 _relay_daily_counts: dict = {}   # {key: count} transactions submitted today per key (tracking only)
 _relay_daily_date = ""           # date string (YYYY-MM-DD UTC) for current counts
 _relay_current_key_idx = 0       # index into RELAYER_API_KEYS for round-robin
@@ -907,6 +907,9 @@ def _redeem_via_relay(w3, account, safe_contract, proxy_address: str,
 
     eoa = account.address
 
+    # Enforce rate limit BEFORE any relay calls (nonce + submit both count)
+    _relay_rate_limit_wait()
+
     # Get nonce from relay
     nonce_resp = requests.get(
         f"{RELAY_URL}/nonce",
@@ -943,9 +946,6 @@ def _redeem_via_relay(w3, account, safe_contract, proxy_address: str,
 
     headers = _get_relay_headers(body)
     active_key = headers.pop("_active_relay_key", "")  # internal tracking, don't send to relay
-
-    # Enforce per-minute rate limit before hitting /submit
-    _relay_rate_limit_wait()
 
     resp = requests.post(
         f"{RELAY_URL}/submit",
@@ -1068,8 +1068,12 @@ def _queue_pending_redemption(condition_id: str, token_id: str, slug: str, attem
     print(f"[REDEEM] Queued for retry (attempt {attempts}): condition={condition_id[:20]}...")
 
 
-def retry_pending_redemptions(dry_run: bool = False):
-    """Retry any queued redemptions whose backoff has elapsed. Call periodically."""
+def retry_pending_redemptions(dry_run: bool = False, max_per_cycle: int = 3):
+    """Retry any queued redemptions whose backoff has elapsed. Call periodically.
+
+    Only retries up to *max_per_cycle* items per call to avoid bursting
+    the relay with a pile of queued redemptions all at once.
+    """
     import time as _t
     if not _pending_redemptions:
         return
@@ -1082,6 +1086,12 @@ def retry_pending_redemptions(dry_run: bool = False):
             continue
         if item["attempts"] >= _PENDING_MAX_ATTEMPTS:
             print(f"[REDEEM] Giving up after {item['attempts']} attempts: {item['condition_id'][:20]}...")
+            continue
+        if retried >= max_per_cycle:
+            # Defer remaining eligible items — stagger their next_retry so they
+            # don't all become eligible on the same tick next cycle.
+            item["next_retry"] = now + 10 * (len(still_pending) + 1)  # 10s spacing
+            still_pending.append(item)
             continue
         print(f"[REDEEM] Retrying queued redemption (attempt {item['attempts']+1}): {item['condition_id'][:20]}...")
         result = redeem_winning_position(
