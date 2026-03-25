@@ -89,7 +89,7 @@ def _load_relayer_keys() -> list:
 
 RELAYER_API_KEYS: list = _load_relayer_keys()
 RELAYER_API_KEY = RELAYER_API_KEYS[0] if RELAYER_API_KEYS else ""  # backward compat
-RELAYER_ADDRESS = os.getenv("POLYMARKET_ADDRESS", "0x14d24f7691408ca906163658ec17079aa6eaf612")
+RELAYER_ADDRESS = os.getenv("POLYMARKET_ADDRESS", "0x14D24f7691408Ca906163658ec17079Aa6Eaf612")
 
 # Builder credentials (from polymarket.com/settings?tab=builder)
 # IMPORTANT: These are BUILDER creds, NOT CLOB API creds. Get them from polymarket.com/settings?tab=builder
@@ -809,7 +809,13 @@ def _get_relay_headers(body_dict: dict) -> dict:
                 eoa = Account.from_key(PRIVATE_KEY).address
             except Exception:
                 pass
+        # Ensure checksummed address — relay does exact string match
         if eoa:
+            try:
+                from web3 import Web3 as _W3
+                eoa = _W3.to_checksum_address(eoa)
+            except Exception:
+                pass
             key_idx = RELAYER_API_KEYS.index(active_key) + 1 if active_key in RELAYER_API_KEYS else "?"
             print(f"[REDEEM] Using Relayer API Key {key_idx}/{len(RELAYER_API_KEYS)} "
                   f"(key={active_key[:12]}...)")
