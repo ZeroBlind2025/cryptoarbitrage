@@ -1053,6 +1053,12 @@ def _exec_via_safe(w3, safe_address: str, to: str, call_data: bytes, account) ->
 # Each entry: {"condition_id": str, "token_id": str, "slug": str, "attempts": int, "next_retry": float}
 _pending_redemptions: list = []
 _PENDING_MAX_ATTEMPTS = 10  # give up after this many total attempts (conserve daily quota)
+_last_cooldown_log: float = 0.0  # throttle cooldown log to once per 60s
+
+
+def _is_pending_redemption(condition_id: str) -> bool:
+    """Check if a condition_id is already in the retry queue."""
+    return any(item["condition_id"] == condition_id for item in _pending_redemptions)
 
 
 def _queue_pending_redemption(condition_id: str, token_id: str, slug: str, attempts: int = 1):
@@ -1095,10 +1101,13 @@ def retry_pending_redemptions(dry_run: bool = False, max_per_cycle: int = 3):
 
     now = _t.time()
 
-    # Early exit: if relay is in global cooldown, don't even try — just log once.
+    # Early exit: if relay is in global cooldown, don't even try — log at most once/min.
+    global _last_cooldown_log
     if now < _relay_cooldown_until:
-        remaining = int(_relay_cooldown_until - now)
-        print(f"[REDEEM] {len(_pending_redemptions)} queued, relay cooldown ({remaining}s) — skipping retries")
+        if now - _last_cooldown_log >= 60:
+            remaining = int(_relay_cooldown_until - now)
+            print(f"[REDEEM] {len(_pending_redemptions)} queued, relay cooldown ({remaining}s) — skipping retries")
+            _last_cooldown_log = now
         return
 
     still_pending = []
@@ -3073,44 +3082,47 @@ class CopyTrader:
                     self.positions["stats"]["wins"] = self.positions["stats"].get("wins", 0) + 1
 
                     # Auto-redeem winning shares on-chain → converts back to USDC
-                    try:
-                        redeemed = redeem_winning_position(
-                            condition_id=condition_id,
-                            token_id=token_id,
-                            dry_run=self.dry_run,
-                            slug=slug,
-                        )
-                        position["redeemed"] = bool(redeemed)
-                        _log_copy_trade("redeem", {
-                            "market": position.get("market", ""),
-                            "condition_id": condition_id,
-                            "token_id": token_id,
-                            "redeemed": bool(redeemed),
-                            "dry_run": self.dry_run,
-                            "pnl": position.get("pnl", 0),
-                        })
-                        if redeemed is True:
-                            print(f"[ALGO] Auto-redeemed: {position['market'][:30]}")
-                        elif redeemed is None:
-                            # Oracle not settled on-chain yet — queue for retry
-                            print(f"[ALGO] Not redeemable yet (oracle pending) — queuing retry: {position['market'][:30]}")
-                            _queue_pending_redemption(condition_id, token_id, slug)
-                        elif redeemed == "rate_limited":
-                            print(f"[ALGO] Relay rate-limited — queuing: {position['market'][:30]}")
-                            _queue_pending_redemption(condition_id, token_id, slug)
-                        else:
-                            print(f"[ALGO] Redemption failed for {position['market'][:30]} — queued for retry")
-                            _queue_pending_redemption(condition_id, token_id, slug)
-                    except Exception as e:
+                    # Skip if already in retry queue — retry_pending_redemptions handles it
+                    if _is_pending_redemption(condition_id):
                         position["redeemed"] = False
-                        _log_copy_trade("redeem_error", {
-                            "market": position.get("market", ""),
-                            "condition_id": condition_id,
-                            "token_id": token_id,
-                            "error": str(e),
-                        })
-                        print(f"[ALGO] Redemption error: {e}")
-                        _queue_pending_redemption(condition_id, token_id, slug)
+                    else:
+                        try:
+                            redeemed = redeem_winning_position(
+                                condition_id=condition_id,
+                                token_id=token_id,
+                                dry_run=self.dry_run,
+                                slug=slug,
+                            )
+                            position["redeemed"] = bool(redeemed)
+                            _log_copy_trade("redeem", {
+                                "market": position.get("market", ""),
+                                "condition_id": condition_id,
+                                "token_id": token_id,
+                                "redeemed": bool(redeemed),
+                                "dry_run": self.dry_run,
+                                "pnl": position.get("pnl", 0),
+                            })
+                            if redeemed is True:
+                                print(f"[ALGO] Auto-redeemed: {position['market'][:30]}")
+                            elif redeemed == "rate_limited":
+                                print(f"[ALGO] Relay rate-limited — queuing: {position['market'][:30]}")
+                                _queue_pending_redemption(condition_id, token_id, slug)
+                            elif redeemed is None:
+                                print(f"[ALGO] Not redeemable yet (oracle pending) — queuing: {position['market'][:30]}")
+                                _queue_pending_redemption(condition_id, token_id, slug)
+                            else:
+                                print(f"[ALGO] Redemption failed for {position['market'][:30]} — queued for retry")
+                                _queue_pending_redemption(condition_id, token_id, slug)
+                        except Exception as e:
+                            position["redeemed"] = False
+                            _log_copy_trade("redeem_error", {
+                                "market": position.get("market", ""),
+                                "condition_id": condition_id,
+                                "token_id": token_id,
+                                "error": str(e),
+                            })
+                            print(f"[ALGO] Redemption error: {e}")
+                            _queue_pending_redemption(condition_id, token_id, slug)
 
                 elif won is False:
                     pnl = -amount
