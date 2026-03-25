@@ -1092,7 +1092,15 @@ def retry_pending_redemptions(dry_run: bool = False, max_per_cycle: int = 3):
     import time as _t
     if not _pending_redemptions:
         return
+
     now = _t.time()
+
+    # Early exit: if relay is in global cooldown, don't even try — just log once.
+    if now < _relay_cooldown_until:
+        remaining = int(_relay_cooldown_until - now)
+        print(f"[REDEEM] {len(_pending_redemptions)} queued, relay cooldown ({remaining}s) — skipping retries")
+        return
+
     still_pending = []
     retried = 0
     for item in _pending_redemptions:
@@ -1105,10 +1113,11 @@ def retry_pending_redemptions(dry_run: bool = False, max_per_cycle: int = 3):
         if retried >= max_per_cycle:
             # Defer remaining eligible items — stagger their next_retry so they
             # don't all become eligible on the same tick next cycle.
-            item["next_retry"] = now + 10 * (len(still_pending) + 1)  # 10s spacing
+            item["next_retry"] = now + 60 * (len(still_pending) + 1)  # 60s spacing
             still_pending.append(item)
             continue
-        print(f"[REDEEM] Retrying queued redemption (attempt {item['attempts']+1}): {item['condition_id'][:20]}...")
+        item["attempts"] += 1
+        print(f"[REDEEM] Retrying queued redemption (attempt {item['attempts']}): {item['condition_id'][:20]}...")
         result = redeem_winning_position(
             item["condition_id"], token_id=item["token_id"],
             dry_run=dry_run, slug=item["slug"],
@@ -1116,13 +1125,17 @@ def retry_pending_redemptions(dry_run: bool = False, max_per_cycle: int = 3):
         if result is True:
             print(f"[REDEEM] Queued redemption succeeded!")
             retried += 1
+            # Item NOT added to still_pending — it's done.
         elif result == "rate_limited":
-            # redeem_winning_position already re-queued it via _queue_pending_redemption;
-            # don't double-update.  But DO stop trying more items this cycle.
-            break
+            # redeem_winning_position no longer self-queues — we manage the item here.
+            backoff = min(120 * (2 ** (item["attempts"] - 1)), 1800)
+            item["next_retry"] = now + backoff
+            still_pending.append(item)
+            print(f"[REDEEM] Rate limited, retry in {backoff}s (attempt {item['attempts']})")
+            break  # Stop trying more items this cycle
         else:
-            item["attempts"] += 1
-            item["next_retry"] = now + min(120 * (2 ** (item["attempts"] - 1)), 1800)  # 2min, 4min, 8min... 30min cap
+            backoff = min(120 * (2 ** (item["attempts"] - 1)), 1800)
+            item["next_retry"] = now + backoff
             still_pending.append(item)
     _pending_redemptions[:] = still_pending
     if _pending_redemptions:
@@ -1260,7 +1273,9 @@ def redeem_winning_position(condition_id: str, token_id: str = "", dry_run: bool
                 address=w3.to_checksum_address(token_holder),
                 abi=GNOSIS_SAFE_ABI,
             )
-            # Try gasless relay — on 429/cooldown, queue with backoff (no MATIC for direct).
+            # Try gasless relay — on 429/cooldown, return "rate_limited" so caller can queue.
+            # NOTE: Do NOT call _queue_pending_redemption here — callers handle queuing
+            # to avoid double-queue when retry_pending_redemptions is already managing the item.
             relay_err = None
             try:
                 tx_hex = _redeem_via_relay(
@@ -1272,8 +1287,7 @@ def redeem_winning_position(condition_id: str, token_id: str = "", dry_run: bool
             except Exception as e:
                 relay_err = e
                 if "429" in str(e) or "cooldown" in str(e).lower():
-                    print(f"[REDEEM] Relay unavailable ({e}), queuing for later retry")
-                    _queue_pending_redemption(condition_id, token_id, slug)
+                    print(f"[REDEEM] Relay unavailable ({e})")
                     return "rate_limited"
 
             # Non-429 relay failure — try direct Safe tx (needs MATIC)
@@ -1284,8 +1298,7 @@ def redeem_winning_position(condition_id: str, token_id: str = "", dry_run: bool
                 return True
             except Exception as direct_err:
                 if "insufficient" in str(direct_err).lower():
-                    print(f"[REDEEM] Direct tx failed: EOA has insufficient MATIC for gas.")
-                    _queue_pending_redemption(condition_id, token_id, slug)
+                    print(f"[REDEEM] Direct tx also failed (no MATIC for gas)")
                     return False
                 raise RuntimeError(f"Both relay ({relay_err}) and direct ({direct_err}) failed") from direct_err
         else:
@@ -3081,6 +3094,9 @@ class CopyTrader:
                         elif redeemed is None:
                             # Oracle not settled on-chain yet — queue for retry
                             print(f"[ALGO] Not redeemable yet (oracle pending) — queuing retry: {position['market'][:30]}")
+                            _queue_pending_redemption(condition_id, token_id, slug)
+                        elif redeemed == "rate_limited":
+                            print(f"[ALGO] Relay rate-limited — queuing: {position['market'][:30]}")
                             _queue_pending_redemption(condition_id, token_id, slug)
                         else:
                             print(f"[ALGO] Redemption failed for {position['market'][:30]} — queued for retry")
