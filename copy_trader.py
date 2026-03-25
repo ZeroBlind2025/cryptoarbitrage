@@ -670,6 +670,7 @@ _RELAY_MIN_GAP = 5.0  # minimum seconds between redemptions (~2 calls each)
 _relay_daily_counts: dict = {}   # {key: count} transactions submitted today per key (tracking only)
 _relay_daily_date = ""           # date string (YYYY-MM-DD UTC) for current counts
 _relay_current_key_idx = 0       # index into RELAYER_API_KEYS for round-robin
+_relay_cooldown_until = 0.0      # global cooldown: no relay calls until this timestamp
 
 
 def _relay_reset_if_new_day():
@@ -904,6 +905,12 @@ def _redeem_via_relay(w3, account, safe_contract, proxy_address: str,
     Returns the transaction hash hex string.
     """
     import json as _json
+    import time as _t
+
+    # Check global cooldown — if the relay recently 429'd, don't even try
+    if _t.time() < _relay_cooldown_until:
+        remaining = int(_relay_cooldown_until - _t.time())
+        raise RuntimeError(f"429 relay cooldown active ({remaining}s remaining)")
 
     eoa = account.address
 
@@ -953,6 +960,10 @@ def _redeem_via_relay(w3, account, safe_contract, proxy_address: str,
         data=_json.dumps(body).encode("utf-8"),
         timeout=30,
     )
+    if resp.status_code == 429:
+        global _relay_cooldown_until
+        _relay_cooldown_until = _t.time() + 300  # 5 min global cooldown
+        print(f"[REDEEM] 429 from relay — setting 5-minute global cooldown")
     resp.raise_for_status()
 
     # Track this submission for observability
@@ -1051,19 +1062,23 @@ def _queue_pending_redemption(condition_id: str, token_id: str, slug: str, attem
     First retry after 2 min, then exponential up to 30 min cap.
     """
     import time as _t
-    # Don't duplicate
+    # Don't duplicate — if already queued, bump attempts and extend backoff
     for item in _pending_redemptions:
         if item["condition_id"] == condition_id:
-            item["attempts"] = attempts
-            # Backoff: 2min, 5min, 10min, 15min, 30min cap
-            item["next_retry"] = _t.time() + min(120 * (2 ** (attempts - 1)), 1800)
+            # Keep the HIGHER attempt count (don't reset on re-queue)
+            item["attempts"] = max(item["attempts"], attempts)
+            item["attempts"] += 1
+            # Backoff: 2min, 4min, 8min, 16min, 30min cap
+            backoff = min(120 * (2 ** (item["attempts"] - 1)), 1800)
+            item["next_retry"] = _t.time() + backoff
+            print(f"[REDEEM] Re-queued (attempt {item['attempts']}, next retry in {backoff}s): {condition_id[:20]}...")
             return
     _pending_redemptions.append({
         "condition_id": condition_id,
         "token_id": token_id,
         "slug": slug,
         "attempts": attempts,
-        "next_retry": _t.time() + 120,  # 2 minutes before first retry (oracle usually settles fast)
+        "next_retry": _t.time() + 120,  # 2 minutes before first retry
     })
     print(f"[REDEEM] Queued for retry (attempt {attempts}): condition={condition_id[:20]}...")
 
@@ -1101,6 +1116,10 @@ def retry_pending_redemptions(dry_run: bool = False, max_per_cycle: int = 3):
         if result is True:
             print(f"[REDEEM] Queued redemption succeeded!")
             retried += 1
+        elif result == "rate_limited":
+            # redeem_winning_position already re-queued it via _queue_pending_redemption;
+            # don't double-update.  But DO stop trying more items this cycle.
+            break
         else:
             item["attempts"] += 1
             item["next_retry"] = now + min(120 * (2 ** (item["attempts"] - 1)), 1800)  # 2min, 4min, 8min... 30min cap
@@ -1241,7 +1260,7 @@ def redeem_winning_position(condition_id: str, token_id: str = "", dry_run: bool
                 address=w3.to_checksum_address(token_holder),
                 abi=GNOSIS_SAFE_ABI,
             )
-            # Try gasless relay once — on 429, queue for retry instead of blocking.
+            # Try gasless relay once — on 429 or cooldown, queue for retry instead of blocking.
             relay_err = None
             try:
                 tx_hex = _redeem_via_relay(
@@ -1252,10 +1271,10 @@ def redeem_winning_position(condition_id: str, token_id: str = "", dry_run: bool
                 return True
             except Exception as e:
                 relay_err = e
-                if "429" in str(e):
-                    print(f"[REDEEM] Relay rate-limited ({e}), queuing for later retry (non-blocking)")
+                if "429" in str(e) or "cooldown" in str(e).lower():
+                    print(f"[REDEEM] Relay unavailable ({e}), queuing for later retry (non-blocking)")
                     _queue_pending_redemption(condition_id, token_id, slug)
-                    return False
+                    return "rate_limited"  # signal to retry_pending_redemptions not to re-queue
 
             print(f"[REDEEM] Gasless relay failed ({relay_err}), trying direct Safe tx...")
             try:
