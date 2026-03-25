@@ -2095,39 +2095,45 @@ class MomentumEngine:
 
                 # Auto-redeem winning shares on-chain → converts back to USDC
                 try:
-                    from copy_trader import redeem_winning_position, _log_copy_trade, _queue_pending_redemption
-                    redeemed = redeem_winning_position(
-                        condition_id=condition_id,
-                        token_id=token_id,
-                        dry_run=self.dry_run,
-                        slug=slug,
-                    )
-                    position["redeemed"] = bool(redeemed)
-                    _log_copy_trade("momentum_redeem", {
-                        "market": position.get("market", ""),
-                        "condition_id": condition_id,
-                        "token_id": token_id,
-                        "redeemed": bool(redeemed),
-                        "dry_run": self.dry_run,
-                        "pnl": pnl,
-                    })
-                    if redeemed is True:
-                        print(f"[MOMENTUM] Auto-redeemed: {position['market'][:30]}", flush=True)
-                    elif redeemed is None:
-                        # None means either balance=0 (already redeemed) or
-                        # payoutDenominator=0 (not resolved on-chain yet).
-                        # Queue for retry — oracle usually settles within minutes.
-                        print(f"[MOMENTUM] Not redeemable yet (oracle pending) — queuing retry: {position['market'][:30]}", flush=True)
-                        _queue_pending_redemption(condition_id, token_id, slug)
+                    from copy_trader import redeem_winning_position, _log_copy_trade, _queue_pending_redemption, _is_pending_redemption
+                    # Skip if already queued — retry_pending_redemptions will handle it
+                    if _is_pending_redemption(condition_id):
+                        position["redeemed"] = False
+                        # Don't spam — just note once and let the queue handle it
                     else:
-                        print(f"[MOMENTUM] Redemption failed for {position['market'][:30]} — queued for retry", flush=True)
-                        _queue_pending_redemption(condition_id, token_id, slug)
+                        redeemed = redeem_winning_position(
+                            condition_id=condition_id,
+                            token_id=token_id,
+                            dry_run=self.dry_run,
+                            slug=slug,
+                        )
+                        position["redeemed"] = bool(redeemed)
+                        _log_copy_trade("momentum_redeem", {
+                            "market": position.get("market", ""),
+                            "condition_id": condition_id,
+                            "token_id": token_id,
+                            "redeemed": bool(redeemed),
+                            "dry_run": self.dry_run,
+                            "pnl": pnl,
+                        })
+                        if redeemed is True:
+                            print(f"[MOMENTUM] Auto-redeemed: {position['market'][:30]}", flush=True)
+                        elif redeemed == "rate_limited":
+                            print(f"[MOMENTUM] Relay rate-limited — queuing: {position['market'][:30]}", flush=True)
+                            _queue_pending_redemption(condition_id, token_id, slug)
+                        elif redeemed is None:
+                            print(f"[MOMENTUM] Not redeemable yet (oracle pending) — queuing: {position['market'][:30]}", flush=True)
+                            _queue_pending_redemption(condition_id, token_id, slug)
+                        else:
+                            print(f"[MOMENTUM] Redemption failed for {position['market'][:30]} — queued for retry", flush=True)
+                            _queue_pending_redemption(condition_id, token_id, slug)
                 except Exception as e:
                     position["redeemed"] = False
                     print(f"[MOMENTUM] Redemption error: {e}", flush=True)
                     try:
-                        from copy_trader import _queue_pending_redemption
-                        _queue_pending_redemption(condition_id, token_id, slug)
+                        from copy_trader import _queue_pending_redemption, _is_pending_redemption
+                        if not _is_pending_redemption(condition_id):
+                            _queue_pending_redemption(condition_id, token_id, slug)
                     except Exception:
                         pass
 
