@@ -1260,7 +1260,7 @@ def redeem_winning_position(condition_id: str, token_id: str = "", dry_run: bool
                 address=w3.to_checksum_address(token_holder),
                 abi=GNOSIS_SAFE_ABI,
             )
-            # Try gasless relay once — on 429 or cooldown, queue for retry instead of blocking.
+            # Try gasless relay first, fall back to direct on-chain (Alchemy) on 429/cooldown.
             relay_err = None
             try:
                 tx_hex = _redeem_via_relay(
@@ -1272,20 +1272,19 @@ def redeem_winning_position(condition_id: str, token_id: str = "", dry_run: bool
             except Exception as e:
                 relay_err = e
                 if "429" in str(e) or "cooldown" in str(e).lower():
-                    print(f"[REDEEM] Relay unavailable ({e}), queuing for later retry (non-blocking)")
-                    _queue_pending_redemption(condition_id, token_id, slug)
-                    return "rate_limited"  # signal to retry_pending_redemptions not to re-queue
+                    print(f"[REDEEM] Relay unavailable ({e}), falling back to direct on-chain tx...")
+                else:
+                    print(f"[REDEEM] Gasless relay failed ({relay_err}), trying direct Safe tx...")
 
-            print(f"[REDEEM] Gasless relay failed ({relay_err}), trying direct Safe tx...")
             try:
                 tx_hex = _exec_via_safe(w3, token_holder, contract_addr, bytes.fromhex(call_data[2:]), account)
-                print(f"[REDEEM] SUCCESS (direct proxy): condition={cid[:20]}... tx={tx_hex}")
+                print(f"[REDEEM] SUCCESS (direct on-chain): condition={cid[:20]}... tx={tx_hex}")
                 return True
             except Exception as direct_err:
                 if "insufficient" in str(direct_err).lower():
                     print(f"[REDEEM] Direct tx failed: EOA has insufficient MATIC for gas.")
                     _queue_pending_redemption(condition_id, token_id, slug)
-                    return False
+                    return "rate_limited"
                 raise RuntimeError(f"Both relay ({relay_err}) and direct ({direct_err}) failed") from direct_err
         else:
             # Direct EOA call (USDC.e first per Polymarket docs)
