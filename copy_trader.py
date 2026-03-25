@@ -660,6 +660,32 @@ def _check_neg_risk(condition_id: str, slug: str = "") -> bool:
 # Polymarket gasless relay — pays gas so the EOA doesn't need MATIC
 RELAY_URL = "https://relayer-v2.polymarket.com"
 
+
+def _validate_relayer_key():
+    """Startup check: verify the relayer API key works by hitting GET /relayer/api/keys."""
+    try:
+        from web3 import Web3 as _W3
+        eoa = _W3.to_checksum_address(RELAYER_ADDRESS)
+    except Exception:
+        eoa = RELAYER_ADDRESS
+    key = RELAYER_API_KEYS[0]
+    headers = {
+        "RELAYER_API_KEY": key,
+        "RELAYER_API_KEY_ADDRESS": eoa,
+    }
+    print(f"[RELAY] Validating relayer key against GET /relayer/api/keys ...")
+    print(f"[RELAY]   RELAYER_API_KEY: {key}")
+    print(f"[RELAY]   RELAYER_API_KEY_ADDRESS: {eoa}")
+    try:
+        resp = requests.get(f"{RELAY_URL}/relayer/api/keys", headers=headers, timeout=10)
+        print(f"[RELAY]   Response: {resp.status_code} {resp.text[:300]}")
+        if resp.status_code == 200:
+            print(f"[RELAY]   Key is VALID")
+        else:
+            print(f"[RELAY]   Key REJECTED — check key and address")
+    except Exception as e:
+        print(f"[RELAY]   Validation failed: {e}")
+
 # Rate limiter for relayer /submit — 25 req/min limit, we target 24 req/min (2.5s gap)
 # NOTE: Relayer API keys have NO daily limit (confirmed by Polymarket). Only per-minute
 # and min-gap rate limits are enforced here to avoid 429s.
@@ -2950,6 +2976,8 @@ class CopyTrader:
         ws_status = "WebSocket active" if self.ws and self.ws.connected else "REST only"
         print(f"[ALGO] Starting continuous monitoring (every {POLL_INTERVAL}s, {ws_status})...")
         print(f"[ALGO] Relayer keys: {len(RELAYER_API_KEYS)} loaded (no daily cap)")
+        if RELAYER_API_KEYS:
+            _validate_relayer_key()
         print("[ALGO] Press Ctrl+C to stop\n")
 
         try:
