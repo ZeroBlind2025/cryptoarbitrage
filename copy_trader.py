@@ -970,6 +970,9 @@ def _redeem_via_relay(w3, account, safe_contract, proxy_address: str,
     if resp.status_code == 429:
         _relay_cooldown_until = _t.time() + 300  # 5 min global cooldown
         print(f"[REDEEM] 429 from relay — setting 5-minute global cooldown")
+    if resp.status_code >= 400:
+        print(f"[REDEEM] Relay {resp.status_code} response: {resp.text[:500]}")
+        print(f"[REDEEM] Relay request headers: { {k: (v[:16]+'...' if len(str(v))>16 else v) for k,v in headers.items()} }")
     resp.raise_for_status()
 
     # Track this submission for observability
