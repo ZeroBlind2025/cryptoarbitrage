@@ -906,6 +906,7 @@ def _redeem_via_relay(w3, account, safe_contract, proxy_address: str,
     """
     import json as _json
     import time as _t
+    global _relay_cooldown_until
 
     # Check global cooldown — if the relay recently 429'd, don't even try
     if _t.time() < _relay_cooldown_until:
@@ -961,7 +962,6 @@ def _redeem_via_relay(w3, account, safe_contract, proxy_address: str,
         timeout=30,
     )
     if resp.status_code == 429:
-        global _relay_cooldown_until
         _relay_cooldown_until = _t.time() + 300  # 5 min global cooldown
         print(f"[REDEEM] 429 from relay — setting 5-minute global cooldown")
     resp.raise_for_status()
