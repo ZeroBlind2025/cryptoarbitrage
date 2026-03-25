@@ -1053,6 +1053,7 @@ def _exec_via_safe(w3, safe_address: str, to: str, call_data: bytes, account) ->
 # Each entry: {"condition_id": str, "token_id": str, "slug": str, "attempts": int, "next_retry": float}
 _pending_redemptions: list = []
 _PENDING_MAX_ATTEMPTS = 10  # give up after this many total attempts (conserve daily quota)
+_last_cooldown_log: float = 0.0  # throttle cooldown log to once per 60s
 
 
 def _is_pending_redemption(condition_id: str) -> bool:
@@ -1101,12 +1102,12 @@ def retry_pending_redemptions(dry_run: bool = False, max_per_cycle: int = 3):
     now = _t.time()
 
     # Early exit: if relay is in global cooldown, don't even try — log at most once/min.
+    global _last_cooldown_log
     if now < _relay_cooldown_until:
-        remaining = int(_relay_cooldown_until - now)
-        if not hasattr(retry_pending_redemptions, "_last_cooldown_log") \
-                or now - retry_pending_redemptions._last_cooldown_log >= 60:
+        if now - _last_cooldown_log >= 60:
+            remaining = int(_relay_cooldown_until - now)
             print(f"[REDEEM] {len(_pending_redemptions)} queued, relay cooldown ({remaining}s) — skipping retries")
-            retry_pending_redemptions._last_cooldown_log = now
+            _last_cooldown_log = now
         return
 
     still_pending = []
