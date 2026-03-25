@@ -1095,10 +1095,13 @@ def retry_pending_redemptions(dry_run: bool = False, max_per_cycle: int = 3):
 
     now = _t.time()
 
-    # Early exit: if relay is in global cooldown, don't even try — just log once.
+    # Early exit: if relay is in global cooldown, don't even try — log at most once/min.
     if now < _relay_cooldown_until:
         remaining = int(_relay_cooldown_until - now)
-        print(f"[REDEEM] {len(_pending_redemptions)} queued, relay cooldown ({remaining}s) — skipping retries")
+        if not hasattr(retry_pending_redemptions, "_last_cooldown_log") \
+                or now - retry_pending_redemptions._last_cooldown_log >= 60:
+            print(f"[REDEEM] {len(_pending_redemptions)} queued, relay cooldown ({remaining}s) — skipping retries")
+            retry_pending_redemptions._last_cooldown_log = now
         return
 
     still_pending = []
