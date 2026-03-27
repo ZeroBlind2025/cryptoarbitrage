@@ -1643,6 +1643,14 @@ class MomentumEngine:
                     if entry_count >= self.max_entries_per_market:
                         continue  # hit max entries for this market
 
+                    # --- FOLLOW-UP COOLDOWN: prevent rapid-fire re-entries ---
+                    last_t = self.last_trade_time.get(market_key, 0)
+                    if last_t:
+                        cooldown = FOLLOW_UP_COOLDOWN_15M if market.get("interval") == "15m" else FOLLOW_UP_COOLDOWN
+                        elapsed = time.time() - last_t
+                        if elapsed < cooldown:
+                            continue  # still in cooldown
+
                     # Update last buy price for upward-only tracking
                     # (fall through to ENTER THE TRADE block below)
 
