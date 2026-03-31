@@ -125,6 +125,21 @@ REENTRY_MIN_PRICE = float(os.getenv("MOMENTUM_REENTRY_MIN_PRICE", "0.899"))  # o
 # Prevents placing trades after (or right at) the close time.
 MIN_MINUTES_BEFORE_CLOSE = float(os.getenv("MOMENTUM_MIN_MINUTES_BEFORE_CLOSE", "1.0"))
 
+# Maximum entry price — skip entries at or above this price (default 0.90 = 90¢).
+# High-price entries win often but the tiny upside doesn't cover losses.
+MAX_PRICE_ENTRY = float(os.getenv("MOMENTUM_MAX_PRICE_ENTRY", "0.90"))
+
+# No-trade hours (ET).  Comma-separated list of hour starts (24h format).
+# Trading pauses for 60 minutes starting at each listed hour.
+# Default: 4,7,8,9 (4AM, 7AM, 8AM, 9AM ET — historically worst hours).
+_NO_TRADE_HOURS_RAW = os.getenv("MOMENTUM_NO_TRADE_HOURS", "4,7,8,9")
+NO_TRADE_HOURS: set[int] = set()
+if _NO_TRADE_HOURS_RAW.strip():
+    NO_TRADE_HOURS = {int(h.strip()) for h in _NO_TRADE_HOURS_RAW.split(",") if h.strip()}
+
+# Allow DOWN bets.  Default FALSE — only take UP positions.
+DOWN_BETS_ENABLED = os.getenv("MOMENTUM_DOWN_BETS_ENABLED", "false").lower() == "true"
+
 # ---------------------------------------------------------------------------
 # Market entry delay — wait N seconds after a market opens before entering.
 # Early-market prices are volatile and reversals are common.  By waiting,
@@ -926,6 +941,10 @@ class MomentumEngine:
         _delay_status = "DISABLED" if getattr(self, '_dry_run_no_delays', False) else "ENABLED"
         _delay_info = ", ".join(f"{k}={int(v*60)}s" for k, v in MARKET_ENTRY_DELAY.items()) if _delay_status == "ENABLED" else ""
         print(f"  Delays/cooldowns: {_delay_status}" + (f" ({_delay_info})" if _delay_info else ""))
+        print(f"  Max entry price: {MAX_PRICE_ENTRY*100:.0f}¢")
+        _no_trade_str = ", ".join(f"{h}:00" for h in sorted(NO_TRADE_HOURS)) if NO_TRADE_HOURS else "NONE"
+        print(f"  No-trade hours (ET): {_no_trade_str}")
+        print(f"  DOWN bets: {'ENABLED' if DOWN_BETS_ENABLED else 'DISABLED'}")
         print(f"  Probe sizing: DISABLED (using dashboard lot sizes)")
         print(f"  Lot sizes: {lot_sizes} (default: ${self.bet_amount})")
         print(f"  Balance: ${balance:.2f}")
@@ -1390,6 +1409,15 @@ class MomentumEngine:
 
         entered = 0
 
+        # --- GUARD: No-trade hours (ET) ---
+        if NO_TRADE_HOURS:
+            _utc_now = datetime.now(timezone.utc)
+            _et_hour = (_utc_now.hour - 4) % 24  # UTC → ET (EDT)
+            if _et_hour in NO_TRADE_HOURS:
+                if self.scans_completed % 60 == 1:
+                    print(f"[MOMENTUM] NO-TRADE HOUR: {_et_hour}:00 ET — skipping scan", flush=True)
+                return 0
+
         for market in markets:
             coin = market["coin"]
             condition_id = market["condition_id"]
@@ -1450,6 +1478,10 @@ class MomentumEngine:
                 other_token_id = market["token_ids"][1 - oi]
                 gamma_price = market["prices"][oi]
 
+                # --- GUARD: Skip DOWN bets if disabled ---
+                if not DOWN_BETS_ENABLED and outcome.lower() == "down":
+                    continue
+
                 # Get best available price (WS → WS cache → CLOB REST → Gamma)
                 live_price = self.get_live_price(token_id)
                 if live_price is not None:
@@ -1485,6 +1517,10 @@ class MomentumEngine:
                     if price < self.min_entry_price or price > self.max_entry_price:
                         print(f"  REJECT price_range: {_mkt_label} {outcome} @ {price*100:.1f}¢ outside {self.min_entry_price*100:.0f}-{self.max_entry_price*100:.0f}¢", flush=True)
                         continue
+
+                # --- GUARD: Hard ceiling on entry price ---
+                if price >= MAX_PRICE_ENTRY:
+                    continue
 
                 # --- Price qualifies! Log that we're evaluating this candidate ---
                 print(f"[MOMENTUM] CANDIDATE {_mkt_label} {outcome} @ {price*100:.1f}¢ ({_price_src})", flush=True)
