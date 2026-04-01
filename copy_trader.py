@@ -105,9 +105,10 @@ PROBE_AMOUNT = float(os.getenv("PROBE_AMOUNT", "10.0"))   # $ for first (probe) 
 POLL_INTERVAL = int(os.getenv("COPY_POLL_INTERVAL", "10"))  # seconds between checks
 ALGO_STARTING_BALANCE = float(os.getenv("ALGO_STARTING_BALANCE", "2300.0"))  # Starting balance for Poly Algo
 PRICE_BUFFER_BPS = int(os.getenv("COPY_PRICE_BUFFER_BPS", "50"))  # Max overbid vs target's price (50 bps = 0.5%)
-FOLLOW_UP_COOLDOWN = int(os.getenv("COPY_FOLLOW_UP_COOLDOWN", "30"))  # seconds between re-entries into same market
+FOLLOW_UP_COOLDOWN = int(os.getenv("COPY_FOLLOW_UP_COOLDOWN", "0"))  # seconds between re-entries (0 = no cooldown)
 STOP_LOSS_PCT = float(os.getenv("COPY_STOP_LOSS_PCT", "55"))  # Auto-sell when position drops this % from peak (0 = disabled)
-MIN_ENTRY_PRICE = float(os.getenv("COPY_MIN_ENTRY_PRICE", "0.88"))  # Skip trades below this price (0 = disabled)
+MIN_ENTRY_PRICE = float(os.getenv("COPY_MIN_ENTRY_PRICE", "0"))  # Skip trades below this price (0 = disabled)
+COPY_MIRROR_EXACT = os.getenv("COPY_MIRROR_EXACT", "true").lower() == "true"  # Mirror target's exact USDC spend
 
 # Arbitrage hedge settings
 ARB_HEDGE_ENABLED = os.getenv("ARB_HEDGE_ENABLED", "true").lower() == "true"
@@ -2115,10 +2116,12 @@ class CopyTrader:
         print(f"  POLY ALGO")
         print(f"  Following: {self.target_name}")
         print(f"  Target: {TARGET_ADDRESS[:20]}...")
-        print(f"  Lot sizes: {lot_sizes} (default: ${self.bet_amount})")
+        print(f"  Mirror: {'EXACT sizes' if COPY_MIRROR_EXACT else f'Lot sizes: {lot_sizes} (default: ${self.bet_amount})'}")
         print(f"  Balance: ${balance:.2f}")
         print(f"  Mode: {'DRY RUN' if self.dry_run else 'LIVE'}")
         print(f"  Filter: {'Crypto only' if self.crypto_only else 'All markets'}")
+        print(f"  Sells: ENABLED (mirror target sells)")
+        print(f"  Both sides: ALLOWED")
         print(f"  Poll interval: {POLL_INTERVAL}s")
         print(f"  Price buffer: {PRICE_BUFFER_BPS} bps")
         print(f"  Stop loss: {STOP_LOSS_PCT}%" if STOP_LOSS_PCT > 0 else "  Stop loss: DISABLED")
@@ -2150,7 +2153,12 @@ class CopyTrader:
             target_size = bet.get("size", 0)
             if cid and target_size:
                 self.copied_sizes.add((cid, str(oi), str(round(float(target_size), 2))))
-        print(f"[ALGO] Marked {len(self.copied_trades)} existing trades ({len(self.copied_sizes)} unique sizes) as seen. Waiting for NEW trades...")
+        print(f"[ALGO] Marked {len(self.copied_trades)} existing trades ({len(self.copied_sizes)} unique sizes) as seen.")
+
+        # Sync to target's current open positions (mirror existing holdings)
+        self._sync_target_positions()
+
+        print(f"[ALGO] Now watching for NEW trades...")
 
         # Snapshot existing sells so we don't mirror historical ones on startup
         existing_sells = get_latest_sells(TARGET_ADDRESS, limit=50)
@@ -2229,6 +2237,126 @@ class CopyTrader:
             return None
         _, best_ask = self.ws.get_best_prices(token_id)
         return best_ask
+
+    def _sync_target_positions(self):
+        """On startup, match the target's current open positions.
+
+        Fetches the target's portfolio, applies the crypto_only filter,
+        and places buy orders to match their total holding on each market.
+        """
+        print(f"\n[ALGO] Syncing to target's open positions...", flush=True)
+        try:
+            target_positions = get_positions(TARGET_ADDRESS)
+        except Exception as e:
+            print(f"[ALGO] Failed to fetch target positions: {e}", flush=True)
+            return
+
+        if not target_positions:
+            print("[ALGO] Target has no open positions", flush=True)
+            return
+
+        synced = 0
+        total_usdc = 0
+        for pos in target_positions:
+            slug = pos.get("slug", "").lower()
+            title = pos.get("title", pos.get("market", ""))
+
+            # Apply same market filter as regular copy
+            if self.crypto_only and not is_crypto_market({"slug": slug, "title": title}):
+                continue
+
+            shares = float(pos.get("size", 0))
+            if shares <= 0:
+                continue
+
+            avg_price = float(pos.get("avgPrice", 0) or pos.get("price", 0))
+            cur_price = float(pos.get("curPrice", 0) or pos.get("currentPrice", 0) or avg_price)
+            condition_id = pos.get("conditionId") or pos.get("condition_id") or ""
+            outcome_index = pos.get("outcomeIndex")
+            if outcome_index is None:
+                outcome_index = pos.get("outcome_index", 0)
+            outcome = pos.get("outcome", "Yes")
+            token_id = pos.get("asset") or pos.get("token_id", "")
+            market_key = (condition_id, outcome_index)
+
+            buy_price = cur_price if cur_price > 0 else avg_price
+            if buy_price <= 0 or buy_price >= 1:
+                continue
+
+            trade_amount = round(shares * buy_price, 2)
+            if trade_amount < 0.01:
+                continue
+
+            print(f"[ALGO] SYNC {title[:50]}")
+            print(f"       Target holds: {shares:.1f} shares of {outcome} @ avg {avg_price*100:.1f}¢ (cur {buy_price*100:.1f}¢)")
+            print(f"       Mirroring: ${trade_amount:.2f}")
+
+            trade_record = {
+                "id": f"sync_{condition_id[:12]}_{outcome_index}",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "market": title,
+                "slug": slug,
+                "outcome": outcome,
+                "side": "BUY",
+                "amount": trade_amount,
+                "price": buy_price,
+                "source": "copy_trader",
+            }
+
+            if self.dry_run:
+                print(f"       DRY RUN — would buy {shares:.1f} shares @ {buy_price*100:.1f}¢ (${trade_amount:.2f})")
+                trade_record["status"] = "dry_run"
+                synced += 1
+                total_usdc += trade_amount
+            elif self.client and token_id:
+                buffer = PRICE_BUFFER_BPS / 10000
+                max_price = min(buy_price * (1 + buffer), 0.99)
+                fill = place_bet(self.client, token_id, trade_amount, max_price=max_price)
+                if fill.get("success"):
+                    fill_price = fill.get("fill_price", buy_price)
+                    print(f"       FILLED @ {fill_price*100:.1f}¢")
+                    trade_record["status"] = "filled"
+                    trade_record["fill_price"] = fill_price
+                    synced += 1
+                    total_usdc += trade_amount
+                    self.total_spent += trade_amount
+                else:
+                    print(f"       FAILED!")
+                    trade_record["status"] = "failed"
+            else:
+                continue
+
+            self.trade_history.append(trade_record)
+
+            if trade_record["status"] in ["filled", "dry_run"]:
+                self.entered_markets[market_key] = buy_price
+                self.market_entry_count[market_key] = self.market_entry_count.get(market_key, 0) + 1
+                position = {
+                    "id": trade_record["id"],
+                    "timestamp": trade_record["timestamp"],
+                    "condition_id": condition_id,
+                    "token_id": token_id,
+                    "outcome_index": outcome_index,
+                    "outcome": outcome,
+                    "market": title,
+                    "slug": slug,
+                    "entry_price": buy_price,
+                    "amount": trade_amount,
+                    "potential_payout": shares,
+                    "dry_run": self.dry_run,
+                    "source": "copy_trader",
+                }
+                self.positions.setdefault("open", []).append(position)
+
+            if self.on_trade:
+                try:
+                    self.on_trade(trade_record)
+                except Exception:
+                    pass
+
+        if synced:
+            save_positions(self.positions)
+        print(f"[ALGO] Sync complete: {synced} positions matched (${total_usdc:.2f} total)\n", flush=True)
 
     def check_and_copy(self) -> int:
         """Check for new trades and copy them. Returns number of trades copied."""
@@ -2356,28 +2484,22 @@ class CopyTrader:
             # GUARD 2 disabled — no re-entry cap
             # GUARD 3 disabled — opposite side block removed
 
-            # Legacy size-based dedup kept as a secondary safety net
-            target_size = bet.get("size", 0)
-            if condition_id and target_size:
-                size_key = (condition_id, str(outcome_index), str(round(float(target_size), 2)))
-                if size_key in self.copied_sizes:
-                    print(f"[ALGO] Skip (same size already copied): {title} | {outcome} {target_size} shares")
-                    self.trades_skipped += 1
-                    continue
-                self.copied_sizes.add(size_key)
-
-            # Resolve per-coin lot size — probe on first entry, full lot on re-entry
+            # Resolve trade amount — mirror exact or use lot sizing
             trade_coin = detect_coin(slug, title)
-            full_lot = self.coin_bet_amounts.get(trade_coin, self.bet_amount) if trade_coin else self.bet_amount
             is_first_entry = condition_id and market_key not in self.entered_markets
-            trade_amount = PROBE_AMOUNT if is_first_entry else full_lot
+            if COPY_MIRROR_EXACT and usdc_size:
+                trade_amount = round(float(usdc_size), 2)
+                if trade_amount < 0.01:
+                    trade_amount = round(float(size) * price, 2) if size and price else self.bet_amount
+            else:
+                full_lot = self.coin_bet_amounts.get(trade_coin, self.bet_amount) if trade_coin else self.bet_amount
+                trade_amount = PROBE_AMOUNT if is_first_entry else full_lot
 
-            # Copy the trade!
-            entry_type = "PROBE" if is_first_entry else "RE-ENTRY"
+            entry_type = "MIRROR" if COPY_MIRROR_EXACT else ("PROBE" if is_first_entry else "RE-ENTRY")
             print(f"\n[ALGO] NEW TRADE DETECTED! ({entry_type})")
             print(f"       Market: {title}")
-            print(f"       Target bought: {size:.1f} {outcome} @ {price*100:.1f}¢")
-            print(f"       Copying: ${trade_amount:.2f} of {outcome} ({trade_coin.upper() or '?'} lot | {entry_type})")
+            print(f"       Target bought: {size:.1f} {outcome} @ {price*100:.1f}¢ (${float(usdc_size or 0):.2f})")
+            print(f"       Copying: ${trade_amount:.2f} of {outcome} ({entry_type})")
 
             # Build trade record for dashboard
             trade_record = {
