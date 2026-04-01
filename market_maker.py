@@ -30,9 +30,9 @@ from datetime import datetime, timezone
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-LIMIT_PRICE = float(os.getenv("MM_LIMIT_PRICE", "0.70"))
-ENTRY_THRESHOLD = float(os.getenv("MM_ENTRY_THRESHOLD", "0.50"))
-LOT_SIZE = float(os.getenv("MM_LOT_SIZE", "1.0"))
+LIMIT_PRICE = float(os.getenv("MM_LIMIT_PRICE", "0.25"))
+ENTRY_THRESHOLD = float(os.getenv("MM_ENTRY_THRESHOLD", "0"))  # No threshold — place at market open
+LOT_SIZE = float(os.getenv("MM_LOT_SIZE", "5.0"))
 POLL_INTERVAL = int(os.getenv("MM_POLL_INTERVAL", "5"))
 DRY_RUN = os.getenv("MM_DRY_RUN", "true").lower() == "true"
 MM_COINS = [c.strip() for c in os.getenv("MM_COINS", "btc,eth,sol,xrp").split(",") if c.strip()]
@@ -272,7 +272,6 @@ class MarketMaker:
                 if minutes_left < 1:
                     continue
 
-            # "Up" is outcome index 0
             up_token_id = market["token_ids"][0]
             up_price = _get_live_price(up_token_id, self.ws)
             if up_price is None:
@@ -281,17 +280,8 @@ class MarketMaker:
             label = f"{coin.upper()}_{market['interval']}"
             _prices.append(f"{label} Up={up_price*100:.0f}¢")
 
-            if up_price <= ENTRY_THRESHOLD:
-                continue
-
             full_label = f"{label} {(market.get('question') or slug)[:40]}"
-
-            if up_price < self.limit_price:
-                if self.scans % 30 == 1:
-                    print(f"[MM] SKIP {full_label}: Up @ {up_price*100:.1f}¢ < {self.limit_price*100:.0f}¢ limit")
-                continue
-
-            print(f"[MM] CANDIDATE {full_label}: Up @ {up_price*100:.1f}¢")
+            print(f"[MM] ORDER {full_label}: GTC BUY Up @ {self.limit_price*100:.0f}¢ ${self.lot_size:.2f}")
 
             if self.dry_run:
                 print(f"[MM] DRY RUN — would place GTC BUY Up @ {self.limit_price*100:.0f}¢ ${self.lot_size:.2f}")
@@ -299,7 +289,7 @@ class MarketMaker:
                 placed += 1
             else:
                 result = place_limit_order(
-                    self.client, up_token_id, self.limit_price, self.lot_size, label=label,
+                    self.client, up_token_id, self.limit_price, self.lot_size, label=full_label,
                 )
                 if result.get("success"):
                     order_id = result.get("order_id", "unknown")
