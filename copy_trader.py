@@ -2479,7 +2479,14 @@ class CopyTrader:
             # GUARD 1 disabled — copy re-entries exactly as target trades
             market_key = (condition_id, outcome_index)
             if condition_id and market_key in self.entered_markets:
-                print(f"[ALGO] Re-entry: {title} | {outcome} (price {price:.3f})")
+                # Only re-enter if price is at or above initial entry
+                initial_price = self.entered_markets[market_key]
+                if price < initial_price:
+                    print(f"[ALGO] Skip (price {price*100:.1f}¢ < initial entry {initial_price*100:.1f}¢): {title} | {outcome}")
+                    self.trades_skipped += 1
+                    continue
+
+                print(f"[ALGO] Re-entry: {title} | {outcome} (price {price*100:.1f}¢ >= initial {initial_price*100:.1f}¢)")
 
                 # 30-second cooldown between re-entries — confirms direction before
                 # following up with full lot (prevents rapid-fire double entries)
