@@ -253,6 +253,8 @@ class MarketMaker:
             self._refresh_ws_tokens()
 
         placed = 0
+        # Collect prices for periodic summary
+        _prices = []
         for market in markets:
             condition_id = market["condition_id"]
             coin = market["coin"]
@@ -276,19 +278,20 @@ class MarketMaker:
             if up_price is None:
                 up_price = market["prices"][0]
 
-            label = f"{coin.upper()}_{market['interval']} {(market.get('question') or slug)[:40]}"
+            label = f"{coin.upper()}_{market['interval']}"
+            _prices.append(f"{label} Up={up_price*100:.0f}¢")
 
             if up_price <= ENTRY_THRESHOLD:
-                if self.scans % 30 == 1:
-                    print(f"[MM] SKIP {label}: Up @ {up_price*100:.1f}¢ <= {ENTRY_THRESHOLD*100:.0f}¢")
                 continue
+
+            full_label = f"{label} {(market.get('question') or slug)[:40]}"
 
             if up_price < self.limit_price:
                 if self.scans % 30 == 1:
-                    print(f"[MM] SKIP {label}: Up @ {up_price*100:.1f}¢ < {self.limit_price*100:.0f}¢")
+                    print(f"[MM] SKIP {full_label}: Up @ {up_price*100:.1f}¢ < {self.limit_price*100:.0f}¢ limit")
                 continue
 
-            print(f"[MM] CANDIDATE {label}: Up @ {up_price*100:.1f}¢")
+            print(f"[MM] CANDIDATE {full_label}: Up @ {up_price*100:.1f}¢")
 
             if self.dry_run:
                 print(f"[MM] DRY RUN — would place GTC BUY Up @ {self.limit_price*100:.0f}¢ ${self.lot_size:.2f}")
@@ -311,6 +314,10 @@ class MarketMaker:
                     _ordered_markets.add(condition_id)
                     placed += 1
                     self.orders_placed += 1
+
+        # Price summary every 10s
+        if _prices and self.scans % 10 == 1:
+            print(f"[MM] Prices: {' | '.join(_prices)}  (threshold={ENTRY_THRESHOLD*100:.0f}¢ limit={self.limit_price*100:.0f}¢)")
 
         return placed
 
