@@ -2038,7 +2038,7 @@ class CopyTrader:
         self.positions = load_positions()
 
         self.last_resolution_check = 0
-        self.resolution_check_interval = 1800  # Check every 30 minutes
+        self.resolution_check_interval = 60  # Check every 60 seconds
 
         # WebSocket for real-time prices (replaces stale REST prices)
         self.ws: Optional["CLOBWebSocket"] = None
