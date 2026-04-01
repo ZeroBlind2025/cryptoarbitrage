@@ -2643,8 +2643,11 @@ class CopyTrader:
             if is_crypto_market(bet):
                 continue
 
-            # Debug: dump first weather bet fields to understand API shape
-            if self.scans_completed < 3:
+            # Debug: dump first few weather bets to understand API shape
+            if not hasattr(self, '_wx_debug_count'):
+                self._wx_debug_count = 0
+            if self._wx_debug_count < 5:
+                self._wx_debug_count += 1
                 _fields = {k: v for k, v in bet.items() if k not in ('id', 'conditionId', 'asset')}
                 print(f"[WEATHER] API fields: {_fields}", flush=True)
 
