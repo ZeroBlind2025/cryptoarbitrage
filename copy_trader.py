@@ -109,6 +109,7 @@ FOLLOW_UP_COOLDOWN = int(os.getenv("COPY_FOLLOW_UP_COOLDOWN", "0"))  # seconds b
 STOP_LOSS_PCT = float(os.getenv("COPY_STOP_LOSS_PCT", "55"))  # Auto-sell when position drops this % from peak (0 = disabled)
 MIN_ENTRY_PRICE = float(os.getenv("COPY_MIN_ENTRY_PRICE", "0"))  # Skip trades below this price (0 = disabled)
 COPY_MIRROR_EXACT = os.getenv("COPY_MIRROR_EXACT", "true").lower() == "true"  # Mirror target's exact USDC spend
+COPY_DOWN_ENABLED = os.getenv("COPY_TRADER_DOWN_ENABLE", "false").lower() == "true"  # Allow copying DOWN bets
 
 # Arbitrage hedge settings
 ARB_HEDGE_ENABLED = os.getenv("ARB_HEDGE_ENABLED", "true").lower() == "true"
@@ -2279,6 +2280,10 @@ class CopyTrader:
             token_id = pos.get("asset") or pos.get("token_id", "")
             market_key = (condition_id, outcome_index)
 
+            # Skip DOWN if disabled
+            if not COPY_DOWN_ENABLED and outcome.lower() == "down":
+                continue
+
             buy_price = cur_price if cur_price > 0 else avg_price
             if buy_price <= 0 or buy_price >= 1:
                 continue
@@ -2440,6 +2445,11 @@ class CopyTrader:
             # Filter for crypto markets only
             if self.crypto_only and not is_crypto_market(bet):
                 print(f"[ALGO] Skip (not crypto): {title}")
+                self.trades_skipped += 1
+                continue
+
+            # Skip DOWN bets if disabled
+            if not COPY_DOWN_ENABLED and outcome.lower() == "down":
                 self.trades_skipped += 1
                 continue
 
