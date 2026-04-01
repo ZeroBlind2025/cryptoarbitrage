@@ -2684,6 +2684,7 @@ class CopyTrader:
                 "outcome": outcome,
                 "side": "BUY",
                 "amount": trade_amount,
+                "price": price,
                 "target_price": price,
                 "source": "weather_copy",
             }
