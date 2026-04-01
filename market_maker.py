@@ -1,5 +1,5 @@
 """
-Market Maker Engine — BTC 5m Up/Down markets.
+Market Maker Engine — BTC 5m Up/Down markets (standalone).
 
 Places resting GTC limit BUY orders on the "Up" outcome at a fixed price
 when the live Up price is above a threshold.  Orders rest on the book
@@ -25,10 +25,7 @@ Railway env vars:
 import os
 import sys
 import time
-import json
-import threading
 from datetime import datetime, timezone
-from collections import defaultdict
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -42,12 +39,16 @@ MM_COINS = [c.strip() for c in os.getenv("MM_COINS", "btc").split(",") if c.stri
 MM_INTERVALS = [i.strip() for i in os.getenv("MM_INTERVALS", "5m").split(",") if i.strip()]
 
 # Reuse infrastructure from existing codebase
-from copy_trader import get_clob_client, PRIVATE_KEY
-from momentum_engine import (
-    discover_active_markets,
-    CRYPTO_COINS,
-    MomentumEngine,
-)
+from copy_trader import get_clob_client
+from momentum_engine import discover_active_markets
+
+# WebSocket for live prices (optional — falls back to gamma)
+_ws = None
+try:
+    from clob_ws import CLOBWebSocket
+    _HAS_WS = True
+except ImportError:
+    _HAS_WS = False
 
 try:
     from py_clob_client.clob_types import OrderArgs, OrderType, PartialCreateOrderOptions
@@ -60,23 +61,33 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Order tracking
 # ---------------------------------------------------------------------------
-# {condition_id: {order_id, token_id, price, size, placed_at, market_label}}
-open_orders: dict = {}
-# List of filled/resolved trades for logging
-trade_log: list = []
-# Markets we've already placed orders for this cycle (prevent duplicates)
-_ordered_markets: set = set()
+open_orders: dict = {}          # condition_id → order info
+_ordered_markets: set = set()   # condition_ids we've already ordered on
+_ws_price_cache: dict = {}      # token_id → price from WS
+
+
+def _on_ws_price(asset_id: str, price: float, **kwargs):
+    """WS callback — just cache the price."""
+    _ws_price_cache[asset_id] = price
+
+
+def _get_live_price(token_id: str, ws) -> float | None:
+    """Get best ask from WS, or from cache."""
+    if ws:
+        try:
+            _, best_ask = ws.get_best_prices(token_id)
+            if best_ask is not None:
+                return best_ask
+        except Exception:
+            pass
+    return _ws_price_cache.get(token_id)
 
 
 def place_limit_order(client, token_id: str, price: float, size: float,
                       label: str = "") -> dict:
-    """Place a GTC limit BUY order (maker/post-only).
-
-    Returns {"order_id": ..., "success": True} or {} on failure.
-    """
+    """Place a GTC limit BUY order (maker/post-only)."""
     try:
         price_rounded = round(price, 2)
-        # size = USDC amount; shares = size / price
         shares = round(size / price_rounded, 4)
 
         print(f"[MM] GTC limit BUY: {shares:.4f} shares @ {price_rounded*100:.0f}¢ "
@@ -112,7 +123,6 @@ def place_limit_order(client, token_id: str, price: float, size: float,
 
 
 def cancel_order(client, order_id: str) -> bool:
-    """Cancel a single open order."""
     try:
         client.cancel(order_id)
         print(f"[MM] Cancelled order {order_id}")
@@ -123,7 +133,6 @@ def cancel_order(client, order_id: str) -> bool:
 
 
 def cancel_all_orders(client) -> int:
-    """Cancel all open orders."""
     try:
         client.cancel_all()
         count = len(open_orders)
@@ -140,14 +149,13 @@ class MarketMaker:
     def __init__(self, dry_run: bool = True):
         self.dry_run = dry_run
         self.client = None
-        self.ws = None  # Will borrow MomentumEngine's WS for live prices
-        self._engine = None  # Lightweight MomentumEngine for price/WS infra
+        self.ws = None
         self.scans = 0
         self.orders_placed = 0
-        self.fills = 0
         self._last_discovery = 0
         self._cached_markets = []
-        self._discovery_interval = 30  # seconds
+        self._discovery_interval = 30
+        self._last_ws_refresh = 0
 
     def start(self):
         print("\n" + "=" * 50)
@@ -167,13 +175,41 @@ class MarketMaker:
                 print("[MM] Failed to init CLOB client — falling back to dry run")
                 self.dry_run = True
 
-        # Use a lightweight MomentumEngine just for WS price infrastructure
-        self._engine = MomentumEngine(dry_run=True)
-        self._engine.start()
-        self.ws = self._engine.ws
+        # Start WS for live prices (no MomentumEngine needed)
+        if _HAS_WS:
+            try:
+                self.ws = CLOBWebSocket(
+                    on_price_change=_on_ws_price,
+                    on_connect=lambda: print("[MM] WebSocket connected"),
+                    on_disconnect=lambda: print("[MM] WebSocket disconnected"),
+                )
+                self.ws.start()
+                time.sleep(1)
+                print("[MM] WebSocket started")
+            except Exception as e:
+                print(f"[MM] WebSocket failed: {e} — using REST/gamma prices")
+                self.ws = None
+
+    def _refresh_ws_tokens(self):
+        """Subscribe WS to token IDs from discovered markets."""
+        if not self.ws or not self._cached_markets:
+            return
+        now = time.time()
+        if now - self._last_ws_refresh < 30:
+            return
+        self._last_ws_refresh = now
+
+        token_ids = []
+        for m in self._cached_markets:
+            token_ids.extend(m.get("token_ids", []))
+        if token_ids:
+            try:
+                self.ws.subscribe_to_assets(token_ids)
+                print(f"[MM] WS subscribed to {len(token_ids)} tokens")
+            except Exception as e:
+                print(f"[MM] WS subscribe error: {e}")
 
     def _discover(self):
-        """Discover BTC 5m markets (filtered)."""
         now = time.time()
         if now - self._last_discovery < self._discovery_interval and self._cached_markets:
             return self._cached_markets
@@ -189,24 +225,20 @@ class MarketMaker:
         if filtered:
             labels = [f"{m['coin'].upper()}_{m['interval']}" for m in filtered]
             print(f"[MM] Discovered {len(filtered)} markets: {', '.join(labels)}")
+
+        # Refresh WS subscriptions with new token IDs
+        self._refresh_ws_tokens()
         return filtered
 
-    def _get_price(self, token_id: str) -> float | None:
-        """Get live price via WS or engine's price infrastructure."""
-        if self._engine:
-            return self._engine.get_live_price(token_id)
-        return None
-
     def scan(self) -> int:
-        """One scan cycle. Returns number of new orders placed."""
         self.scans += 1
         markets = self._discover()
         if not markets:
             return 0
 
-        # Refresh WS tokens periodically
-        if self._engine and self.scans % 5 == 1:
-            self._engine._refresh_ws_tokens()
+        # Periodic WS refresh
+        if self.scans % 5 == 1:
+            self._refresh_ws_tokens()
 
         placed = 0
         for market in markets:
@@ -214,40 +246,34 @@ class MarketMaker:
             coin = market["coin"]
             slug = market["slug"]
 
-            # Skip if we already have an order for this market
             if condition_id in _ordered_markets:
                 continue
 
-            # Check market is still open
             end_date = market.get("end_date")
             if end_date:
                 minutes_left = (end_date - datetime.now(timezone.utc)).total_seconds() / 60
                 if minutes_left < 1:
                     continue
 
-            # We only care about the "Up" outcome (index 0)
+            # "Up" is outcome index 0
             up_token_id = market["token_ids"][0]
-            up_price = self._get_price(up_token_id)
-
+            up_price = _get_live_price(up_token_id, self.ws)
             if up_price is None:
-                up_price = market["prices"][0]  # gamma fallback
+                up_price = market["prices"][0]
 
             label = f"{coin.upper()}_{market['interval']} {(market.get('question') or slug)[:40]}"
 
-            # Check threshold: Up must be > ENTRY_THRESHOLD
             if up_price <= ENTRY_THRESHOLD:
                 if self.scans % 30 == 1:
-                    print(f"[MM] SKIP {label}: Up @ {up_price*100:.1f}¢ <= {ENTRY_THRESHOLD*100:.0f}¢ threshold")
+                    print(f"[MM] SKIP {label}: Up @ {up_price*100:.1f}¢ <= {ENTRY_THRESHOLD*100:.0f}¢")
                 continue
 
-            # Don't place if live price is already below our limit
-            # (we'd get filled immediately at a worse price)
             if up_price < LIMIT_PRICE:
                 if self.scans % 30 == 1:
-                    print(f"[MM] SKIP {label}: Up @ {up_price*100:.1f}¢ < {LIMIT_PRICE*100:.0f}¢ limit")
+                    print(f"[MM] SKIP {label}: Up @ {up_price*100:.1f}¢ < {LIMIT_PRICE*100:.0f}¢")
                 continue
 
-            print(f"[MM] CANDIDATE {label}: Up @ {up_price*100:.1f}¢ > {ENTRY_THRESHOLD*100:.0f}¢")
+            print(f"[MM] CANDIDATE {label}: Up @ {up_price*100:.1f}¢")
 
             if self.dry_run:
                 print(f"[MM] DRY RUN — would place GTC BUY Up @ {LIMIT_PRICE*100:.0f}¢ ${LOT_SIZE:.2f}")
@@ -274,23 +300,20 @@ class MarketMaker:
         return placed
 
     def cleanup_expired(self):
-        """Cancel orders for markets that have closed."""
         if self.dry_run or not self.client:
             return
 
         to_remove = []
         for cid, order in open_orders.items():
-            # Find market in cache
             market = next((m for m in self._cached_markets if m["condition_id"] == cid), None)
             if market:
                 end_date = market.get("end_date")
                 if end_date:
                     minutes_left = (end_date - datetime.now(timezone.utc)).total_seconds() / 60
-                    if minutes_left < 0.5:  # 30s before close
+                    if minutes_left < 0.5:
                         cancel_order(self.client, order["order_id"])
                         to_remove.append(cid)
             else:
-                # Market no longer in discovery — probably closed
                 cancel_order(self.client, order["order_id"])
                 to_remove.append(cid)
 
@@ -299,7 +322,6 @@ class MarketMaker:
             _ordered_markets.discard(cid)
 
     def run_loop(self):
-        """Main loop."""
         self.start()
         print(f"[MM] Starting scan loop (every {POLL_INTERVAL}s) — Ctrl+C to stop\n")
 
@@ -312,8 +334,7 @@ class MarketMaker:
 
                     self.cleanup_expired()
 
-                    # Clear ordered set for new 5m epoch
-                    # (new markets appear every 5 minutes)
+                    # Clear ordered set every 5 minutes (new markets appear)
                     if self.scans % (300 // max(POLL_INTERVAL, 1)) == 0:
                         _ordered_markets.clear()
 
