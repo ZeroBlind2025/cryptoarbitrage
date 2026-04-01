@@ -2663,10 +2663,6 @@ class CopyTrader:
                 outcome_index = bet.get("outcome_index")
             market_key = (condition_id, outcome_index)
 
-            # Skip re-entries for simplicity
-            if market_key in self.entered_markets:
-                continue
-
             token_id = bet.get("asset", "")
             # Mirror exact position: same USDC spend as target
             trade_amount = round(usdc_size, 2) if usdc_size > 0 else WEATHER_BET_AMOUNT
