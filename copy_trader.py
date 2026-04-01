@@ -2643,19 +2643,31 @@ class CopyTrader:
             if is_crypto_market(bet):
                 continue
 
+            # Debug: dump first weather bet fields to understand API shape
+            if self.scans_completed < 3:
+                _fields = {k: v for k, v in bet.items() if k not in ('id', 'conditionId', 'asset')}
+                print(f"[WEATHER] API fields: {_fields}", flush=True)
+
             slug = bet.get("slug", "")
             title = bet.get("title", bet.get("market", ""))
             outcome = bet.get("outcome", bet.get("side", ""))
-            price = 0
+
+            # Parse amounts — API may return usdcSize as total USDC or per-share
             usdc_size = float(bet.get("usdcSize", 0))
             shares = float(bet.get("size", 0))
-            if usdc_size and shares:
+            price = float(bet.get("price", 0))
+
+            # Derive price if not directly available
+            if not price and usdc_size and shares:
                 price = usdc_size / shares
-            elif bet.get("price"):
-                price = float(bet["price"])
 
             if price <= 0 or price >= 1:
                 continue
+
+            # Total USDC spent = shares * price (most reliable calculation)
+            total_usdc = round(shares * price, 2) if shares and price else round(usdc_size, 2)
+            if total_usdc < 0.01:
+                total_usdc = WEATHER_BET_AMOUNT
 
             condition_id = bet.get("conditionId") or bet.get("condition_id") or ""
             outcome_index = bet.get("outcomeIndex")
@@ -2664,13 +2676,12 @@ class CopyTrader:
             market_key = (condition_id, outcome_index)
 
             token_id = bet.get("asset", "")
-            # Mirror exact position: same USDC spend as target
-            trade_amount = round(usdc_size, 2) if usdc_size > 0 else WEATHER_BET_AMOUNT
+            trade_amount = total_usdc
 
             print(f"\n[WEATHER] NEW TRADE from {WEATHER_TARGET_ADDRESS[:10]}...")
             print(f"         Market: {title}")
-            print(f"         Target bought: {shares:.1f} shares of {outcome} @ {price*100:.1f}¢ (${usdc_size:.2f})")
-            print(f"         Mirroring: ${trade_amount:.2f} (exact copy)")
+            print(f"         Target bought: {shares:.1f} shares of {outcome} @ {price*100:.1f}¢ (${total_usdc:.2f} USDC)")
+            print(f"         Mirroring: ${trade_amount:.2f}")
 
             trade_record = {
                 "id": trade_id,
