@@ -2625,8 +2625,140 @@ class CopyTrader:
 
         return copied
 
+    def _sync_weather_positions(self):
+        """On startup, match the weather target's current open positions.
+
+        Fetches the target's portfolio, filters to non-crypto, and places
+        buy orders to match their total position size on each market.
+        """
+        print(f"\n[WEATHER] Syncing to {WEATHER_TARGET_ADDRESS[:12]}... open positions...", flush=True)
+        try:
+            target_positions = get_positions(WEATHER_TARGET_ADDRESS)
+        except Exception as e:
+            print(f"[WEATHER] Failed to fetch target positions: {e}", flush=True)
+            return
+
+        if not target_positions:
+            print("[WEATHER] Target has no open positions", flush=True)
+            return
+
+        synced = 0
+        total_usdc = 0
+        for pos in target_positions:
+            # Position fields from data-api: conditionId, asset (token_id),
+            # size (shares), avgPrice, currentValue, title, slug, outcome, outcomeIndex
+            slug = pos.get("slug", "").lower()
+            title = pos.get("title", pos.get("market", ""))
+
+            # Skip crypto markets
+            if is_crypto_market({"slug": slug, "title": title}):
+                continue
+
+            shares = float(pos.get("size", 0))
+            if shares <= 0:
+                continue
+
+            avg_price = float(pos.get("avgPrice", 0) or pos.get("price", 0))
+            cur_price = float(pos.get("curPrice", 0) or pos.get("currentPrice", 0) or avg_price)
+            condition_id = pos.get("conditionId") or pos.get("condition_id") or ""
+            outcome_index = pos.get("outcomeIndex")
+            if outcome_index is None:
+                outcome_index = pos.get("outcome_index", 0)
+            outcome = pos.get("outcome", "Yes")
+            token_id = pos.get("asset") or pos.get("token_id", "")
+            market_key = (condition_id, outcome_index)
+
+            # Use avg entry price for cost basis, current price for order
+            buy_price = cur_price if cur_price > 0 else avg_price
+            if buy_price <= 0 or buy_price >= 1:
+                continue
+
+            position_cost = round(shares * avg_price, 2) if avg_price else round(shares * buy_price, 2)
+
+            print(f"[WEATHER] SYNC {title[:50]}")
+            print(f"         Target holds: {shares:.1f} shares of {outcome} @ avg {avg_price*100:.1f}¢ (${position_cost:.2f})")
+            print(f"         Current price: {buy_price*100:.1f}¢")
+
+            trade_amount = round(shares * buy_price, 2)
+            if trade_amount < 0.01:
+                continue
+
+            trade_record = {
+                "id": f"wx_sync_{condition_id[:12]}_{outcome_index}",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "market": title,
+                "slug": slug,
+                "outcome": outcome,
+                "side": "BUY",
+                "amount": trade_amount,
+                "price": buy_price,
+                "target_price": buy_price,
+                "source": "weather_copy",
+            }
+
+            if self.dry_run:
+                print(f"         DRY RUN — would buy {shares:.1f} shares @ {buy_price*100:.1f}¢ (${trade_amount:.2f})")
+                trade_record["status"] = "dry_run"
+                synced += 1
+                total_usdc += trade_amount
+            elif self.client and token_id:
+                buffer = PRICE_BUFFER_BPS / 10000
+                max_price = min(buy_price * (1 + buffer), 0.99)
+                fill = place_bet(self.client, token_id, trade_amount, max_price=max_price)
+                if fill.get("success"):
+                    fill_price = fill.get("fill_price", buy_price)
+                    print(f"         FILLED @ {fill_price*100:.1f}¢")
+                    trade_record["status"] = "filled"
+                    trade_record["fill_price"] = fill_price
+                    synced += 1
+                    total_usdc += trade_amount
+                    self.total_spent += trade_amount
+                else:
+                    print(f"         FAILED!")
+                    trade_record["status"] = "failed"
+            else:
+                print(f"         SKIP (no client or token_id)")
+                continue
+
+            self.trade_history.append(trade_record)
+
+            if trade_record["status"] in ["filled", "dry_run"]:
+                self.entered_markets[market_key] = buy_price
+                self.market_entry_count[market_key] = self.market_entry_count.get(market_key, 0) + 1
+                position = {
+                    "id": trade_record["id"],
+                    "timestamp": trade_record["timestamp"],
+                    "condition_id": condition_id,
+                    "token_id": token_id,
+                    "outcome_index": outcome_index,
+                    "outcome": outcome,
+                    "market": title,
+                    "slug": slug,
+                    "entry_price": buy_price,
+                    "amount": trade_amount,
+                    "potential_payout": trade_amount / buy_price if buy_price > 0 else 0,
+                    "dry_run": self.dry_run,
+                    "source": "weather_copy",
+                }
+                self.positions.setdefault("open", []).append(position)
+
+            if self.on_trade:
+                try:
+                    self.on_trade(trade_record)
+                except Exception:
+                    pass
+
+        if synced:
+            save_positions(self.positions)
+        print(f"\n[WEATHER] Sync complete: {synced} positions matched (${total_usdc:.2f} total)", flush=True)
+
     def _check_weather_copy(self) -> int:
         """Copy non-crypto (weather) trades from the secondary target address."""
+        # On first call, sync to target's existing positions
+        if not hasattr(self, '_wx_synced'):
+            self._wx_synced = True
+            self._sync_weather_positions()
+
         weather_bets = get_latest_bets(WEATHER_TARGET_ADDRESS, verbose=False)
         if not weather_bets:
             return 0
