@@ -2376,6 +2376,30 @@ def api_mm_settings():
                     "limit_price": market_maker_engine.limit_price})
 
 
+@app.route('/api/market-maker/pause-coin', methods=['POST'])
+def api_mm_pause_coin():
+    if not market_maker_engine:
+        return jsonify({"error": "Market maker not running"}), 409
+    data = request.get_json(force=True, silent=True) or {}
+    coin = data.get('coin', '').lower()
+    if not coin:
+        return jsonify({"error": "Missing coin"}), 400
+    market_maker_engine.paused_coins.add(coin)
+    return jsonify({"success": True, "paused_coins": list(market_maker_engine.paused_coins)})
+
+
+@app.route('/api/market-maker/resume-coin', methods=['POST'])
+def api_mm_resume_coin():
+    if not market_maker_engine:
+        return jsonify({"error": "Market maker not running"}), 409
+    data = request.get_json(force=True, silent=True) or {}
+    coin = data.get('coin', '').lower()
+    if not coin:
+        return jsonify({"error": "Missing coin"}), 400
+    market_maker_engine.paused_coins.discard(coin)
+    return jsonify({"success": True, "paused_coins": list(market_maker_engine.paused_coins)})
+
+
 @app.route('/api/market-maker/trades')
 def api_mm_trades():
     limit = int(request.args.get('limit', 50))

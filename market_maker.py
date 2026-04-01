@@ -35,7 +35,7 @@ ENTRY_THRESHOLD = float(os.getenv("MM_ENTRY_THRESHOLD", "0.50"))
 LOT_SIZE = float(os.getenv("MM_LOT_SIZE", "1.0"))
 POLL_INTERVAL = int(os.getenv("MM_POLL_INTERVAL", "5"))
 DRY_RUN = os.getenv("MM_DRY_RUN", "true").lower() == "true"
-MM_COINS = [c.strip() for c in os.getenv("MM_COINS", "btc").split(",") if c.strip()]
+MM_COINS = [c.strip() for c in os.getenv("MM_COINS", "btc,eth,sol,xrp").split(",") if c.strip()]
 MM_INTERVALS = [i.strip() for i in os.getenv("MM_INTERVALS", "5m").split(",") if i.strip()]
 
 # Reuse infrastructure from existing codebase
@@ -167,6 +167,7 @@ class MarketMaker:
         self._last_ws_refresh = 0
         self._filled_orders: list = []  # trade history
         self._balance_history: list = []
+        self.paused_coins: set = set()  # coins currently paused
 
     def start(self):
         print("\n" + "=" * 50)
@@ -258,6 +259,9 @@ class MarketMaker:
             slug = market["slug"]
 
             if condition_id in _ordered_markets:
+                continue
+
+            if coin in self.paused_coins:
                 continue
 
             end_date = market.get("end_date")
@@ -365,6 +369,7 @@ class MarketMaker:
             "limit_price": self.limit_price,
             "entry_threshold": ENTRY_THRESHOLD,
             "coins": MM_COINS,
+            "paused_coins": list(self.paused_coins),
             "intervals": MM_INTERVALS,
             "dry_run": self.dry_run,
             "filled_orders": self._filled_orders[-50:],

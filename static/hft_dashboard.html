@@ -1537,9 +1537,31 @@
                                     </div>
                                 </div>
 
-                                <p className="text-slate-400 text-xs mb-3">
-                                    GTC limit orders on BTC 5m Up @ {(mm.limit_price*100||70).toFixed(0)}¢ | Lot: ${(mm.lot_size||1).toFixed(2)}
+                                <p className="text-slate-400 text-xs mb-2">
+                                    GTC limit orders on 5m Up @ {(mm.limit_price*100||70).toFixed(0)}¢ | Lot: ${(mm.lot_size||1).toFixed(2)}
                                 </p>
+
+                                {/* Per-coin toggles */}
+                                <div className="flex gap-2 mb-3">
+                                    {(mm.coins || ['btc','eth','sol','xrp']).map(coin => {
+                                        const paused = (mm.paused_coins || []).includes(coin);
+                                        return (
+                                            <button key={coin} onClick={() => {
+                                                fetch(`/api/market-maker/${paused ? 'resume' : 'pause'}-coin`, {
+                                                    method: 'POST',
+                                                    headers: {'Content-Type':'application/json'},
+                                                    body: JSON.stringify({coin})
+                                                }).then(()=>fetchData());
+                                            }} className={`px-2 py-1 rounded text-xs font-mono border ${
+                                                paused
+                                                    ? 'bg-slate-700/30 text-slate-500 border-slate-600/30'
+                                                    : 'bg-cyan-500/20 text-cyan-400 border-cyan-500/30'
+                                            }`}>
+                                                {coin.toUpperCase()}
+                                            </button>
+                                        );
+                                    })}
+                                </div>
 
                                 {mm.running && (
                                     <div>
