@@ -146,25 +146,36 @@ def cancel_all_orders(client) -> int:
 
 
 class MarketMaker:
-    def __init__(self, dry_run: bool = True):
+    def __init__(self, dry_run: bool = True, on_trade=None,
+                 lot_size: float = 0, limit_price: float = 0):
         self.dry_run = dry_run
+        self.on_trade = on_trade
         self.client = None
         self.ws = None
         self.scans = 0
         self.orders_placed = 0
+        self.fills = 0
+        self.total_pnl = 0.0
+        self.total_spent = 0.0
+        self.wins = 0
+        self.losses = 0
+        self.lot_size = lot_size or LOT_SIZE
+        self.limit_price = limit_price or LIMIT_PRICE
         self._last_discovery = 0
         self._cached_markets = []
         self._discovery_interval = 30
         self._last_ws_refresh = 0
+        self._filled_orders: list = []  # trade history
+        self._balance_history: list = []
 
     def start(self):
         print("\n" + "=" * 50)
         print("  MARKET MAKER ENGINE")
         print(f"  Coins: {', '.join(MM_COINS)}")
         print(f"  Intervals: {', '.join(MM_INTERVALS)}")
-        print(f"  Limit price: {LIMIT_PRICE*100:.0f}¢ (Up)")
+        print(f"  Limit price: {self.limit_price*100:.0f}¢ (Up)")
         print(f"  Entry threshold: >{ENTRY_THRESHOLD*100:.0f}¢")
-        print(f"  Lot size: ${LOT_SIZE:.2f}")
+        print(f"  Lot size: ${self.lot_size:.2f}")
         print(f"  Poll: {POLL_INTERVAL}s")
         print(f"  Mode: {'DRY RUN' if self.dry_run else 'LIVE'}")
         print("=" * 50 + "\n")
@@ -268,28 +279,28 @@ class MarketMaker:
                     print(f"[MM] SKIP {label}: Up @ {up_price*100:.1f}¢ <= {ENTRY_THRESHOLD*100:.0f}¢")
                 continue
 
-            if up_price < LIMIT_PRICE:
+            if up_price < self.limit_price:
                 if self.scans % 30 == 1:
-                    print(f"[MM] SKIP {label}: Up @ {up_price*100:.1f}¢ < {LIMIT_PRICE*100:.0f}¢")
+                    print(f"[MM] SKIP {label}: Up @ {up_price*100:.1f}¢ < {self.limit_price*100:.0f}¢")
                 continue
 
             print(f"[MM] CANDIDATE {label}: Up @ {up_price*100:.1f}¢")
 
             if self.dry_run:
-                print(f"[MM] DRY RUN — would place GTC BUY Up @ {LIMIT_PRICE*100:.0f}¢ ${LOT_SIZE:.2f}")
+                print(f"[MM] DRY RUN — would place GTC BUY Up @ {self.limit_price*100:.0f}¢ ${self.lot_size:.2f}")
                 _ordered_markets.add(condition_id)
                 placed += 1
             else:
                 result = place_limit_order(
-                    self.client, up_token_id, LIMIT_PRICE, LOT_SIZE, label=label,
+                    self.client, up_token_id, self.limit_price, self.lot_size, label=label,
                 )
                 if result.get("success"):
                     order_id = result.get("order_id", "unknown")
                     open_orders[condition_id] = {
                         "order_id": order_id,
                         "token_id": up_token_id,
-                        "price": LIMIT_PRICE,
-                        "size": LOT_SIZE,
+                        "price": self.limit_price,
+                        "size": self.lot_size,
                         "placed_at": datetime.now(timezone.utc).isoformat(),
                         "market": label,
                     }
@@ -320,6 +331,46 @@ class MarketMaker:
         for cid in to_remove:
             del open_orders[cid]
             _ordered_markets.discard(cid)
+
+    def stop(self):
+        """Clean shutdown."""
+        if self.client and open_orders:
+            cancel_all_orders(self.client)
+        if self.ws:
+            try:
+                self.ws.stop()
+            except Exception:
+                pass
+            self.ws = None
+        print("[MM] Stopped.")
+
+    def get_stats(self) -> dict:
+        """Return stats for the dashboard."""
+        return {
+            "scans": self.scans,
+            "orders_placed": self.orders_placed,
+            "open_orders": len(open_orders),
+            "open_order_list": [
+                {"market": o["market"], "price": o["price"], "size": o["size"],
+                 "placed_at": o["placed_at"]}
+                for o in open_orders.values()
+            ],
+            "fills": self.fills,
+            "total_pnl": round(self.total_pnl, 2),
+            "total_spent": round(self.total_spent, 2),
+            "wins": self.wins,
+            "losses": self.losses,
+            "win_rate": round(self.wins / max(self.wins + self.losses, 1) * 100, 1),
+            "lot_size": self.lot_size,
+            "limit_price": self.limit_price,
+            "entry_threshold": ENTRY_THRESHOLD,
+            "coins": MM_COINS,
+            "intervals": MM_INTERVALS,
+            "dry_run": self.dry_run,
+            "filled_orders": self._filled_orders[-50:],
+            "balance_history": self._balance_history[-200:],
+            "markets_discovered": len(self._cached_markets),
+        }
 
     def run_loop(self):
         self.start()

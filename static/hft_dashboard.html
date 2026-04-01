@@ -880,6 +880,7 @@
             const trades = data?.trades || { demo: [], live: [], copy: [] };
             const copyTrader = data?.copy_trader || {};
             const momentum = data?.momentum || {};
+            const mm = data?.market_maker || {};
             const allTrades = [...(trades.demo || []), ...(trades.live || []), ...(trades.copy || []), ...(trades.momentum || [])]
                 .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
 
@@ -1486,6 +1487,153 @@
                                 {!momentum.running && (
                                     <p className="text-slate-500 text-sm">
                                         Click Start to begin momentum trading.
+                                    </p>
+                                )}
+                            </div>
+
+                            {/* Market Maker Engine */}
+                            <div className="bg-slate-800/50 backdrop-blur rounded-xl border border-slate-700/50 p-4">
+                                <div className="flex items-center justify-between mb-3">
+                                    <div className="flex items-center gap-2">
+                                        <h2 className="text-lg font-semibold">Market Maker</h2>
+                                        {mm.running && (
+                                            <span className="px-2 py-0.5 rounded-full text-xs font-medium bg-cyan-500/20 text-cyan-400 border border-cyan-500/30">
+                                                {mm.dry_run ? 'DRY RUN' : 'LIVE'}
+                                            </span>
+                                        )}
+                                    </div>
+                                    <div className="flex gap-2">
+                                        {mm.running ? (
+                                            <>
+                                                <button onClick={() => {
+                                                    fetch('/api/market-maker/stop', {method:'POST'}).then(()=>fetchData());
+                                                }} className="px-3 py-1 bg-red-500/20 hover:bg-red-500/30 text-red-400 rounded text-xs border border-red-500/30">
+                                                    Stop
+                                                </button>
+                                            </>
+                                        ) : (
+                                            <>
+                                                <button onClick={() => {
+                                                    fetch('/api/market-maker/start', {
+                                                        method: 'POST',
+                                                        headers: {'Content-Type':'application/json'},
+                                                        body: JSON.stringify({live: false})
+                                                    }).then(()=>fetchData());
+                                                }} className="px-3 py-1 bg-slate-500/20 hover:bg-slate-500/30 text-slate-300 rounded text-xs border border-slate-500/30">
+                                                    Dry Run
+                                                </button>
+                                                <button onClick={() => {
+                                                    if(!confirm('Start Market Maker in LIVE mode?')) return;
+                                                    fetch('/api/market-maker/start', {
+                                                        method: 'POST',
+                                                        headers: {'Content-Type':'application/json'},
+                                                        body: JSON.stringify({live: true, confirm_live: true})
+                                                    }).then(()=>fetchData());
+                                                }} className="px-3 py-1 bg-cyan-500/20 hover:bg-cyan-500/30 text-cyan-400 rounded text-xs border border-cyan-500/30">
+                                                    Live
+                                                </button>
+                                            </>
+                                        )}
+                                    </div>
+                                </div>
+
+                                <p className="text-slate-400 text-xs mb-3">
+                                    GTC limit orders on BTC 5m Up @ {(mm.limit_price*100||70).toFixed(0)}¢ | Lot: ${(mm.lot_size||1).toFixed(2)}
+                                </p>
+
+                                {mm.running && (
+                                    <div>
+                                        {/* P&L Box */}
+                                        <div className="bg-slate-900/50 rounded-lg p-3 mb-3">
+                                            <div className="text-center mb-2">
+                                                <div className={`text-2xl font-bold ${(mm.total_pnl||0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                                                    ${(mm.total_pnl||0).toFixed(2)}
+                                                </div>
+                                                <div className="text-slate-500 text-xs">Market Maker P&L</div>
+                                            </div>
+                                            <div className="grid grid-cols-3 gap-2 text-center text-xs">
+                                                <div>
+                                                    <div className="text-green-400 font-mono">{mm.wins||0}</div>
+                                                    <div className="text-slate-500">Wins</div>
+                                                </div>
+                                                <div>
+                                                    <div className="text-red-400 font-mono">{mm.losses||0}</div>
+                                                    <div className="text-slate-500">Losses</div>
+                                                </div>
+                                                <div>
+                                                    <div className="text-cyan-400 font-mono">{mm.win_rate||0}%</div>
+                                                    <div className="text-slate-500">Win Rate</div>
+                                                </div>
+                                            </div>
+                                        </div>
+
+                                        {/* Stats */}
+                                        <div className="space-y-1 text-xs mb-3">
+                                            <div className="flex justify-between">
+                                                <span className="text-slate-400">Scans</span>
+                                                <span className="text-white font-mono">{mm.scans||0}</span>
+                                            </div>
+                                            <div className="flex justify-between">
+                                                <span className="text-slate-400">Orders Placed</span>
+                                                <span className="text-white font-mono">{mm.orders_placed||0}</span>
+                                            </div>
+                                            <div className="flex justify-between">
+                                                <span className="text-slate-400">Open Orders</span>
+                                                <span className="text-cyan-400 font-mono">{mm.open_orders||0}</span>
+                                            </div>
+                                            <div className="flex justify-between">
+                                                <span className="text-slate-400">Markets Found</span>
+                                                <span className="text-white font-mono">{mm.markets_discovered||0}</span>
+                                            </div>
+                                        </div>
+
+                                        {/* Lot Size Control */}
+                                        <div className="flex items-center gap-2 mb-3">
+                                            <span className="text-slate-400 text-xs">Lot $</span>
+                                            <input type="number" step="0.5" min="0.5" max="100"
+                                                defaultValue={mm.lot_size||1}
+                                                className="bg-slate-700 text-white text-xs rounded px-2 py-1 w-16 font-mono"
+                                                onBlur={(e) => {
+                                                    fetch('/api/market-maker/settings', {
+                                                        method: 'POST',
+                                                        headers: {'Content-Type':'application/json'},
+                                                        body: JSON.stringify({lot_size: parseFloat(e.target.value)})
+                                                    }).then(()=>fetchData());
+                                                }}
+                                            />
+                                            <span className="text-slate-400 text-xs">Limit ¢</span>
+                                            <input type="number" step="1" min="50" max="95"
+                                                defaultValue={(mm.limit_price||0.70)*100}
+                                                className="bg-slate-700 text-white text-xs rounded px-2 py-1 w-16 font-mono"
+                                                onBlur={(e) => {
+                                                    fetch('/api/market-maker/settings', {
+                                                        method: 'POST',
+                                                        headers: {'Content-Type':'application/json'},
+                                                        body: JSON.stringify({limit_price: parseFloat(e.target.value)/100})
+                                                    }).then(()=>fetchData());
+                                                }}
+                                            />
+                                        </div>
+
+                                        {/* Open Orders List */}
+                                        {mm.open_order_list && mm.open_order_list.length > 0 && (
+                                            <div>
+                                                <div className="text-slate-400 text-xs mb-1">Open Orders:</div>
+                                                <div className="space-y-1 max-h-32 overflow-y-auto">
+                                                    {mm.open_order_list.map((o, i) => (
+                                                        <div key={i} className="text-xs text-slate-300 font-mono bg-slate-900/30 rounded px-2 py-1">
+                                                            {o.market} @ {(o.price*100).toFixed(0)}¢ ${o.size.toFixed(2)}
+                                                        </div>
+                                                    ))}
+                                                </div>
+                                            </div>
+                                        )}
+                                    </div>
+                                )}
+
+                                {!mm.running && (
+                                    <p className="text-slate-500 text-sm">
+                                        Click Start to begin market making.
                                     </p>
                                 )}
                             </div>

@@ -127,6 +127,12 @@ stop_momentum = threading.Event()
 momentum_paused = threading.Event()  # When set, skip new scans but keep resolution running
 momentum_trades: deque = deque(maxlen=500)
 
+# Market maker state
+market_maker_engine = None
+market_maker_thread: Optional[threading.Thread] = None
+stop_market_maker = threading.Event()
+market_maker_trades: deque = deque(maxlen=500)
+
 
 def on_copy_trade(trade_record: dict):
     """Callback when copy trader executes a trade"""
@@ -138,6 +144,12 @@ def on_momentum_trade(trade_record: dict):
     """Callback when momentum engine executes a trade"""
     momentum_trades.append(trade_record)
     print(f"[MOMENTUM] Trade recorded: {trade_record.get('market', '?')[:30]} - {trade_record.get('status', '?')}", flush=True)
+
+
+def on_mm_trade(trade_record: dict):
+    """Callback when market maker places/fills an order"""
+    market_maker_trades.append(trade_record)
+    print(f"[MM] Trade recorded: {trade_record.get('market', '?')[:30]} - {trade_record.get('status', '?')}", flush=True)
 
 
 # Sports data (no longer using WebSocket)
@@ -2266,6 +2278,131 @@ def api_momentum_trades():
     return jsonify(trades)
 
 
+# =============================================================================
+# MARKET MAKER
+# =============================================================================
+
+def mm_loop():
+    """Background loop for market maker engine"""
+    global market_maker_engine
+    if not market_maker_engine:
+        return
+    from market_maker import POLL_INTERVAL as MM_POLL
+    poll_s = MM_POLL
+    print(f"[MM] Background scanning started (every {poll_s}s)...", flush=True)
+    loop_count = 0
+    while not stop_market_maker.is_set():
+        try:
+            loop_count += 1
+            placed = market_maker_engine.scan()
+            if placed > 0:
+                print(f"[MM] Placed {placed} order(s)", flush=True)
+            market_maker_engine.cleanup_expired()
+            # Heartbeat every ~5 min
+            if loop_count % max(1, 300 // poll_s) == 0:
+                stats = market_maker_engine.get_stats()
+                print(f"[MM] Heartbeat: {stats['orders_placed']} placed | "
+                      f"{stats['open_orders']} open | {stats['scans']} scans", flush=True)
+        except Exception as e:
+            print(f"[MM] Error in loop: {e}", flush=True)
+            import traceback; traceback.print_exc()
+        stop_market_maker.wait(timeout=poll_s)
+    print("[MM] Background scanning stopped", flush=True)
+
+
+@app.route('/api/market-maker/start', methods=['POST'])
+def api_mm_start():
+    global market_maker_engine, market_maker_thread
+    if market_maker_thread and market_maker_thread.is_alive():
+        return jsonify({"error": "Market maker already running"}), 409
+    data = request.get_json(force=True, silent=True) or {}
+    live_mode = data.get('live', False)
+    if live_mode and not data.get('confirm_live'):
+        return jsonify({"error": "Set confirm_live=true for live mode"}), 403
+    lot_size = float(data.get('lot_size', 0))
+    limit_price = float(data.get('limit_price', 0))
+    try:
+        from market_maker import MarketMaker
+        market_maker_engine = MarketMaker(
+            dry_run=not live_mode,
+            on_trade=on_mm_trade,
+            lot_size=lot_size,
+            limit_price=limit_price,
+        )
+        market_maker_engine.start()
+    except Exception as e:
+        print(f"[MM] Failed to start: {e}")
+        import traceback; traceback.print_exc()
+        market_maker_engine = None
+        return jsonify({"error": f"Failed to start: {e}"}), 500
+    stop_market_maker.clear()
+    market_maker_thread = threading.Thread(target=mm_loop, daemon=True)
+    market_maker_thread.start()
+    mode = "LIVE" if live_mode else "DRY RUN"
+    return jsonify({"success": True, "message": f"Market maker started ({mode})"})
+
+
+@app.route('/api/market-maker/stop', methods=['POST'])
+def api_mm_stop():
+    global market_maker_engine, market_maker_thread
+    if not market_maker_thread or not market_maker_thread.is_alive():
+        return jsonify({"error": "Market maker not running"}), 409
+    stop_market_maker.set()
+    market_maker_thread.join(timeout=5)
+    stats = market_maker_engine.get_stats() if market_maker_engine else {}
+    if market_maker_engine:
+        market_maker_engine.stop()
+    market_maker_engine = None
+    return jsonify({"success": True, "stats": stats})
+
+
+@app.route('/api/market-maker/status')
+def api_mm_status():
+    running = market_maker_thread and market_maker_thread.is_alive()
+    stats = market_maker_engine.get_stats() if market_maker_engine else {}
+    return jsonify({"running": running, **stats})
+
+
+@app.route('/api/market-maker/settings', methods=['POST'])
+def api_mm_settings():
+    if not market_maker_engine:
+        return jsonify({"error": "Market maker not running"}), 409
+    data = request.get_json(force=True, silent=True) or {}
+    if 'lot_size' in data:
+        market_maker_engine.lot_size = float(data['lot_size'])
+    if 'limit_price' in data:
+        market_maker_engine.limit_price = float(data['limit_price'])
+    return jsonify({"success": True, "lot_size": market_maker_engine.lot_size,
+                    "limit_price": market_maker_engine.limit_price})
+
+
+@app.route('/api/market-maker/trades')
+def api_mm_trades():
+    limit = int(request.args.get('limit', 50))
+    trades = list(market_maker_trades)[-limit:]
+    trades.reverse()
+    return jsonify(trades)
+
+
+def _get_mm_data() -> dict:
+    """Get market maker data for /api/data"""
+    running = market_maker_thread and market_maker_thread.is_alive()
+    base = {"running": running}
+    try:
+        if market_maker_engine:
+            base.update(market_maker_engine.get_stats())
+        else:
+            base.update({
+                "orders_placed": 0, "open_orders": 0, "fills": 0,
+                "total_pnl": 0, "wins": 0, "losses": 0, "win_rate": 0,
+                "lot_size": 1.0, "limit_price": 0.70,
+                "dry_run": True, "scans": 0, "markets_discovered": 0,
+            })
+    except Exception as e:
+        print(f"[MM] get_stats error: {e}", flush=True)
+    return base
+
+
 @app.route('/api/sweep', methods=['POST'])
 def api_sweep():
     """Sweep all unredeemed winning positions from our Polymarket wallet.
@@ -2469,6 +2606,7 @@ def api_data():
         },
         "copy_trader": _get_copy_trader_data(),
         "momentum": _get_momentum_data(),
+        "market_maker": _get_mm_data(),
         "pnl": {
             "demo": {
                 "filled": len(demo_filled),
