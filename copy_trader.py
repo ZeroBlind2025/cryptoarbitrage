@@ -61,6 +61,10 @@ except ImportError:
 # Target trader to copy
 TARGET_ADDRESS = os.getenv("COPY_TARGET_ADDRESS", "0xd0d6053c3c37e727402d84c14069780d360993aa")
 
+# Secondary target — weather/non-crypto markets only
+WEATHER_TARGET_ADDRESS = os.getenv("COPY_WEATHER_TARGET", "")
+WEATHER_BET_AMOUNT = float(os.getenv("COPY_WEATHER_BET_AMOUNT", "5.0"))
+
 # Your credentials (from environment)
 FUNDER_ADDRESS = os.getenv("POLYMARKET_FUNDER_ADDRESS", os.getenv("POLYGON_ADDRESS", ""))
 PRIVATE_KEY = os.getenv("POLYGON_PRIVATE_KEY", "")
@@ -2119,6 +2123,9 @@ class CopyTrader:
         print(f"  Balance: ${balance:.2f}")
         print(f"  Mode: {'DRY RUN' if self.dry_run else 'LIVE'}")
         print(f"  Filter: {'Crypto only' if self.crypto_only else 'All markets'}")
+        if WEATHER_TARGET_ADDRESS:
+            wx_name = get_profile_name(WEATHER_TARGET_ADDRESS)
+            print(f"  Weather copy: {wx_name} ({WEATHER_TARGET_ADDRESS[:16]}...) — mirror exact sizes")
         print(f"  Poll interval: {POLL_INTERVAL}s")
         print(f"  Price buffer: {PRICE_BUFFER_BPS} bps")
         print(f"  Stop loss: {STOP_LOSS_PCT}%" if STOP_LOSS_PCT > 0 else "  Stop loss: DISABLED")
@@ -2611,6 +2618,125 @@ class CopyTrader:
 
             self.trades_copied += copied
             self.total_buys += copied
+
+        # --- WEATHER TARGET: copy non-crypto bets from secondary address ---
+        if WEATHER_TARGET_ADDRESS:
+            copied += self._check_weather_copy()
+
+        return copied
+
+    def _check_weather_copy(self) -> int:
+        """Copy non-crypto (weather) trades from the secondary target address."""
+        weather_bets = get_latest_bets(WEATHER_TARGET_ADDRESS, verbose=False)
+        if not weather_bets:
+            return 0
+
+        copied = 0
+        for bet in weather_bets:
+            trade_id = f"wx_{bet.get('id') or bet.get('conditionId', '')}"
+
+            if trade_id in self.copied_trades:
+                continue
+            self.copied_trades.add(trade_id)
+
+            # INVERSE filter: skip crypto, keep everything else (weather, sports, etc.)
+            if is_crypto_market(bet):
+                continue
+
+            slug = bet.get("slug", "")
+            title = bet.get("title", bet.get("market", ""))
+            outcome = bet.get("outcome", bet.get("side", ""))
+            price = 0
+            usdc_size = float(bet.get("usdcSize", 0))
+            shares = float(bet.get("size", 0))
+            if usdc_size and shares:
+                price = usdc_size / shares
+            elif bet.get("price"):
+                price = float(bet["price"])
+
+            if price <= 0 or price >= 1:
+                continue
+
+            condition_id = bet.get("conditionId") or bet.get("condition_id") or ""
+            outcome_index = bet.get("outcomeIndex")
+            if outcome_index is None:
+                outcome_index = bet.get("outcome_index")
+            market_key = (condition_id, outcome_index)
+
+            # Skip re-entries for simplicity
+            if market_key in self.entered_markets:
+                continue
+
+            token_id = bet.get("asset", "")
+            # Mirror exact position: same USDC spend as target
+            trade_amount = round(usdc_size, 2) if usdc_size > 0 else WEATHER_BET_AMOUNT
+
+            print(f"\n[WEATHER] NEW TRADE from {WEATHER_TARGET_ADDRESS[:10]}...")
+            print(f"         Market: {title}")
+            print(f"         Target bought: {shares:.1f} shares of {outcome} @ {price*100:.1f}¢ (${usdc_size:.2f})")
+            print(f"         Mirroring: ${trade_amount:.2f} (exact copy)")
+
+            trade_record = {
+                "id": trade_id,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "market": title,
+                "slug": slug,
+                "outcome": outcome,
+                "side": "BUY",
+                "amount": trade_amount,
+                "target_price": price,
+                "source": "weather_copy",
+            }
+
+            if self.dry_run:
+                print(f"         DRY RUN — would buy @ {price*100:.1f}¢")
+                trade_record["status"] = "dry_run"
+                copied += 1
+            elif self.client and token_id:
+                buffer = PRICE_BUFFER_BPS / 10000
+                max_price = min(price * (1 + buffer), 0.99)
+                fill = place_bet(self.client, token_id, trade_amount, max_price=max_price)
+                if fill.get("success"):
+                    fill_price = fill.get("fill_price", price)
+                    print(f"         FILLED @ {fill_price*100:.1f}¢")
+                    trade_record["status"] = "filled"
+                    trade_record["fill_price"] = fill_price
+                    copied += 1
+                    self.total_spent += trade_amount
+                else:
+                    print(f"         FAILED!")
+                    trade_record["status"] = "failed"
+
+            self.trade_history.append(trade_record)
+
+            if trade_record["status"] in ["filled", "dry_run"]:
+                if condition_id:
+                    self.entered_markets[market_key] = price
+                    self.market_entry_count[market_key] = 1
+                position = {
+                    "id": trade_record["id"],
+                    "timestamp": trade_record["timestamp"],
+                    "condition_id": condition_id,
+                    "token_id": token_id,
+                    "outcome_index": outcome_index,
+                    "outcome": outcome,
+                    "market": title,
+                    "slug": slug,
+                    "entry_price": price,
+                    "amount": trade_amount,
+                    "potential_payout": trade_amount / price if price > 0 else 0,
+                    "dry_run": self.dry_run,
+                    "source": "weather_copy",
+                }
+                self.positions.setdefault("open", []).append(position)
+                save_positions(self.positions)
+                print(f"         Position saved. Payout: ${position['potential_payout']:.2f}")
+
+            if self.on_trade:
+                try:
+                    self.on_trade(trade_record)
+                except Exception:
+                    pass
 
         return copied
 
