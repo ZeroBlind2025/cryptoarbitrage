@@ -978,9 +978,9 @@
                                     </div>
                                 </div>
 
-                                <div className="space-y-3 max-h-[500px] overflow-y-auto">
+                                <div className="space-y-3 max-h-[800px] overflow-y-auto">
                                     {allTrades.length > 0 ? (
-                                        allTrades.slice(0, 20).map((trade) => (
+                                        allTrades.slice(0, 50).map((trade) => (
                                             trade.source === 'copy_trader' || trade.source === 'weather_copy' ? (
                                                 <CopyTradeRow
                                                     key={trade.id}
