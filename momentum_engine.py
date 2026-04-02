@@ -1877,8 +1877,10 @@ class MomentumEngine:
                     proceeds = shares * live_price
                     pnl = proceeds - position.get("amount", 0)
                     position["result"] = "TAKE_PROFIT"
+                    position["won"] = True
                     position["sell_price"] = live_price
                     position["pnl"] = pnl
+                    position["proceeds"] = proceeds
                     self.positions.get("open", []).remove(position)
                     self.positions.setdefault("resolved", []).append(position)
                     self.positions["stats"] = self.positions.get("stats", {})
@@ -1897,8 +1899,10 @@ class MomentumEngine:
                         proceeds = shares * fill_price
                         pnl = proceeds - position.get("amount", 0)
                         position["result"] = "TAKE_PROFIT"
+                        position["won"] = True
                         position["sell_price"] = fill_price
                         position["pnl"] = pnl
+                        position["proceeds"] = proceeds
                         self.positions.get("open", []).remove(position)
                         self.positions.setdefault("resolved", []).append(position)
                         self.positions["stats"] = self.positions.get("stats", {})
@@ -2346,7 +2350,7 @@ class MomentumEngine:
             result = pos.get("result", "")
             coin_data[coin]["deployed"] += amount
             coin_data[coin]["pnl"] += pnl
-            if result == "WIN":
+            if result in ("WIN", "TAKE_PROFIT"):
                 coin_data[coin]["wins"] += 1
                 coin_data[coin]["results"].append("W")
             elif result in ("LOSS", "STOP_LOSS"):
