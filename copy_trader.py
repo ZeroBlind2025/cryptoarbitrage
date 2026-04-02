@@ -33,7 +33,7 @@ except ImportError:
 
 try:
     from py_clob_client.client import ClobClient
-    from py_clob_client.clob_types import MarketOrderArgs, OrderType
+    from py_clob_client.clob_types import MarketOrderArgs, OrderArgs, OrderType, PartialCreateOrderOptions
     from py_clob_client.order_builder.constants import BUY, SELL
     HAS_CLOB_CLIENT = True
 except ImportError:
