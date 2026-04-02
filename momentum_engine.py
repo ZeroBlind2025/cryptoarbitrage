@@ -1897,12 +1897,23 @@ class MomentumEngine:
                     position["proceeds"] = proceeds
                     self.positions.get("open", []).remove(position)
                     self.positions.setdefault("resolved", []).append(position)
-                    self.positions["stats"] = self.positions.get("stats", {})
-                    self.positions["stats"]["wins"] = self.positions["stats"].get("wins", 0) + 1
-                    self.positions["stats"]["total_pnl"] = self.positions["stats"].get("total_pnl", 0) + pnl
+                    stats = self.positions.setdefault("stats", {})
+                    stats["wins"] = stats.get("wins", 0) + 1
+                    stats["total_pnl"] = stats.get("total_pnl", 0) + pnl
+                    # Credit proceeds back to balance
+                    stats["balance"] = stats.get("balance", ALGO_STARTING_BALANCE) + proceeds
+                    open_staked = sum(p.get("amount", 0) for p in self.positions.get("open", []))
+                    stats.setdefault("balance_history", []).append({
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "balance": stats["balance"],
+                        "pnl": stats["total_pnl"],
+                        "equity": stats["balance"] + open_staked,
+                        "event": "momentum_take_profit",
+                        "detail": f"TP {title[:30]}",
+                    })
                     save_positions(self.positions)
                     stopped += 1
-                    print(f"       PnL: ${pnl:.2f}", flush=True)
+                    print(f"       PnL: ${pnl:.2f} | Balance: ${stats['balance']:.2f}", flush=True)
                 elif token_id and self.client:
                     from copy_trader import place_sell_gtc
                     # GTC limit sell at take-profit price — rests on book if no immediate match
@@ -1918,12 +1929,23 @@ class MomentumEngine:
                         position["proceeds"] = proceeds
                         self.positions.get("open", []).remove(position)
                         self.positions.setdefault("resolved", []).append(position)
-                        self.positions["stats"] = self.positions.get("stats", {})
-                        self.positions["stats"]["wins"] = self.positions["stats"].get("wins", 0) + 1
-                        self.positions["stats"]["total_pnl"] = self.positions["stats"].get("total_pnl", 0) + pnl
+                        stats = self.positions.setdefault("stats", {})
+                        stats["wins"] = stats.get("wins", 0) + 1
+                        stats["total_pnl"] = stats.get("total_pnl", 0) + pnl
+                        # Credit proceeds back to balance
+                        stats["balance"] = stats.get("balance", ALGO_STARTING_BALANCE) + proceeds
+                        open_staked = sum(p.get("amount", 0) for p in self.positions.get("open", []))
+                        stats.setdefault("balance_history", []).append({
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                            "balance": stats["balance"],
+                            "pnl": stats["total_pnl"],
+                            "equity": stats["balance"] + open_staked,
+                            "event": "momentum_take_profit",
+                            "detail": f"TP {title[:30]}",
+                        })
                         save_positions(self.positions)
                         stopped += 1
-                        print(f"       SOLD @ {fill_price*100:.1f}¢ | PnL: ${pnl:.2f}", flush=True)
+                        print(f"       SOLD @ {fill_price*100:.1f}¢ | PnL: ${pnl:.2f} | Balance: ${stats['balance']:.2f}", flush=True)
                     else:
                         print(f"       SELL FAILED", flush=True)
                 continue  # don't also check stop loss on this position
