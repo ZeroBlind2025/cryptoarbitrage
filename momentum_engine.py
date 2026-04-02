@@ -1868,6 +1868,20 @@ class MomentumEngine:
             if TAKE_PROFIT_PRICE > 0 and live_price >= TAKE_PROFIT_PRICE:
                 title = position.get("market", "?")[:40]
                 shares = position.get("potential_payout", 0)
+
+                # Query actual on-chain balance to avoid selling more than we hold
+                try:
+                    from copy_trader import check_token_balance
+                    actual_balance = check_token_balance(token_id)
+                    if actual_balance is not None and actual_balance < shares:
+                        if actual_balance <= 0:
+                            print(f"[MOMENTUM] TP skip {title}: 0 balance on-chain", flush=True)
+                            continue
+                        print(f"[MOMENTUM] TP balance adjust: {shares:.2f} → {actual_balance:.2f} (on-chain)", flush=True)
+                        shares = actual_balance
+                except Exception:
+                    pass  # use tracked shares if balance check fails
+
                 print(f"\n[MOMENTUM] TAKE PROFIT: {title}")
                 print(f"       Price: {live_price*100:.1f}¢ >= {TAKE_PROFIT_PRICE*100:.0f}¢ threshold")
                 print(f"       Entry: {entry_price*100:.1f}¢ | Shares: {shares:.2f}", flush=True)
@@ -1890,10 +1904,9 @@ class MomentumEngine:
                     stopped += 1
                     print(f"       PnL: ${pnl:.2f}", flush=True)
                 elif token_id and self.client:
-                    from copy_trader import place_sell
-                    buffer = PRICE_BUFFER_BPS / 10000
-                    min_price = max(live_price * (1 - buffer), 0.01)
-                    fill = place_sell(self.client, token_id, shares, min_price=min_price)
+                    from copy_trader import place_sell_gtc
+                    # GTC limit sell at take-profit price — rests on book if no immediate match
+                    fill = place_sell_gtc(self.client, token_id, shares, TAKE_PROFIT_PRICE)
                     if fill.get("success"):
                         fill_price = fill.get("fill_price", live_price)
                         proceeds = shares * fill_price

@@ -1869,6 +1869,31 @@ def check_usdc_balance() -> Optional[float]:
     except Exception:
         return None
 
+
+def check_token_balance(token_id: str) -> Optional[float]:
+    """Check on-chain ERC1155 balance for a specific outcome token.
+
+    Returns number of shares (float, 6 decimals) or None on failure.
+    """
+    if not HAS_WEB3 or not PRIVATE_KEY:
+        return None
+    try:
+        w3 = _get_web3()
+        if not w3 or not w3.is_connected():
+            return None
+        use_proxy = SIGNATURE_TYPE >= 1 and FUNDER_ADDRESS
+        wallet = w3.to_checksum_address(FUNDER_ADDRESS) if use_proxy else w3.eth.account.from_key(PRIVATE_KEY).address
+        ctf = w3.eth.contract(
+            address=w3.to_checksum_address(CTF_CONTRACT_ADDRESS),
+            abi=json.loads(CTF_ABI),
+        )
+        tid_int = int(token_id)
+        bal = ctf.functions.balanceOf(wallet, tid_int).call()
+        return bal / 1e6
+    except Exception:
+        return None
+
+
 def place_bet(client: "ClobClient", token_id: str, amount: float, max_price: float = 0) -> dict:
     """Place a FOK market buy order. Returns fill details or empty dict on failure.
 
@@ -1976,6 +2001,53 @@ def place_sell(client: "ClobClient", token_id: str, size: float, min_price: floa
         return fill_info
     except Exception as e:
         print(f"[ALGO] Sell order error: {e}")
+        return {}
+
+
+def place_sell_gtc(client: "ClobClient", token_id: str, size: float, price: float) -> dict:
+    """Place a GTC limit sell order (resting on book until filled).
+
+    Used for take-profit sells where FAK fails due to thin books at 98¢+.
+    """
+    try:
+        import math
+        price_rounded = round(price, 2)
+        sell_size = math.floor(size * 100) / 100
+
+        print(f"[ALGO] GTC sell: {sell_size:.2f} shares @ {price_rounded*100:.0f}¢")
+        order_args = OrderArgs(
+            token_id=token_id,
+            price=price_rounded,
+            size=sell_size,
+            side=SELL,
+        )
+        signed_order = client.create_order(
+            order_args,
+            options=PartialCreateOrderOptions(tick_size="0.01"),
+        )
+        result = client.post_order(signed_order, OrderType.GTC)
+
+        if isinstance(result, dict):
+            order_id = result.get("orderID") or result.get("id", "")
+            status = result.get("status", "").lower()
+            if status in ("rejected", "failed"):
+                print(f"[ALGO] GTC sell rejected: {result}")
+                return {}
+            # GTC may fill immediately or rest — check matched amount
+            shares_filled = float(result.get("size") or result.get("filledSize") or 0)
+            usdc_filled = float(result.get("matchedAmount") or result.get("amount") or 0)
+            fill_info = {"success": True, "order_id": order_id}
+            if shares_filled > 0 and usdc_filled > 0:
+                fill_info["fill_price"] = usdc_filled / shares_filled
+                fill_info["shares"] = shares_filled
+                fill_info["usdc"] = usdc_filled
+            else:
+                fill_info["fill_price"] = price_rounded  # resting, assume limit price
+            print(f"[ALGO] GTC sell placed: id={order_id} status={status} filled={shares_filled}")
+            return fill_info
+        return {}
+    except Exception as e:
+        print(f"[ALGO] GTC sell error: {e}")
         return {}
 
 
