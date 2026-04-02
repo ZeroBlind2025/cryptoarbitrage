@@ -120,6 +120,7 @@ MAX_ENTRIES_PER_MARKET = int(os.getenv("MOMENTUM_MAX_ENTRIES_PER_MARKET", "2"))
 FOLLOW_UP_COOLDOWN = int(os.getenv("MOMENTUM_FOLLOW_UP_COOLDOWN", "30"))
 FOLLOW_UP_COOLDOWN_15M = int(os.getenv("MOMENTUM_15m_COOLDOWN", "240"))  # 4 minutes for 15m markets
 REENTRY_MIN_PRICE = float(os.getenv("MOMENTUM_REENTRY_MIN_PRICE", "0.899"))  # only re-enter above 89.9¢
+UPGUARD_ROLLING = os.getenv("MOMENTUM_UPGUARD_ROLLING", "true").lower() == "true"  # compare vs last entry (True) or initial entry (False)
 
 # Minimum minutes before market close to allow entry.
 # Prevents placing trades after (or right at) the close time.
@@ -858,7 +859,8 @@ class MomentumEngine:
         # Track entered markets: (condition_id, token_id) → last_buy_price
         # KEY: uses token_id (stable identifier) not outcome_index (array position
         # that can flip between API calls).
-        self.entered_markets: dict = {}
+        self.entered_markets: dict = {}  # market_key → last_buy_price (updated on every fill)
+        self.initial_entry_price: dict = {}  # market_key → first entry price (never updated)
         self.market_entry_count: dict = {}
         self.hedged_markets: set = set()  # condition_ids already arb-hedged
         self.last_trade_time: dict = {}  # (condition_id, token_id) → epoch timestamp
@@ -937,7 +939,8 @@ class MomentumEngine:
                 print(f"    {', '.join(other)}: global range ({self.min_entry_price*100:.0f}-{self.max_entry_price*100:.0f}¢)")
         print(f"  Markets: {', '.join(INTERVALS) if INTERVALS else 'NONE (all disabled!)'}")
         print(f"  Hedge: {'ENABLED' if MOMENTUM_HEDGE_ENABLE else 'DISABLED'} | gap: {MOMENTUM_HEDGE_PCT:.0f}¢")
-        print(f"  Re-entry: upward only, max {self.max_entries_per_market} entries/market")
+        _guard_type = "rolling (vs last entry)" if UPGUARD_ROLLING else "initial (vs first entry)"
+        print(f"  Re-entry: upward only ({_guard_type}), max {self.max_entries_per_market} entries/market")
         _delay_status = "DISABLED" if getattr(self, '_dry_run_no_delays', False) else "ENABLED"
         _delay_info = ", ".join(f"{k}={int(v*60)}s" for k, v in MARKET_ENTRY_DELAY.items()) if _delay_status == "ENABLED" else ""
         print(f"  Delays/cooldowns: {_delay_status}" + (f" ({_delay_info})" if _delay_info else ""))
@@ -1541,8 +1544,13 @@ class MomentumEngine:
                 # it's not a re-entry on primary — it's a hedge on the opposite side.
                 is_first_entry = market_key not in self.entered_markets
                 if market_key in self.entered_markets:
-                    last_buy_price = self.entered_markets[market_key]
-                    price_rise = round(price - last_buy_price, 4)
+                    # Rolling: compare vs last entry. Non-rolling: compare vs initial entry.
+                    if UPGUARD_ROLLING:
+                        guard_price = self.entered_markets[market_key]
+                    else:
+                        guard_price = self.initial_entry_price.get(market_key, self.entered_markets[market_key])
+                    last_buy_price = self.entered_markets[market_key]  # still used for hedge calc
+                    price_rise = round(price - guard_price, 4)
 
                     if MOMENTUM_HEDGE_ENABLE:
                         # Hedge mode: require minimum gap before triggering hedge
@@ -1752,7 +1760,9 @@ class MomentumEngine:
                 })
 
                 if trade_record["status"] in ("filled", "dry_run"):
-                    # Update last buy price (NOT first — this is the key difference)
+                    # Track initial entry (never changes) and last entry (rolling)
+                    if market_key not in self.initial_entry_price:
+                        self.initial_entry_price[market_key] = price
                     self.entered_markets[market_key] = price
                     self.market_entry_count[market_key] = self.market_entry_count.get(market_key, 0) + 1
                     self.last_trade_time[market_key] = time.time()
