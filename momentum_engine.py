@@ -121,6 +121,7 @@ FOLLOW_UP_COOLDOWN = int(os.getenv("MOMENTUM_FOLLOW_UP_COOLDOWN", "30"))
 FOLLOW_UP_COOLDOWN_15M = int(os.getenv("MOMENTUM_15m_COOLDOWN", "240"))  # 4 minutes for 15m markets
 REENTRY_MIN_PRICE = float(os.getenv("MOMENTUM_REENTRY_MIN_PRICE", "0.899"))  # only re-enter above 89.9¢
 UPGUARD_ROLLING = os.getenv("MOMENTUM_UPGUARD_ROLLING", "true").lower() == "true"  # compare vs last entry (True) or initial entry (False)
+TAKE_PROFIT_PRICE = float(os.getenv("MOMENTUM_TAKE_PROFIT", "0.98"))  # sell when bid >= this price (0 = disabled)
 
 # Minimum minutes before market close to allow entry.
 # Prevents placing trades after (or right at) the close time.
@@ -948,6 +949,7 @@ class MomentumEngine:
         _no_trade_str = ", ".join(f"{h}:00" for h in sorted(NO_TRADE_HOURS)) if NO_TRADE_HOURS else "NONE"
         print(f"  No-trade hours (ET): {_no_trade_str}")
         print(f"  DOWN bets: {'ENABLED' if DOWN_BETS_ENABLED else 'DISABLED'}")
+        print(f"  Take profit: {TAKE_PROFIT_PRICE*100:.0f}¢" if TAKE_PROFIT_PRICE > 0 else "  Take profit: DISABLED")
         print(f"  Probe sizing: DISABLED (using dashboard lot sizes)")
         print(f"  Lot sizes: {lot_sizes} (default: ${self.bet_amount})")
         print(f"  Balance: ${balance:.2f}")
@@ -1861,6 +1863,53 @@ class MomentumEngine:
             if live_price > peak_price:
                 peak_price = live_price
                 position["peak_price"] = peak_price
+
+            # --- TAKE PROFIT: sell if price >= threshold (e.g. 98¢) ---
+            if TAKE_PROFIT_PRICE > 0 and live_price >= TAKE_PROFIT_PRICE:
+                title = position.get("market", "?")[:40]
+                shares = position.get("potential_payout", 0)
+                print(f"\n[MOMENTUM] TAKE PROFIT: {title}")
+                print(f"       Price: {live_price*100:.1f}¢ >= {TAKE_PROFIT_PRICE*100:.0f}¢ threshold")
+                print(f"       Entry: {entry_price*100:.1f}¢ | Shares: {shares:.2f}", flush=True)
+
+                if self.dry_run:
+                    print(f"       DRY RUN — would sell {shares:.2f} shares @ {live_price*100:.1f}¢", flush=True)
+                    proceeds = shares * live_price
+                    pnl = proceeds - position.get("amount", 0)
+                    position["result"] = "TAKE_PROFIT"
+                    position["sell_price"] = live_price
+                    position["pnl"] = pnl
+                    self.positions.get("open", []).remove(position)
+                    self.positions.setdefault("resolved", []).append(position)
+                    self.positions["stats"] = self.positions.get("stats", {})
+                    self.positions["stats"]["wins"] = self.positions["stats"].get("wins", 0) + 1
+                    self.positions["stats"]["total_pnl"] = self.positions["stats"].get("total_pnl", 0) + pnl
+                    save_positions(self.positions)
+                    stopped += 1
+                    print(f"       PnL: ${pnl:.2f}", flush=True)
+                elif token_id and self.client:
+                    from copy_trader import place_sell
+                    buffer = PRICE_BUFFER_BPS / 10000
+                    min_price = max(live_price * (1 - buffer), 0.01)
+                    fill = place_sell(self.client, token_id, shares, min_price=min_price)
+                    if fill.get("success"):
+                        fill_price = fill.get("fill_price", live_price)
+                        proceeds = shares * fill_price
+                        pnl = proceeds - position.get("amount", 0)
+                        position["result"] = "TAKE_PROFIT"
+                        position["sell_price"] = fill_price
+                        position["pnl"] = pnl
+                        self.positions.get("open", []).remove(position)
+                        self.positions.setdefault("resolved", []).append(position)
+                        self.positions["stats"] = self.positions.get("stats", {})
+                        self.positions["stats"]["wins"] = self.positions["stats"].get("wins", 0) + 1
+                        self.positions["stats"]["total_pnl"] = self.positions["stats"].get("total_pnl", 0) + pnl
+                        save_positions(self.positions)
+                        stopped += 1
+                        print(f"       SOLD @ {fill_price*100:.1f}¢ | PnL: ${pnl:.2f}", flush=True)
+                    else:
+                        print(f"       SELL FAILED", flush=True)
+                continue  # don't also check stop loss on this position
 
             stop_price = peak_price * threshold
             if live_price >= stop_price:
