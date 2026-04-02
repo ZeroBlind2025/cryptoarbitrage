@@ -122,6 +122,7 @@ FOLLOW_UP_COOLDOWN_15M = int(os.getenv("MOMENTUM_15m_COOLDOWN", "240"))  # 4 min
 REENTRY_MIN_PRICE = float(os.getenv("MOMENTUM_REENTRY_MIN_PRICE", "0.899"))  # only re-enter above 89.9¢
 UPGUARD_ROLLING = os.getenv("MOMENTUM_UPGUARD_ROLLING", "true").lower() == "true"  # compare vs last entry (True) or initial entry (False)
 TAKE_PROFIT_PRICE = float(os.getenv("MOMENTUM_TAKE_PROFIT", "0.98"))  # sell when bid >= this price (0 = disabled)
+OPPOSITE_SIDE_BLOCK = os.getenv("MOMENTUM_OPPOSITE_SIDE_BLOCK", "false").lower() == "true"  # block buying both sides
 
 # Minimum minutes before market close to allow entry.
 # Prevents placing trades after (or right at) the close time.
@@ -1533,13 +1534,13 @@ class MomentumEngine:
                 # Key by (condition_id, token_id) — stable across API ordering changes
                 market_key = (condition_id, token_id)
 
-                # --- GUARD: No opposite side ---
-                # Check if we already hold the OTHER token on this condition_id
-                opposite_key = (condition_id, other_token_id)
-                if opposite_key in self.entered_markets:
-                    self.trades_skipped += 1
-                    print(f"  REJECT opposite_held: already hold other side of {_mkt_label}", flush=True)
-                    continue
+                # --- GUARD: No opposite side (optional) ---
+                if OPPOSITE_SIDE_BLOCK:
+                    opposite_key = (condition_id, other_token_id)
+                    if opposite_key in self.entered_markets:
+                        self.trades_skipped += 1
+                        print(f"  REJECT opposite_held: already hold other side of {_mkt_label}", flush=True)
+                        continue
 
                 # --- HEDGE TRIGGER: Price risen 5¢+ above probe → hedge opposite side ---
                 # This runs BEFORE the max-entries / cooldown guards because
