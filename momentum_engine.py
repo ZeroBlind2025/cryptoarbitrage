@@ -1442,8 +1442,8 @@ class MomentumEngine:
 
         entered = 0
 
-        # --- GUARD: No-trade hours (ET) ---
-        if NO_TRADE_HOURS:
+        # --- GUARD: No-trade hours (ET) — skip in martingale mode ---
+        if NO_TRADE_HOURS and not MARTINGALE_ENABLED:
             _utc_now = datetime.now(timezone.utc)
             _et_hour = (_utc_now.hour - 4) % 24  # UTC → ET (EDT)
             if _et_hour in NO_TRADE_HOURS:
