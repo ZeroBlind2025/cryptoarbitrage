@@ -1476,8 +1476,8 @@ class MomentumEngine:
                 end_date = market.get("end_date")
                 if end_date:
                     mins_left = (end_date - datetime.now(timezone.utc)).total_seconds() / 60
-                    if mins_left < 1 or mins_left > 5:
-                        continue  # only enter fresh markets (1-5 mins left)
+                    if mins_left < 2 or mins_left > 5:
+                        continue  # only enter markets with 2-5 mins remaining
 
                 # Don't enter if this coin has an unresolved martingale position
                 _has_open = any(
