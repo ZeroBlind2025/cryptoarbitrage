@@ -137,6 +137,7 @@ MARTINGALE_ENABLED = os.getenv("MOMENTUM_MARTINGALE", "false").lower() == "true"
 MARTINGALE_BASE_LOT = float(os.getenv("MOMENTUM_MARTINGALE_BASE_LOT", "2.0"))
 MARTINGALE_MAX_LOT = float(os.getenv("MOMENTUM_MARTINGALE_MAX_LOT", "256.0"))  # safety cap
 MARTINGALE_SIDE = os.getenv("MOMENTUM_MARTINGALE_SIDE", "Up")  # which side to bet
+MARTINGALE_MAX_ENTRY = float(os.getenv("MOMENTUM_MARTINGALE_MAX_ENTRY", "0.50"))  # max entry price after a loss (50¢ = even odds)
 
 # Minimum minutes before market close to allow entry.
 # Prevents placing trades after (or right at) the close time.
@@ -953,7 +954,7 @@ class MomentumEngine:
             print(f"  Base lot: ${MARTINGALE_BASE_LOT:.2f} | Max lot: ${MARTINGALE_MAX_LOT:.2f}")
             print(f"  Side: {MARTINGALE_SIDE} | Markets: 5m only")
             print(f"  No SL, no TP — wait for resolution")
-            print(f"  On loss: double lot, guard price <= loss entry")
+            print(f"  On loss: double lot, guard price ≤{MARTINGALE_MAX_ENTRY*100:.0f}¢")
             print(f"  On win: reset to ${MARTINGALE_BASE_LOT:.2f}")
         else:
             print("  MOMENTUM ENGINE")
@@ -2551,13 +2552,14 @@ class MomentumEngine:
                         mg["streak"] = 0
                         print(f"[MARTINGALE] {_mg_coin.upper()} WIN — reset lot ${old_lot:.2f} → ${MARTINGALE_BASE_LOT:.2f}", flush=True)
                     elif won is False:
-                        # LOSS: double the lot, set price guard to loss entry price
+                        # LOSS: double the lot, guard at MARTINGALE_MAX_ENTRY (e.g. 50¢)
+                        # At ≤50¢ a win pays ≥2x, enough to recoup the previous loss
                         old_lot = mg["lot"]
                         mg["lot"] = min(old_lot * 2, MARTINGALE_MAX_LOT)
-                        mg["max_price"] = entry_price  # next entry must be <= this price
+                        mg["max_price"] = MARTINGALE_MAX_ENTRY
                         mg["streak"] += 1
                         print(f"[MARTINGALE] {_mg_coin.upper()} LOSS — double lot ${old_lot:.2f} → ${mg['lot']:.2f} "
-                              f"(streak={mg['streak']}, max_price={mg['max_price']*100:.1f}¢)", flush=True)
+                              f"(streak={mg['streak']}, guard ≤{MARTINGALE_MAX_ENTRY*100:.0f}¢)", flush=True)
 
             if self.on_resolution:
                 try:
