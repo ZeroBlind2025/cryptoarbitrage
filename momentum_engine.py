@@ -1404,7 +1404,7 @@ class MomentumEngine:
                     status = order_info.get("status", "").lower()
                     filled = float(order_info.get("matchedAmount") or order_info.get("filledSize") or 0)
 
-                    if filled > 0 and filled >= pending["amount"] * 0.5:
+                    if status == "matched" or (filled > 0 and filled >= pending["amount"] * 0.5):
                         # Filled — promote to position
                         print(f"[MARTINGALE] Order {oid[:12]} FILLED: ${filled:.2f}", flush=True)
                         self._promote_martingale_fill(
@@ -1674,12 +1674,12 @@ class MomentumEngine:
                             if status not in ("rejected", "failed"):
                                 oid = result.get("orderID") or result.get("id", "")
                                 matched = float(result.get("matchedAmount") or 0)
-                                print(f"           Order placed: id={oid[:16]} status={status}", flush=True)
+                                print(f"           Order placed: id={oid[:16]} status={status} matched=${matched:.2f}", flush=True)
                                 self._martingale_entered.add(condition_id)
 
-                                if matched > 0 and matched >= trade_amount * 0.9:
-                                    # Immediately filled — promote to position
-                                    print(f"           FILLED immediately: ${matched:.2f}", flush=True)
+                                if status == "matched" or (matched > 0 and matched >= trade_amount * 0.5):
+                                    # Filled — promote to position
+                                    print(f"           FILLED — creating position", flush=True)
                                     self._promote_martingale_fill(
                                         condition_id, token_id, side_idx, outcome,
                                         title, slug, coin, limit_price, trade_amount, mg["streak"],
