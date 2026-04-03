@@ -2331,59 +2331,13 @@ class MomentumEngine:
                 _resolution_cache[cache_key] = result
 
             if not result or not result.get("resolved"):
-                # Fallback: use live WebSocket price for resolution
-                live_price = self.get_live_price(token_id) if token_id else None
-                _end_date = position.get("end_date")
-                _secs_past_close = 0
-                if _end_date:
-                    try:
-                        end_dt = datetime.fromisoformat(_end_date) if isinstance(_end_date, str) else _end_date
-                        _secs_past_close = (datetime.now(timezone.utc) - end_dt).total_seconds()
-                    except Exception:
-                        pass
-
-                # Martingale fast resolution: if market closed and price is extreme, resolve now
-                if MARTINGALE_ENABLED and _secs_past_close > 5 and live_price is not None:
-                    if live_price >= 0.90 or live_price <= 0.10:
-                        our_token_won = live_price >= 0.90
-                        print(f"[MARTINGALE] Fast resolve: {position['market'][:30]} "
-                              f"| price={live_price*100:.1f}¢ → {'WIN' if our_token_won else 'LOSS'} "
-                              f"({_secs_past_close:.0f}s after close)", flush=True)
-                        result = {
-                            "resolved": True,
-                            "our_token_won": our_token_won,
-                            "winning_outcome": our_outcome if our_token_won else None,
-                        }
-                    elif _secs_past_close > 30:
-                        # After 30s with no extreme price, try a broader threshold
-                        our_token_won = live_price >= 0.50
-                        print(f"[MARTINGALE] Forced resolve ({_secs_past_close:.0f}s): {position['market'][:30]} "
-                              f"| price={live_price*100:.1f}¢ → {'WIN' if our_token_won else 'LOSS'}", flush=True)
-                        result = {
-                            "resolved": True,
-                            "our_token_won": our_token_won,
-                            "winning_outcome": our_outcome if our_token_won else None,
-                        }
-
-                # Normal fallback: final 10 seconds price-based
-                if (not result or not result.get("resolved")):
-                    _in_final_seconds = _secs_past_close < 0 and _secs_past_close > -10
-                    if _in_final_seconds and live_price is not None and (live_price >= 0.98 or live_price <= 0.02):
-                        our_token_won = live_price >= 0.98
-                        print(f"[MOMENTUM] Price-based resolution (final 10s): {position['market'][:30]} "
-                              f"| price={live_price:.4f} → {'WIN' if our_token_won else 'LOSS'}", flush=True)
-                        result = {
-                            "resolved": True,
-                            "our_token_won": our_token_won,
-                            "winning_outcome": our_outcome if our_token_won else None,
-                        }
-                else:
-                    # Track unresolved attempts with timestamps for smarter retry
-                    attempts = position.get("_resolve_attempts", 0) + 1
-                    position["_resolve_attempts"] = attempts
-                    if attempts == 1:
-                        position["_first_resolve_check"] = time.time()
-                    continue
+                # API hasn't returned resolution yet — wait and retry next cycle.
+                # NO price-based fallbacks — only trust the CLOB API resolution.
+                attempts = position.get("_resolve_attempts", 0) + 1
+                position["_resolve_attempts"] = attempts
+                if attempts == 1:
+                    position["_first_resolve_check"] = time.time()
+                continue
 
             entry_price = position.get("entry_price", 0)
             amount = position.get("amount", 0)
@@ -2422,13 +2376,8 @@ class MomentumEngine:
                           f"(ours={our_outcome}, winner={winning_outcome}). Correcting to WIN.", flush=True)
                     won = True
 
-            # Priority 4: Live price fallback when API says resolved but no winner info
-            # This catches the case where Gamma returns resolved=True with no outcome data
-            if won is None and token_id:
-                live_price = self.get_live_price(token_id)
-                if live_price is not None and (live_price >= 0.95 or live_price <= 0.05):
-                    won = live_price >= 0.95
-                    print(f"[MOMENTUM] Resolved-but-no-winner fallback: price={live_price:.4f} → {'WIN' if won else 'LOSS'}", flush=True)
+            # Priority 4 REMOVED — no price-based resolution fallback.
+            # Only trust CLOB API winner data.
 
             if won is True:
                 if entry_price > 0:
