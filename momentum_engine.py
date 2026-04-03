@@ -2332,27 +2332,51 @@ class MomentumEngine:
 
             if not result or not result.get("resolved"):
                 # Fallback: use live WebSocket price for resolution
-                # Only trigger in the final 10 seconds of a market to avoid
-                # false wins/losses from mid-window price spikes to 99¢.
                 live_price = self.get_live_price(token_id) if token_id else None
-                _in_final_seconds = False
-                end_date_str = position.get("end_date")
-                if end_date_str:
+                _end_date = position.get("end_date")
+                _secs_past_close = 0
+                if _end_date:
                     try:
-                        end_dt = datetime.fromisoformat(end_date_str) if isinstance(end_date_str, str) else end_date_str
-                        secs_left = (end_dt - datetime.now(timezone.utc)).total_seconds()
-                        _in_final_seconds = secs_left <= 10
+                        end_dt = datetime.fromisoformat(_end_date) if isinstance(_end_date, str) else _end_date
+                        _secs_past_close = (datetime.now(timezone.utc) - end_dt).total_seconds()
                     except Exception:
                         pass
-                if _in_final_seconds and live_price is not None and (live_price >= 0.98 or live_price <= 0.02):
-                    our_token_won = live_price >= 0.98
-                    print(f"[MOMENTUM] Price-based resolution (final 10s): {position['market'][:30]} "
-                          f"| price={live_price:.4f} → {'WIN' if our_token_won else 'LOSS'}", flush=True)
-                    result = {
-                        "resolved": True,
-                        "our_token_won": our_token_won,
-                        "winning_outcome": our_outcome if our_token_won else None,
-                    }
+
+                # Martingale fast resolution: if market closed and price is extreme, resolve now
+                if MARTINGALE_ENABLED and _secs_past_close > 5 and live_price is not None:
+                    if live_price >= 0.90 or live_price <= 0.10:
+                        our_token_won = live_price >= 0.90
+                        print(f"[MARTINGALE] Fast resolve: {position['market'][:30]} "
+                              f"| price={live_price*100:.1f}¢ → {'WIN' if our_token_won else 'LOSS'} "
+                              f"({_secs_past_close:.0f}s after close)", flush=True)
+                        result = {
+                            "resolved": True,
+                            "our_token_won": our_token_won,
+                            "winning_outcome": our_outcome if our_token_won else None,
+                        }
+                    elif _secs_past_close > 30:
+                        # After 30s with no extreme price, try a broader threshold
+                        our_token_won = live_price >= 0.50
+                        print(f"[MARTINGALE] Forced resolve ({_secs_past_close:.0f}s): {position['market'][:30]} "
+                              f"| price={live_price*100:.1f}¢ → {'WIN' if our_token_won else 'LOSS'}", flush=True)
+                        result = {
+                            "resolved": True,
+                            "our_token_won": our_token_won,
+                            "winning_outcome": our_outcome if our_token_won else None,
+                        }
+
+                # Normal fallback: final 10 seconds price-based
+                if (not result or not result.get("resolved")):
+                    _in_final_seconds = _secs_past_close < 0 and _secs_past_close > -10
+                    if _in_final_seconds and live_price is not None and (live_price >= 0.98 or live_price <= 0.02):
+                        our_token_won = live_price >= 0.98
+                        print(f"[MOMENTUM] Price-based resolution (final 10s): {position['market'][:30]} "
+                              f"| price={live_price:.4f} → {'WIN' if our_token_won else 'LOSS'}", flush=True)
+                        result = {
+                            "resolved": True,
+                            "our_token_won": our_token_won,
+                            "winning_outcome": our_outcome if our_token_won else None,
+                        }
                 else:
                     # Track unresolved attempts with timestamps for smarter retry
                     attempts = position.get("_resolve_attempts", 0) + 1
