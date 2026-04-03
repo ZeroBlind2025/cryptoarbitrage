@@ -912,7 +912,7 @@ class MomentumEngine:
 
         # Resolution
         self.last_resolution_check = 0
-        self.resolution_check_interval = 60  # Check every 60 seconds
+        self.resolution_check_interval = 5 if MARTINGALE_ENABLED else 60
 
         # WebSocket for live prices
         self.ws: Optional["CLOBWebSocket"] = None
@@ -1477,6 +1477,15 @@ class MomentumEngine:
                     mins_left = (end_date - datetime.now(timezone.utc)).total_seconds() / 60
                     if mins_left < 1 or mins_left > 5:
                         continue  # only enter fresh markets (1-5 mins left)
+
+                # Don't enter if this coin has an unresolved martingale position
+                _has_open = any(
+                    p.get("source") == "momentum"
+                    and detect_coin(p.get("slug", ""), p.get("market", "")) == coin
+                    for p in self.positions.get("open", [])
+                )
+                if _has_open:
+                    continue
 
                 # Get martingale state for this coin
                 if coin not in self.martingale:
