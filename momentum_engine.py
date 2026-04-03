@@ -885,8 +885,11 @@ class MomentumEngine:
 
         # Martingale state per coin: {"btc": {"lot": 2.0, "max_price": 1.0, "streak": 0}}
         self.martingale: dict = {}
-        # Track which condition_ids already have a martingale entry (one per market)
+        # Track which condition_ids already have a martingale order (one per market)
         self._martingale_entered: set = set()
+        # Pending GTC orders waiting for fill confirmation
+        # {order_id: {condition_id, token_id, coin, outcome, price, amount, title, slug, streak, ...}}
+        self._martingale_pending: dict = {}
 
         # Position tracking — share the same dict as copy trader when available
         # so both engines' trades appear in the combined P&L / balance chart
@@ -1319,12 +1322,133 @@ class MomentumEngine:
                 pass
             self.ws = None
 
+    def _promote_martingale_fill(self, condition_id, token_id, side_idx, outcome,
+                                   title, slug, coin, price, amount, streak):
+        """Convert a confirmed fill into an open position."""
+        position = {
+            "id": f"mg_{condition_id[:12]}_{int(time.time())}",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "condition_id": condition_id,
+            "token_id": token_id,
+            "outcome_index": side_idx,
+            "outcome": outcome,
+            "market": title,
+            "slug": slug,
+            "entry_price": price,
+            "amount": amount,
+            "potential_payout": amount / price if price > 0 else 0,
+            "dry_run": self.dry_run,
+            "source": "momentum",
+            "interval": "5m",
+            "martingale_streak": streak,
+        }
+        self.positions.setdefault("open", []).append(position)
+        self.entered_markets[(condition_id, token_id)] = price
+        if (condition_id, token_id) not in self.initial_entry_price:
+            self.initial_entry_price[(condition_id, token_id)] = price
+        self.market_entry_count[(condition_id, token_id)] = 1
+
+        try:
+            stats = self.positions.setdefault("stats", {})
+            stats["balance"] = stats.get("balance", ALGO_STARTING_BALANCE) - amount
+            open_staked = sum(p.get("amount", 0) for p in self.positions.get("open", []))
+            stats.setdefault("balance_history", []).append({
+                "timestamp": position["timestamp"],
+                "balance": stats["balance"],
+                "pnl": stats.get("total_pnl", 0.0),
+                "equity": stats["balance"] + open_staked,
+                "event": "momentum_trade",
+                "detail": f"MG {coin.upper()} {outcome} @{price*100:.0f}¢ streak={streak}",
+            })
+        except Exception:
+            pass
+        save_positions(self.positions)
+        self.trades_entered += 1
+
+        trade_record = {
+            "id": position["id"],
+            "timestamp": position["timestamp"],
+            "market": title,
+            "slug": slug,
+            "outcome": outcome,
+            "side": "BUY",
+            "amount": amount,
+            "coin": coin,
+            "price": price,
+            "interval": "5m",
+            "source": "momentum",
+            "status": "dry_run" if self.dry_run else "filled",
+        }
+        if self.on_trade:
+            try:
+                self.on_trade(trade_record)
+            except Exception:
+                pass
+        print(f"[MARTINGALE] Position created: {coin.upper()} {outcome} ${amount:.2f} @{price*100:.1f}¢", flush=True)
+
+    def _check_martingale_fills(self):
+        """Check pending GTC orders for fills. Promote filled orders to positions,
+        cancel and discard unfilled orders from expired markets."""
+        if not self._martingale_pending or not self.client:
+            return
+
+        to_remove = []
+        for oid, pending in self._martingale_pending.items():
+            # Check if market has expired (>5 min since order placed = market likely closed)
+            elapsed = time.time() - pending["placed_at"]
+
+            # Query order status from CLOB
+            try:
+                order_info = self.client.get_order(oid)
+                if isinstance(order_info, dict):
+                    status = order_info.get("status", "").lower()
+                    filled = float(order_info.get("matchedAmount") or order_info.get("filledSize") or 0)
+
+                    if filled > 0 and filled >= pending["amount"] * 0.5:
+                        # Filled — promote to position
+                        print(f"[MARTINGALE] Order {oid[:12]} FILLED: ${filled:.2f}", flush=True)
+                        self._promote_martingale_fill(
+                            pending["condition_id"], pending["token_id"],
+                            pending["side_idx"], pending["outcome"],
+                            pending["title"], pending["slug"], pending["coin"],
+                            pending["price"], pending["amount"], pending["streak"],
+                        )
+                        to_remove.append(oid)
+                        continue
+
+                    if status in ("cancelled", "expired", "dead"):
+                        print(f"[MARTINGALE] Order {oid[:12]} {status} — not filled, discarding", flush=True)
+                        self._martingale_entered.discard(pending["condition_id"])
+                        to_remove.append(oid)
+                        continue
+            except Exception as e:
+                if elapsed > 30:
+                    # Can't check and it's old — try to cancel
+                    print(f"[MARTINGALE] Order {oid[:12]} check failed after {elapsed:.0f}s: {e}", flush=True)
+
+            # If market has likely closed (>6 min), cancel and discard
+            if elapsed > 360:
+                print(f"[MARTINGALE] Order {oid[:12]} expired (>{elapsed:.0f}s) — cancelling", flush=True)
+                try:
+                    self.client.cancel(oid)
+                except Exception:
+                    pass
+                self._martingale_entered.discard(pending["condition_id"])
+                to_remove.append(oid)
+
+        for oid in to_remove:
+            del self._martingale_pending[oid]
+
     def scan_and_trade(self) -> int:
         """Main loop iteration: discover markets, check prices, enter trades.
 
         Returns number of trades entered this cycle.
         """
         self.scans_completed += 1
+
+        # Check pending martingale GTC orders for fills
+        if MARTINGALE_ENABLED and self._martingale_pending:
+            self._check_martingale_fills()
 
         # --- WS health check: force reconnect if stale ---
         if self.ws and self.ws.is_stale():
@@ -1517,11 +1641,15 @@ class MomentumEngine:
                 print(f"           Market: {title}", flush=True)
                 print(f"           Streak: {mg['streak']} | Lot: ${trade_amount:.2f}", flush=True)
 
-                order_ok = False
-
                 if self.dry_run:
-                    print(f"           DRY RUN — would place GTC @ {limit_price*100:.1f}¢", flush=True)
-                    order_ok = True
+                    # Dry run: assume filled immediately
+                    print(f"           DRY RUN — GTC @ {limit_price*100:.1f}¢ (assumed filled)", flush=True)
+                    self._martingale_entered.add(condition_id)
+                    self._promote_martingale_fill(
+                        condition_id, token_id, side_idx, outcome,
+                        title, slug, coin, limit_price, trade_amount, mg["streak"],
+                    )
+                    entered += 1
                 else:
                     try:
                         from py_clob_client.clob_types import OrderArgs, OrderType, PartialCreateOrderOptions
@@ -1544,83 +1672,39 @@ class MomentumEngine:
                         if isinstance(result, dict):
                             status = result.get("status", "").lower()
                             if status not in ("rejected", "failed"):
-                                order_ok = True
-                                oid = result.get("orderID", "?")[:12]
+                                oid = result.get("orderID") or result.get("id", "")
                                 matched = float(result.get("matchedAmount") or 0)
-                                print(f"           Order placed: id={oid} status={status} matched=${matched:.2f}", flush=True)
+                                print(f"           Order placed: id={oid[:16]} status={status}", flush=True)
+                                self._martingale_entered.add(condition_id)
+
+                                if matched > 0 and matched >= trade_amount * 0.9:
+                                    # Immediately filled — promote to position
+                                    print(f"           FILLED immediately: ${matched:.2f}", flush=True)
+                                    self._promote_martingale_fill(
+                                        condition_id, token_id, side_idx, outcome,
+                                        title, slug, coin, limit_price, trade_amount, mg["streak"],
+                                    )
+                                    entered += 1
+                                else:
+                                    # Resting — track as pending, check fill later
+                                    print(f"           RESTING on book — will check for fill", flush=True)
+                                    self._martingale_pending[oid] = {
+                                        "condition_id": condition_id,
+                                        "token_id": token_id,
+                                        "side_idx": side_idx,
+                                        "outcome": outcome,
+                                        "title": title,
+                                        "slug": slug,
+                                        "coin": coin,
+                                        "price": limit_price,
+                                        "amount": trade_amount,
+                                        "streak": mg["streak"],
+                                        "placed_at": time.time(),
+                                    }
                             else:
                                 print(f"           REJECTED: {result}", flush=True)
                     except Exception as e:
                         print(f"           GTC order error: {e}", flush=True)
-
-                if order_ok:
-                    self._martingale_entered.add(condition_id)
-                    entered += 1
-
-                    trade_record = {
-                        "id": f"mg_{condition_id[:12]}_{int(time.time())}",
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                        "market": title,
-                        "slug": slug,
-                        "outcome": outcome,
-                        "outcome_index": side_idx,
-                        "side": "BUY",
-                        "amount": trade_amount,
-                        "coin": coin,
-                        "price": limit_price,
-                        "interval": "5m",
-                        "source": "momentum",
-                        "martingale_streak": mg["streak"],
-                        "martingale_lot": trade_amount,
-                        "status": "dry_run" if self.dry_run else "filled",
-                    }
-
-                    position = {
-                        "id": trade_record["id"],
-                        "timestamp": trade_record["timestamp"],
-                        "condition_id": condition_id,
-                        "token_id": token_id,
-                        "outcome_index": side_idx,
-                        "outcome": outcome,
-                        "market": title,
-                        "slug": slug,
-                        "entry_price": limit_price,
-                        "amount": trade_amount,
-                        "potential_payout": trade_amount / limit_price if limit_price > 0 else 0,
-                        "dry_run": self.dry_run,
-                        "source": "momentum",
-                        "interval": "5m",
-                        "martingale_streak": mg["streak"],
-                    }
-                    self.positions.setdefault("open", []).append(position)
-                    self.entered_markets[(condition_id, token_id)] = limit_price
-                    if (condition_id, token_id) not in self.initial_entry_price:
-                        self.initial_entry_price[(condition_id, token_id)] = limit_price
-                    self.market_entry_count[(condition_id, token_id)] = 1
-
-                    # Deduct balance
-                    try:
-                        stats = self.positions.setdefault("stats", {})
-                        stats["balance"] = stats.get("balance", ALGO_STARTING_BALANCE) - trade_amount
-                        open_staked = sum(p.get("amount", 0) for p in self.positions.get("open", []))
-                        stats.setdefault("balance_history", []).append({
-                            "timestamp": trade_record["timestamp"],
-                            "balance": stats["balance"],
-                            "pnl": stats.get("total_pnl", 0.0),
-                            "equity": stats["balance"] + open_staked,
-                            "event": "momentum_trade",
-                            "detail": f"MG {coin.upper()} {outcome} @{limit_price*100:.0f}¢ streak={mg['streak']}",
-                        })
-                    except Exception:
-                        pass
-                    save_positions(self.positions)
-                    self.trades_entered += 1
-
-                    if self.on_trade:
-                        try:
-                            self.on_trade(trade_record)
-                        except Exception:
-                            pass
 
                 continue  # skip normal momentum logic for this market
             # ================== END MARTINGALE MODE ==================
