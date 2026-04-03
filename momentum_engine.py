@@ -1417,16 +1417,29 @@ class MomentumEngine:
                         continue
 
                     if status in ("cancelled", "expired", "dead"):
-                        print(f"[MARTINGALE] Order {oid[:12]} {status} — not filled, discarding", flush=True)
+                        print(f"[MARTINGALE] Order {oid[:12]} {status} — not filled, freeing {pending['coin'].upper()}", flush=True)
                         self._martingale_entered.discard(pending["condition_id"])
                         to_remove.append(oid)
                         continue
+
+                    # Still live but market may have closed — check elapsed time
+                    # 5m market = 300s. If order is >240s old (4 min), cancel it
+                    # so we can enter the next market immediately
+                    if elapsed > 240 and status == "live":
+                        print(f"[MARTINGALE] Order {oid[:12]} unfilled after {elapsed:.0f}s — cancelling to free {pending['coin'].upper()}", flush=True)
+                        try:
+                            self.client.cancel(oid)
+                        except Exception:
+                            pass
+                        self._martingale_entered.discard(pending["condition_id"])
+                        to_remove.append(oid)
+                        continue
+
             except Exception as e:
                 if elapsed > 30:
-                    # Can't check and it's old — try to cancel
                     print(f"[MARTINGALE] Order {oid[:12]} check failed after {elapsed:.0f}s: {e}", flush=True)
 
-            # If market has likely closed (>6 min), cancel and discard
+            # Safety net: if somehow still here after 6 min, force cancel
             if elapsed > 360:
                 print(f"[MARTINGALE] Order {oid[:12]} expired (>{elapsed:.0f}s) — cancelling", flush=True)
                 try:
