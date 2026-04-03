@@ -1607,16 +1607,18 @@ class MomentumEngine:
                         continue  # only enter markets with 2-5 mins remaining
 
                 # Don't enter if this coin has an unresolved position OR a pending order
-                _has_open = any(
-                    p.get("source") == "momentum"
-                    and detect_coin(p.get("slug", ""), p.get("market", "")) == coin
+                _open_coins = [
+                    detect_coin(p.get("slug", ""), p.get("market", ""))
                     for p in self.positions.get("open", [])
-                )
-                _has_pending = any(
-                    p.get("coin") == coin
-                    for p in self._martingale_pending.values()
-                )
+                    if p.get("source") == "momentum"
+                ]
+                _pending_coins = [p.get("coin") for p in self._martingale_pending.values()]
+                _has_open = coin in _open_coins
+                _has_pending = coin in _pending_coins
                 if _has_open or _has_pending:
+                    if self.scans_completed % 30 == 1:
+                        print(f"[MARTINGALE] WAIT {coin.upper()}: open={_has_open} pending={_has_pending} "
+                              f"(open_coins={_open_coins} pending_coins={_pending_coins})", flush=True)
                     continue
 
                 # Get martingale state for this coin
