@@ -1606,13 +1606,17 @@ class MomentumEngine:
                     if mins_left < 2 or mins_left > 5:
                         continue  # only enter markets with 2-5 mins remaining
 
-                # Don't enter if this coin has an unresolved martingale position
+                # Don't enter if this coin has an unresolved position OR a pending order
                 _has_open = any(
                     p.get("source") == "momentum"
                     and detect_coin(p.get("slug", ""), p.get("market", "")) == coin
                     for p in self.positions.get("open", [])
                 )
-                if _has_open:
+                _has_pending = any(
+                    p.get("coin") == coin
+                    for p in self._martingale_pending.values()
+                )
+                if _has_open or _has_pending:
                     continue
 
                 # Get martingale state for this coin
