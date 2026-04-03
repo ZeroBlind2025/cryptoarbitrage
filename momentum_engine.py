@@ -138,8 +138,7 @@ MARTINGALE_BASE_LOT = float(os.getenv("MOMENTUM_MARTINGALE_BASE_LOT", "2.0"))
 MARTINGALE_MAX_LOT = float(os.getenv("MOMENTUM_MARTINGALE_MAX_LOT", "256.0"))  # safety cap
 MARTINGALE_SIDE = os.getenv("MOMENTUM_MARTINGALE_SIDE", "Up")  # which side to bet
 MARTINGALE_MAX_ENTRY = float(os.getenv("MOMENTUM_MARTINGALE_MAX_ENTRY", "0.50"))  # max entry price after a loss
-MARTINGALE_LIMIT_PRICE = float(os.getenv("MOMENTUM_MARTINGALE_PRICE", "0.475"))  # fixed limit price for GTC orders
-MARTINGALE_NUM_ORDERS = int(os.getenv("MOMENTUM_MARTINGALE_ORDERS", "2"))  # number of GTC orders per market (50¢ = even odds)
+MARTINGALE_LIMIT_PRICE = float(os.getenv("MOMENTUM_MARTINGALE_PRICE", "0.475"))  # fixed limit price for GTC orders (50¢ = even odds)
 
 # Minimum minutes before market close to allow entry.
 # Prevents placing trades after (or right at) the close time.
@@ -953,9 +952,8 @@ class MomentumEngine:
         print("\n" + "=" * 60)
         if MARTINGALE_ENABLED:
             print("  MARTINGALE ENGINE (MAKER)")
-            print(f"  Limit price: {MARTINGALE_LIMIT_PRICE*100:.1f}¢ (GTC maker orders)")
-            print(f"  Orders per market: {MARTINGALE_NUM_ORDERS}")
-            print(f"  Base lot: ${MARTINGALE_BASE_LOT:.2f}/order | Max lot: ${MARTINGALE_MAX_LOT:.2f}")
+            print(f"  Limit price: {MARTINGALE_LIMIT_PRICE*100:.1f}¢ (GTC maker order)")
+            print(f"  Base lot: ${MARTINGALE_BASE_LOT:.2f} | Max lot: ${MARTINGALE_MAX_LOT:.2f}")
             print(f"  Side: {MARTINGALE_SIDE} | Markets: 5m only")
             print(f"  No SL, no TP — wait for resolution")
             print(f"  On loss: double lot, guard ≤{MARTINGALE_MAX_ENTRY*100:.0f}¢")
@@ -1510,65 +1508,52 @@ class MomentumEngine:
                 token_id = market["token_ids"][side_idx]
                 outcome = market["outcomes"][side_idx]
 
-                # Fixed limit price — always make the market at this price
+                # Fixed limit price — one GTC maker order
                 limit_price = MARTINGALE_LIMIT_PRICE
-                per_order_amount = mg["lot"]
-                num_orders = MARTINGALE_NUM_ORDERS
-                total_amount = per_order_amount * num_orders
+                trade_amount = mg["lot"]
                 title = (question or slug)[:50]
 
-                print(f"\n[MARTINGALE] PLACING {num_orders}x GTC BUY {coin.upper()} {outcome} "
-                      f"@ {limit_price*100:.1f}¢ ${per_order_amount:.2f} each (total ${total_amount:.2f})", flush=True)
+                print(f"\n[MARTINGALE] GTC BUY {coin.upper()} {outcome} @ {limit_price*100:.1f}¢ ${trade_amount:.2f}", flush=True)
                 print(f"           Market: {title}", flush=True)
-                print(f"           Streak: {mg['streak']} | Lot: ${per_order_amount:.2f}", flush=True)
+                print(f"           Streak: {mg['streak']} | Lot: ${trade_amount:.2f}", flush=True)
 
-                orders_placed = 0
-                total_filled = 0.0
+                order_ok = False
 
                 if self.dry_run:
-                    print(f"           DRY RUN — would place {num_orders}x GTC @ {limit_price*100:.1f}¢", flush=True)
-                    orders_placed = num_orders
-                    total_filled = total_amount
+                    print(f"           DRY RUN — would place GTC @ {limit_price*100:.1f}¢", flush=True)
+                    order_ok = True
                 else:
-                    from copy_trader import place_sell_gtc
-                    # Reuse GTC order infrastructure but for BUY side
                     try:
                         from py_clob_client.clob_types import OrderArgs, OrderType, PartialCreateOrderOptions
                         from py_clob_client.order_builder.constants import BUY
                         import math
 
-                        for _ord_i in range(num_orders):
-                            shares = math.floor((per_order_amount / limit_price) * 100) / 100
-                            order_args = OrderArgs(
-                                token_id=token_id,
-                                price=round(limit_price, 2),
-                                size=shares,
-                                side=BUY,
-                            )
-                            signed = self.client.create_order(
-                                order_args,
-                                options=PartialCreateOrderOptions(tick_size="0.01"),
-                            )
-                            result = self.client.post_order(signed, OrderType.GTC)
+                        shares = math.floor((trade_amount / limit_price) * 100) / 100
+                        order_args = OrderArgs(
+                            token_id=token_id,
+                            price=round(limit_price, 2),
+                            size=shares,
+                            side=BUY,
+                        )
+                        signed = self.client.create_order(
+                            order_args,
+                            options=PartialCreateOrderOptions(tick_size="0.01"),
+                        )
+                        result = self.client.post_order(signed, OrderType.GTC)
 
-                            if isinstance(result, dict):
-                                status = result.get("status", "").lower()
-                                if status not in ("rejected", "failed"):
-                                    orders_placed += 1
-                                    # Check if immediately filled
-                                    matched = float(result.get("matchedAmount") or 0)
-                                    if matched > 0:
-                                        total_filled += matched
-                                    else:
-                                        total_filled += per_order_amount  # assume resting
-                                    oid = result.get("orderID", "?")[:12]
-                                    print(f"           Order {_ord_i+1}: id={oid} status={status} matched=${matched:.2f}", flush=True)
-                                else:
-                                    print(f"           Order {_ord_i+1}: REJECTED {result}", flush=True)
+                        if isinstance(result, dict):
+                            status = result.get("status", "").lower()
+                            if status not in ("rejected", "failed"):
+                                order_ok = True
+                                oid = result.get("orderID", "?")[:12]
+                                matched = float(result.get("matchedAmount") or 0)
+                                print(f"           Order placed: id={oid} status={status} matched=${matched:.2f}", flush=True)
+                            else:
+                                print(f"           REJECTED: {result}", flush=True)
                     except Exception as e:
                         print(f"           GTC order error: {e}", flush=True)
 
-                if orders_placed > 0:
+                if order_ok:
                     self._martingale_entered.add(condition_id)
                     entered += 1
 
@@ -1580,14 +1565,13 @@ class MomentumEngine:
                         "outcome": outcome,
                         "outcome_index": side_idx,
                         "side": "BUY",
-                        "amount": total_filled,
+                        "amount": trade_amount,
                         "coin": coin,
                         "price": limit_price,
                         "interval": "5m",
                         "source": "momentum",
                         "martingale_streak": mg["streak"],
-                        "martingale_lot": per_order_amount,
-                        "orders_placed": orders_placed,
+                        "martingale_lot": trade_amount,
                         "status": "dry_run" if self.dry_run else "filled",
                     }
 
@@ -1601,8 +1585,8 @@ class MomentumEngine:
                         "market": title,
                         "slug": slug,
                         "entry_price": limit_price,
-                        "amount": total_filled,
-                        "potential_payout": total_filled / limit_price if limit_price > 0 else 0,
+                        "amount": trade_amount,
+                        "potential_payout": trade_amount / limit_price if limit_price > 0 else 0,
                         "dry_run": self.dry_run,
                         "source": "momentum",
                         "interval": "5m",
@@ -1617,7 +1601,7 @@ class MomentumEngine:
                     # Deduct balance
                     try:
                         stats = self.positions.setdefault("stats", {})
-                        stats["balance"] = stats.get("balance", ALGO_STARTING_BALANCE) - total_filled
+                        stats["balance"] = stats.get("balance", ALGO_STARTING_BALANCE) - trade_amount
                         open_staked = sum(p.get("amount", 0) for p in self.positions.get("open", []))
                         stats.setdefault("balance_history", []).append({
                             "timestamp": trade_record["timestamp"],
@@ -1625,7 +1609,7 @@ class MomentumEngine:
                             "pnl": stats.get("total_pnl", 0.0),
                             "equity": stats["balance"] + open_staked,
                             "event": "momentum_trade",
-                            "detail": f"MG {coin.upper()} {outcome} {num_orders}x@{limit_price*100:.0f}¢ streak={mg['streak']}",
+                            "detail": f"MG {coin.upper()} {outcome} @{limit_price*100:.0f}¢ streak={mg['streak']}",
                         })
                     except Exception:
                         pass
