@@ -2150,29 +2150,9 @@ class MomentumEngine:
                 _resolution_cache[cache_key] = result
 
             if not result or not result.get("resolved"):
-                # Fallback: use live WebSocket price for resolution
-                # Only trigger in the final 10 seconds of a market to avoid
-                # false wins/losses from mid-window price spikes to 99¢.
-                live_price = self.get_live_price(token_id) if token_id else None
-                _in_final_seconds = False
-                end_date_str = position.get("end_date")
-                if end_date_str:
-                    try:
-                        end_dt = datetime.fromisoformat(end_date_str) if isinstance(end_date_str, str) else end_date_str
-                        secs_left = (end_dt - datetime.now(timezone.utc)).total_seconds()
-                        _in_final_seconds = secs_left <= 10
-                    except Exception:
-                        pass
-                if _in_final_seconds and live_price is not None and (live_price >= 0.98 or live_price <= 0.02):
-                    our_token_won = live_price >= 0.98
-                    print(f"[MOMENTUM] Price-based resolution (final 10s): {position['market'][:30]} "
-                          f"| price={live_price:.4f} → {'WIN' if our_token_won else 'LOSS'}", flush=True)
-                    result = {
-                        "resolved": True,
-                        "our_token_won": our_token_won,
-                        "winning_outcome": our_outcome if our_token_won else None,
-                    }
-                else:
+                # API hasn't returned resolution yet — wait and retry next cycle.
+                # NO price-based fallbacks — only trust the CLOB API resolution.
+                if True:
                     # Track unresolved attempts with timestamps for smarter retry
                     attempts = position.get("_resolve_attempts", 0) + 1
                     position["_resolve_attempts"] = attempts
@@ -2217,13 +2197,8 @@ class MomentumEngine:
                           f"(ours={our_outcome}, winner={winning_outcome}). Correcting to WIN.", flush=True)
                     won = True
 
-            # Priority 4: Live price fallback when API says resolved but no winner info
-            # This catches the case where Gamma returns resolved=True with no outcome data
-            if won is None and token_id:
-                live_price = self.get_live_price(token_id)
-                if live_price is not None and (live_price >= 0.95 or live_price <= 0.05):
-                    won = live_price >= 0.95
-                    print(f"[MOMENTUM] Resolved-but-no-winner fallback: price={live_price:.4f} → {'WIN' if won else 'LOSS'}", flush=True)
+            # Priority 4 REMOVED — no price-based resolution fallback.
+            # Only trust CLOB API winner data.
 
             if won is True:
                 if entry_price > 0:
