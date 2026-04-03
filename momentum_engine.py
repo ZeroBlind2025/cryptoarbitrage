@@ -1686,7 +1686,8 @@ class MomentumEngine:
                             order_args,
                             options=PartialCreateOrderOptions(tick_size="0.01"),
                         )
-                        result = self.client.post_order(signed, OrderType.GTC, post_only=True)
+                        use_post_only = trade_amount >= 8.0
+                        result = self.client.post_order(signed, OrderType.GTC, post_only=use_post_only)
 
                         if isinstance(result, dict):
                             status = result.get("status", "").lower()
