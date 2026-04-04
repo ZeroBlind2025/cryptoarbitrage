@@ -138,7 +138,10 @@ MARTINGALE_BASE_LOT = float(os.getenv("MOMENTUM_MARTINGALE_BASE_LOT", "2.0"))
 MARTINGALE_MAX_LOT = float(os.getenv("MOMENTUM_MARTINGALE_MAX_LOT", "256.0"))  # safety cap
 MARTINGALE_SIDE = os.getenv("MOMENTUM_MARTINGALE_SIDE", "Up")  # which side to bet
 MARTINGALE_MAX_ENTRY = float(os.getenv("MOMENTUM_MARTINGALE_MAX_ENTRY", "0.50"))  # max entry price after a loss
-MARTINGALE_LIMIT_PRICE = float(os.getenv("MOMENTUM_MARTINGALE_PRICE", "0.475"))  # fixed limit price for GTC orders (50¢ = even odds)
+MARTINGALE_LIMIT_PRICE = float(os.getenv("MOMENTUM_MARTINGALE_PRICE", "0.475"))  # fixed limit price for GTC orders
+MARTINGALE_BREAK = os.getenv("MOMENTUM_MARTINGALE_BREAK", "true").lower() == "true"  # cooldown after 3 consecutive losses
+MARTINGALE_BREAK_LOSSES = int(os.getenv("MOMENTUM_MARTINGALE_BREAK_LOSSES", "3"))  # losses before cooldown
+MARTINGALE_BREAK_MINS = int(os.getenv("MOMENTUM_MARTINGALE_BREAK_MINS", "30"))  # cooldown duration in minutes
 
 # Minimum minutes before market close to allow entry.
 # Prevents placing trades after (or right at) the close time.
@@ -1640,8 +1643,16 @@ class MomentumEngine:
                         "lot": MARTINGALE_BASE_LOT,
                         "max_price": 1.0,
                         "streak": 0,
+                        "cooldown_until": 0,
                     }
                 mg = self.martingale[coin]
+
+                # Check cooldown after consecutive losses
+                if MARTINGALE_BREAK and mg.get("cooldown_until", 0) > time.time():
+                    remaining = int(mg["cooldown_until"] - time.time())
+                    if self.scans_completed % 60 == 1:
+                        print(f"[MARTINGALE] {coin.upper()} COOLDOWN: {remaining}s remaining (after {MARTINGALE_BREAK_LOSSES} losses)", flush=True)
+                    continue
 
                 # Find the Up token
                 side = MARTINGALE_SIDE
@@ -2634,21 +2645,26 @@ class MomentumEngine:
                         self.martingale[_mg_coin] = {"lot": MARTINGALE_BASE_LOT, "max_price": 1.0, "streak": 0}
                     mg = self.martingale[_mg_coin]
                     if won is True:
-                        # WIN: reset to base lot, clear price guard
+                        # WIN: reset to base lot, clear price guard, clear cooldown
                         old_lot = mg["lot"]
                         mg["lot"] = MARTINGALE_BASE_LOT
-                        mg["max_price"] = 1.0  # no guard on fresh start
+                        mg["max_price"] = 1.0
                         mg["streak"] = 0
+                        mg["cooldown_until"] = 0
                         print(f"[MARTINGALE] {_mg_coin.upper()} WIN — reset lot ${old_lot:.2f} → ${MARTINGALE_BASE_LOT:.2f}", flush=True)
                     elif won is False:
-                        # LOSS: double the lot, guard at MARTINGALE_MAX_ENTRY (e.g. 50¢)
-                        # At ≤50¢ a win pays ≥2x, enough to recoup the previous loss
+                        # LOSS: double the lot, guard at MARTINGALE_MAX_ENTRY
                         old_lot = mg["lot"]
                         mg["lot"] = min(old_lot * 2, MARTINGALE_MAX_LOT)
                         mg["max_price"] = MARTINGALE_MAX_ENTRY
                         mg["streak"] += 1
                         print(f"[MARTINGALE] {_mg_coin.upper()} LOSS — double lot ${old_lot:.2f} → ${mg['lot']:.2f} "
                               f"(streak={mg['streak']}, guard ≤{MARTINGALE_MAX_ENTRY*100:.0f}¢)", flush=True)
+                        # Initiate cooldown after N consecutive losses
+                        if MARTINGALE_BREAK and mg["streak"] >= MARTINGALE_BREAK_LOSSES:
+                            mg["cooldown_until"] = time.time() + MARTINGALE_BREAK_MINS * 60
+                            print(f"[MARTINGALE] {_mg_coin.upper()} BREAK — {mg['streak']} losses, "
+                                  f"cooling down for {MARTINGALE_BREAK_MINS}min", flush=True)
 
             if self.on_resolution:
                 try:
