@@ -1457,7 +1457,7 @@ class MomentumEngine:
             # Simulates a live limit order fill. Waits for WS price to cross
             # the threshold, then records entry at the threshold price.
             if LIMIT_SIM_ENABLED:
-                # One entry per market
+                # One entry per market (only one side can fill since Up+Down=$1)
                 if condition_id in self._limit_sim_entered:
                     continue
 
@@ -1474,29 +1474,41 @@ class MomentumEngine:
                 if mins_left < 0.5 or mins_left > 6:
                     continue
 
-                # Find the target side token
-                side_idx = 0 if LIMIT_SIM_SIDE.lower() == "up" else 1
-                if side_idx >= len(market.get("token_ids", [])):
-                    continue
-                token_id = market["token_ids"][side_idx]
-                outcome = market["outcomes"][side_idx]
-
-                # Get live WS price
-                live_price = self.get_live_price(token_id)
-                if live_price is None:
+                token_ids = market.get("token_ids", [])
+                outcomes = market.get("outcomes", [])
+                if len(token_ids) < 2 or len(outcomes) < 2:
                     continue
 
-                # Only trigger when live price crosses the limit threshold
-                if live_price < LIMIT_SIM_PRICE:
+                # Check both sides — whichever crosses the threshold first fills.
+                # Since Up + Down = $1, only one side can be >= 75¢ at a time.
+                fill_side_idx = None
+                fill_price = None
+                fill_token_id = None
+                fill_outcome = None
+                for _idx in (0, 1):
+                    _tid = token_ids[_idx]
+                    _lp = self.get_live_price(_tid)
+                    if _lp is None:
+                        continue
+                    if _lp >= LIMIT_SIM_PRICE:
+                        fill_side_idx = _idx
+                        fill_price = _lp
+                        fill_token_id = _tid
+                        fill_outcome = outcomes[_idx]
+                        break
+
+                if fill_side_idx is None:
+                    # No side has crossed threshold — skip this market entirely.
+                    # Do NOT fall through to normal momentum (would enter at live price).
                     continue
 
-                # Price >= threshold → simulate limit fill at the threshold price
+                # Simulate limit fill at the threshold price (not live price)
                 entry_price = LIMIT_SIM_PRICE
                 trade_amount = LIMIT_SIM_LOT
                 title = (question or slug)[:50]
 
-                print(f"\n[LIMIT-SIM] FILL {coin.upper()} {outcome} @ {entry_price*100:.1f}¢ "
-                      f"(WS={live_price*100:.1f}¢) ${trade_amount:.2f}", flush=True)
+                print(f"\n[LIMIT-SIM] FILL {coin.upper()} {fill_outcome} @ {entry_price*100:.1f}¢ "
+                      f"(WS={fill_price*100:.1f}¢) ${trade_amount:.2f}", flush=True)
                 print(f"           Market: {title}", flush=True)
 
                 trade_record = {
@@ -1504,8 +1516,8 @@ class MomentumEngine:
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                     "market": title,
                     "slug": slug,
-                    "outcome": outcome,
-                    "outcome_index": side_idx,
+                    "outcome": fill_outcome,
+                    "outcome_index": fill_side_idx,
                     "side": "BUY",
                     "amount": trade_amount,
                     "coin": coin,
@@ -1519,9 +1531,9 @@ class MomentumEngine:
                     "id": trade_record["id"],
                     "timestamp": trade_record["timestamp"],
                     "condition_id": condition_id,
-                    "token_id": token_id,
-                    "outcome_index": side_idx,
-                    "outcome": outcome,
+                    "token_id": fill_token_id,
+                    "outcome_index": fill_side_idx,
+                    "outcome": fill_outcome,
                     "market": title,
                     "slug": slug,
                     "entry_price": entry_price,
@@ -1534,8 +1546,8 @@ class MomentumEngine:
                 }
                 self.positions.setdefault("open", []).append(position)
                 self._limit_sim_entered.add(condition_id)
-                self.entered_markets[(condition_id, token_id)] = entry_price
-                self.market_entry_count[(condition_id, token_id)] = 1
+                self.entered_markets[(condition_id, fill_token_id)] = entry_price
+                self.market_entry_count[(condition_id, fill_token_id)] = 1
 
                 # Deduct balance
                 try:
@@ -1548,7 +1560,7 @@ class MomentumEngine:
                         "pnl": stats.get("total_pnl", 0.0),
                         "equity": stats["balance"] + open_staked,
                         "event": "momentum_trade",
-                        "detail": f"LIMSIM {coin.upper()} {outcome} @{entry_price*100:.0f}¢",
+                        "detail": f"LIMSIM {coin.upper()} {fill_outcome} @{entry_price*100:.0f}¢",
                     })
                 except Exception:
                     pass
