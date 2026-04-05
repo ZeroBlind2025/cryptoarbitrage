@@ -1668,19 +1668,59 @@ class MomentumEngine:
                 trade_amount = mg["lot"]
                 title = (question or slug)[:50]
 
-                print(f"\n[MARTINGALE] GTC BUY {coin.upper()} {outcome} @ {limit_price*100:.1f}¢ ${trade_amount:.2f}", flush=True)
+                # Lot < $5 can't make market (min order = $5) — must take live price
+                use_maker = trade_amount >= 5.0
+
+                if use_maker:
+                    entry_price = limit_price
+                    order_type_label = f"GTC BUY @ {limit_price*100:.1f}¢ (maker)"
+                else:
+                    # Small lot — get live ask to take the market
+                    live_ask = self.get_live_price(token_id)
+                    if live_ask is None:
+                        live_ask = market["prices"][side_idx] if side_idx < len(market.get("prices", [])) else None
+                    if not live_ask or live_ask <= 0 or live_ask >= 1:
+                        if self.scans_completed % 30 == 1:
+                            print(f"[MARTINGALE] {coin.upper()} SKIP: no live price for taker entry", flush=True)
+                        continue
+                    entry_price = live_ask
+                    order_type_label = f"FAK BUY @ {entry_price*100:.1f}¢ (taker, lot <${5:.0f})"
+
+                # Price guard: don't enter above max_price (post-loss guard)
+                if entry_price > mg["max_price"]:
+                    if self.scans_completed % 30 == 1:
+                        print(f"[MARTINGALE] {coin.upper()} SKIP: {entry_price*100:.1f}¢ > guard {mg['max_price']*100:.1f}¢", flush=True)
+                    continue
+
+                print(f"\n[MARTINGALE] {order_type_label} {coin.upper()} {outcome} ${trade_amount:.2f}", flush=True)
                 print(f"           Market: {title}", flush=True)
                 print(f"           Streak: {mg['streak']} | Lot: ${trade_amount:.2f}", flush=True)
 
                 if self.dry_run:
-                    # Dry run: assume filled immediately
-                    print(f"           DRY RUN — GTC @ {limit_price*100:.1f}¢ (assumed filled)", flush=True)
+                    # Dry run: assume filled immediately at entry_price
+                    print(f"           DRY RUN — {order_type_label} (assumed filled)", flush=True)
                     self._martingale_entered.add(condition_id)
                     self._promote_martingale_fill(
                         condition_id, token_id, side_idx, outcome,
-                        title, slug, coin, limit_price, trade_amount, mg["streak"],
+                        title, slug, coin, entry_price, trade_amount, mg["streak"],
                     )
                     entered += 1
+                elif not use_maker:
+                    # Small lot — take the market with FAK
+                    buffer = PRICE_BUFFER_BPS / 10000
+                    max_price = min(entry_price * (1 + buffer), 0.99)
+                    fill = place_bet(self.client, token_id, trade_amount, max_price=max_price)
+                    if fill.get("success"):
+                        fill_price = fill.get("fill_price", entry_price)
+                        print(f"           FAK FILLED @ {fill_price*100:.1f}¢", flush=True)
+                        self._martingale_entered.add(condition_id)
+                        self._promote_martingale_fill(
+                            condition_id, token_id, side_idx, outcome,
+                            title, slug, coin, fill_price, trade_amount, mg["streak"],
+                        )
+                        entered += 1
+                    else:
+                        print(f"           FAK FAILED", flush=True)
                 else:
                     try:
                         from py_clob_client.clob_types import OrderArgs, OrderType, PartialCreateOrderOptions
