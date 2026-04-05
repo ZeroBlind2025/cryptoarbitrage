@@ -1461,17 +1461,22 @@ class MomentumEngine:
                 if condition_id in self._limit_sim_entered:
                     continue
 
-                # Only enter while market is open and has enough time
+                # Market must still be open (any time remaining is fine — limit
+                # orders can fill right up to close)
                 _end_date = market.get("end_date")
                 if _end_date is None:
+                    if self.scans_completed % 60 == 1:
+                        print(f"[LIMIT-SIM] {coin.upper()} skip: no end_date", flush=True)
                     continue
                 try:
                     if isinstance(_end_date, str):
                         _end_date = datetime.fromisoformat(_end_date.replace("Z", "+00:00"))
                     mins_left = (_end_date - datetime.now(timezone.utc)).total_seconds() / 60
-                except Exception:
+                except Exception as _e:
+                    if self.scans_completed % 60 == 1:
+                        print(f"[LIMIT-SIM] {coin.upper()} skip: end_date parse error {_e}", flush=True)
                     continue
-                if mins_left < 0.5 or mins_left > 6:
+                if mins_left <= 0 or mins_left > 6:
                     continue
 
                 token_ids = market.get("token_ids", [])
