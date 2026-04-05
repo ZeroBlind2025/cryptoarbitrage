@@ -138,7 +138,8 @@ MARTINGALE_BASE_LOT = float(os.getenv("MOMENTUM_MARTINGALE_BASE_LOT", "2.0"))
 MARTINGALE_MAX_LOT = float(os.getenv("MOMENTUM_MARTINGALE_MAX_LOT", "256.0"))  # safety cap
 MARTINGALE_SIDE = os.getenv("MOMENTUM_MARTINGALE_SIDE", "Up")  # which side to bet
 MARTINGALE_MAX_ENTRY = float(os.getenv("MOMENTUM_MARTINGALE_MAX_ENTRY", "0.50"))  # max entry price after a loss
-MARTINGALE_LIMIT_PRICE = float(os.getenv("MOMENTUM_MARTINGALE_PRICE", "0.475"))  # fixed limit price for GTC orders
+MARTINGALE_LIMIT_PRICE = float(os.getenv("MOMENTUM_MARTINGALE_PRICE", "0.475"))  # legacy fixed limit price
+MARTINGALE_MAKER_SIZE = float(os.getenv("MOMENTUM_MARTINGALE_MAKER_SIZE", "0.50"))  # maker price for lots >= $5 (entries 2, 3 after losses)
 MARTINGALE_BREAK = os.getenv("MOMENTUM_MARTINGALE_BREAK", "true").lower() == "true"  # cooldown after N consecutive losses
 MARTINGALE_BREAK_LOSSES = int(os.getenv("MOMENTUM_MARTINGALE_BREAK_LOSSES", "3"))  # losses before cooldown
 MARTINGALE_BREAK_MINS = int(os.getenv("MOMENTUM_MARTINGALE_BREAK_MINS", "30"))  # cooldown duration in minutes
@@ -959,7 +960,8 @@ class MomentumEngine:
         print("\n" + "=" * 60)
         if MARTINGALE_ENABLED:
             print("  MARTINGALE ENGINE (MAKER)")
-            print(f"  Limit price: {MARTINGALE_LIMIT_PRICE*100:.1f}¢ (GTC maker order)")
+            print(f"  Maker price: {MARTINGALE_MAKER_SIZE*100:.1f}¢ (lots >= $5)")
+            print(f"  Small lots (<$5): take live ask")
             print(f"  Base lot: ${MARTINGALE_BASE_LOT:.2f} | Max lot: ${MARTINGALE_MAX_LOT:.2f}")
             print(f"  Side: {MARTINGALE_SIDE} | Markets: 5m only")
             print(f"  No SL, no TP — wait for resolution")
@@ -1663,8 +1665,8 @@ class MomentumEngine:
                 token_id = market["token_ids"][side_idx]
                 outcome = market["outcomes"][side_idx]
 
-                # Fixed limit price — one GTC maker order
-                limit_price = MARTINGALE_LIMIT_PRICE
+                # Maker price for lots >= $5 (entries 2, 3 after losses)
+                limit_price = MARTINGALE_MAKER_SIZE
                 trade_amount = mg["lot"]
                 title = (question or slug)[:50]
 
