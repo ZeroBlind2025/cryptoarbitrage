@@ -98,6 +98,18 @@ MOMENTUM_15M_MARKET = os.getenv("MOMENTUM_15M_MARKET", "false").lower() == "true
 MAX_ENTRY_PRICE = float(os.getenv("MOMENTUM_MAX_ENTRY_PRICE", "0.989"))
 
 # ---------------------------------------------------------------------------
+# LIMIT SIMULATION MODE — mimics a live limit order in dry run
+# When enabled, entry only triggers when the live WS price crosses the
+# threshold. The position is recorded at the threshold price (= simulated
+# limit fill price), not the live price. This simulates placing a
+# $5 @ 75¢ Up limit order that fills as the market crosses 75¢.
+# ---------------------------------------------------------------------------
+LIMIT_SIM_ENABLED = os.getenv("MOMENTUM_LIMIT_SIM", "false").lower() == "true"
+LIMIT_SIM_PRICE = float(os.getenv("MOMENTUM_LIMIT_SIM_PRICE", "0.75"))
+LIMIT_SIM_LOT = float(os.getenv("MOMENTUM_LIMIT_SIM_LOT", "5.0"))
+LIMIT_SIM_SIDE = os.getenv("MOMENTUM_LIMIT_SIM_SIDE", "Up")
+
+# ---------------------------------------------------------------------------
 # Per-interval entry price brackets (data-driven from bracket analysis)
 # Each interval maps to a list of (min, max) tuples.  A price must fall in
 # at least ONE bracket to qualify.  Intervals not listed here use the global
@@ -864,6 +876,7 @@ class MomentumEngine:
         self.entered_markets: dict = {}  # market_key → last_buy_price (updated on every fill)
         self.initial_entry_price: dict = {}  # market_key → first entry price (never updated)
         self.market_entry_count: dict = {}
+        self._limit_sim_entered: set = set()  # condition_ids already entered in limit sim mode
         self.hedged_markets: set = set()  # condition_ids already arb-hedged
         self.last_trade_time: dict = {}  # (condition_id, token_id) → epoch timestamp
 
@@ -929,7 +942,13 @@ class MomentumEngine:
         balance = self.positions.get("stats", {}).get("balance", ALGO_STARTING_BALANCE)
         lot_sizes = ", ".join(f"{c.upper()}=${a}" for c, a in sorted(self.coin_bet_amounts.items()))
         print("\n" + "=" * 60)
-        print("  MOMENTUM ENGINE")
+        if LIMIT_SIM_ENABLED:
+            print("  MOMENTUM ENGINE (LIMIT SIM)")
+            print(f"  Limit trigger: WS >= {LIMIT_SIM_PRICE*100:.0f}¢ → fill @ {LIMIT_SIM_PRICE*100:.0f}¢")
+            print(f"  Lot: ${LIMIT_SIM_LOT:.2f} | Side: {LIMIT_SIM_SIDE}")
+            print(f"  Simulates: limit BUY {LIMIT_SIM_SIDE} @ {LIMIT_SIM_PRICE*100:.0f}¢")
+        else:
+            print("  MOMENTUM ENGINE")
         print(f"  Global entry range: {self.min_entry_price*100:.0f}-{self.max_entry_price*100:.0f}¢")
         if self.interval_price_brackets:
             print("  Per-interval brackets:")
@@ -1433,6 +1452,118 @@ class MomentumEngine:
             # Per-coin pause
             if coin in self.paused_coins:
                 continue
+
+            # =================== LIMIT SIMULATION MODE ===================
+            # Simulates a live limit order fill. Waits for WS price to cross
+            # the threshold, then records entry at the threshold price.
+            if LIMIT_SIM_ENABLED:
+                # One entry per market
+                if condition_id in self._limit_sim_entered:
+                    continue
+
+                # Only enter while market is open and has enough time
+                _end_date = market.get("end_date")
+                if _end_date is None:
+                    continue
+                try:
+                    if isinstance(_end_date, str):
+                        _end_date = datetime.fromisoformat(_end_date.replace("Z", "+00:00"))
+                    mins_left = (_end_date - datetime.now(timezone.utc)).total_seconds() / 60
+                except Exception:
+                    continue
+                if mins_left < 0.5 or mins_left > 6:
+                    continue
+
+                # Find the target side token
+                side_idx = 0 if LIMIT_SIM_SIDE.lower() == "up" else 1
+                if side_idx >= len(market.get("token_ids", [])):
+                    continue
+                token_id = market["token_ids"][side_idx]
+                outcome = market["outcomes"][side_idx]
+
+                # Get live WS price
+                live_price = self.get_live_price(token_id)
+                if live_price is None:
+                    continue
+
+                # Only trigger when live price crosses the limit threshold
+                if live_price < LIMIT_SIM_PRICE:
+                    continue
+
+                # Price >= threshold → simulate limit fill at the threshold price
+                entry_price = LIMIT_SIM_PRICE
+                trade_amount = LIMIT_SIM_LOT
+                title = (question or slug)[:50]
+
+                print(f"\n[LIMIT-SIM] FILL {coin.upper()} {outcome} @ {entry_price*100:.1f}¢ "
+                      f"(WS={live_price*100:.1f}¢) ${trade_amount:.2f}", flush=True)
+                print(f"           Market: {title}", flush=True)
+
+                trade_record = {
+                    "id": f"limsim_{condition_id[:12]}_{int(time.time())}",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "market": title,
+                    "slug": slug,
+                    "outcome": outcome,
+                    "outcome_index": side_idx,
+                    "side": "BUY",
+                    "amount": trade_amount,
+                    "coin": coin,
+                    "price": entry_price,
+                    "interval": market.get("interval", "5m"),
+                    "source": "momentum",
+                    "status": "dry_run" if self.dry_run else "filled",
+                }
+
+                position = {
+                    "id": trade_record["id"],
+                    "timestamp": trade_record["timestamp"],
+                    "condition_id": condition_id,
+                    "token_id": token_id,
+                    "outcome_index": side_idx,
+                    "outcome": outcome,
+                    "market": title,
+                    "slug": slug,
+                    "entry_price": entry_price,
+                    "amount": trade_amount,
+                    "potential_payout": trade_amount / entry_price if entry_price > 0 else 0,
+                    "dry_run": self.dry_run,
+                    "source": "momentum",
+                    "interval": market.get("interval", "5m"),
+                    "end_date": _end_date.isoformat() if hasattr(_end_date, "isoformat") else str(_end_date),
+                }
+                self.positions.setdefault("open", []).append(position)
+                self._limit_sim_entered.add(condition_id)
+                self.entered_markets[(condition_id, token_id)] = entry_price
+                self.market_entry_count[(condition_id, token_id)] = 1
+
+                # Deduct balance
+                try:
+                    stats = self.positions.setdefault("stats", {})
+                    stats["balance"] = stats.get("balance", ALGO_STARTING_BALANCE) - trade_amount
+                    open_staked = sum(p.get("amount", 0) for p in self.positions.get("open", []))
+                    stats.setdefault("balance_history", []).append({
+                        "timestamp": trade_record["timestamp"],
+                        "balance": stats["balance"],
+                        "pnl": stats.get("total_pnl", 0.0),
+                        "equity": stats["balance"] + open_staked,
+                        "event": "momentum_trade",
+                        "detail": f"LIMSIM {coin.upper()} {outcome} @{entry_price*100:.0f}¢",
+                    })
+                except Exception:
+                    pass
+                save_positions(self.positions)
+                self.trades_entered += 1
+                entered += 1
+
+                if self.on_trade:
+                    try:
+                        self.on_trade(trade_record)
+                    except Exception:
+                        pass
+
+                continue  # skip normal momentum logic for this market
+            # ================ END LIMIT SIMULATION MODE ================
 
             # --- Recalculate minutes_left live from stored end_date ---
             # The cached minutes_until_close goes stale; recompute from
