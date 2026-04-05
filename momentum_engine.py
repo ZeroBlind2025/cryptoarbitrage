@@ -1618,12 +1618,25 @@ class MomentumEngine:
                 if condition_id in self._martingale_entered:
                     continue
 
-                # Market must be open with time remaining
+                # Market must be open with 2-5 mins remaining.
+                # Reject if we can't determine time left (safer to skip).
                 end_date = market.get("end_date")
-                if end_date:
+                if end_date is None:
+                    if self.scans_completed % 60 == 1:
+                        print(f"[MARTINGALE] SKIP {coin.upper()}: no end_date on market", flush=True)
+                    continue
+                try:
+                    if isinstance(end_date, str):
+                        end_date = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
                     mins_left = (end_date - datetime.now(timezone.utc)).total_seconds() / 60
-                    if mins_left < 2 or mins_left > 5:
-                        continue  # only enter markets with 2-5 mins remaining
+                except Exception as e:
+                    if self.scans_completed % 60 == 1:
+                        print(f"[MARTINGALE] SKIP {coin.upper()}: end_date parse error {e}", flush=True)
+                    continue
+                if mins_left < 2 or mins_left > 5:
+                    if self.scans_completed % 60 == 1:
+                        print(f"[MARTINGALE] SKIP {coin.upper()}: {mins_left:.1f}m left (need 2-5m)", flush=True)
+                    continue
 
                 # Don't enter if this coin has an unresolved position OR a pending order
                 _open_coins = [
