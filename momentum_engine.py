@@ -1434,6 +1434,39 @@ class MomentumEngine:
 
         entered = 0
 
+        # --- LIMIT SIM status dump (every 30 scans) ---
+        if LIMIT_SIM_ENABLED and self.scans_completed % 30 == 1:
+            _open_5m = []
+            for m in markets:
+                if m.get("interval") != "5m":
+                    continue
+                _ed = m.get("end_date")
+                if _ed is None:
+                    continue
+                try:
+                    if isinstance(_ed, str):
+                        _ed = datetime.fromisoformat(_ed.replace("Z", "+00:00"))
+                    _ml = (_ed - datetime.now(timezone.utc)).total_seconds() / 60
+                except Exception:
+                    continue
+                if _ml <= 0 or _ml > 6:
+                    continue
+                _tids = m.get("token_ids", [])
+                if len(_tids) < 2:
+                    continue
+                _up = self.get_live_price(_tids[0])
+                _dn = self.get_live_price(_tids[1])
+                _up_s = f"{_up*100:.0f}¢" if _up is not None else "?"
+                _dn_s = f"{_dn*100:.0f}¢" if _dn is not None else "?"
+                _already = " [entered]" if m.get("condition_id") in self._limit_sim_entered else ""
+                _open_5m.append(f"{m['coin'].upper()} U={_up_s} D={_dn_s} {_ml:.1f}m{_already}")
+            if _open_5m:
+                print(f"[LIMIT-SIM] Watching {len(_open_5m)} open 5m markets (threshold {LIMIT_SIM_PRICE*100:.0f}¢):", flush=True)
+                for _line in _open_5m:
+                    print(f"  {_line}", flush=True)
+            else:
+                print(f"[LIMIT-SIM] No open 5m markets (discovered {len(markets)} total)", flush=True)
+
         # --- GUARD: No-trade hours (ET) ---
         if NO_TRADE_HOURS:
             _utc_now = datetime.now(timezone.utc)
