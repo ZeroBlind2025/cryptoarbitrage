@@ -878,6 +878,15 @@ class MomentumEngine:
         self.initial_entry_price: dict = {}  # market_key → first entry price (never updated)
         self.market_entry_count: dict = {}
         self._limit_sim_entered: set = set()  # condition_ids already entered in limit sim mode
+        # Limit sim pending orders (both sides placed, waiting for fill).
+        # {condition_id: {
+        #    "up_order_id", "down_order_id",  # order IDs (None in dry run)
+        #    "up_token_id", "down_token_id",
+        #    "outcomes": [up_outcome, down_outcome],
+        #    "coin", "interval", "title", "slug",
+        #    "end_date", "placed_at",
+        # }}
+        self._limit_sim_pending: dict = {}
         self.hedged_markets: set = set()  # condition_ids already arb-hedged
         self.last_trade_time: dict = {}  # (condition_id, token_id) → epoch timestamp
 
@@ -944,10 +953,14 @@ class MomentumEngine:
         lot_sizes = ", ".join(f"{c.upper()}=${a}" for c, a in sorted(self.coin_bet_amounts.items()))
         print("\n" + "=" * 60)
         if LIMIT_SIM_ENABLED:
-            print("  MOMENTUM ENGINE (LIMIT SIM)")
-            print(f"  Limit trigger: WS >= {LIMIT_SIM_PRICE*100:.0f}¢ → fill @ {LIMIT_SIM_PRICE*100:.0f}¢")
-            print(f"  Lot: ${LIMIT_SIM_LOT:.2f} | Side: {LIMIT_SIM_SIDE}")
-            print(f"  Simulates: limit BUY {LIMIT_SIM_SIDE} @ {LIMIT_SIM_PRICE*100:.0f}¢")
+            _mode = "DRY RUN" if self.dry_run else "LIVE"
+            print(f"  MOMENTUM ENGINE (LIMIT MODE — {_mode})")
+            print(f"  Places post-only GTC BUY on BOTH Up and Down @ {LIMIT_SIM_PRICE*100:.0f}¢")
+            print(f"  Lot: ${LIMIT_SIM_LOT:.2f} per side (${LIMIT_SIM_LOT*2:.2f} total per market)")
+            print(f"  Settle delay: {LIMIT_SIM_SETTLE_SECS:.0f}s after market open")
+            print(f"  On fill: cancel opposite side, position resolves on market close")
+            if self.dry_run:
+                print(f"  DRY: simulates fill when WS price crosses {LIMIT_SIM_PRICE*100:.0f}¢")
         else:
             print("  MOMENTUM ENGINE")
         print(f"  Global entry range: {self.min_entry_price*100:.0f}-{self.max_entry_price*100:.0f}¢")
@@ -1308,12 +1321,200 @@ class MomentumEngine:
                 pass
             self.ws = None
 
+    def _check_limit_sim_pending(self):
+        """Check pending limit sim orders for fills / expiry.
+
+        Dry run: simulates a fill when the WS price for either side crosses
+                 the limit threshold.
+        Live: polls each order's status via client.get_order.
+
+        On fill:
+          - Promote the filled side to an open position
+          - Cancel the opposite side order (live only)
+          - Track condition_id in _limit_sim_entered
+        On market close / timeout (both unfilled):
+          - Cancel both orders (live only)
+          - Discard pending entry
+        """
+        if not self._limit_sim_pending:
+            return
+
+        now = datetime.now(timezone.utc)
+        now_ts = time.time()
+        to_remove = []
+
+        for cid, pend in list(self._limit_sim_pending.items()):
+            end_date = pend.get("end_date")
+            mins_left = None
+            if end_date is not None:
+                try:
+                    if isinstance(end_date, str):
+                        end_date = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
+                    mins_left = (end_date - now).total_seconds() / 60
+                except Exception:
+                    mins_left = None
+
+            market_expired = mins_left is not None and mins_left <= 0
+
+            # Determine which side (if any) has filled
+            fill_side = None  # "up" | "down" | None
+            fill_live_price = None
+
+            if self.dry_run:
+                # Simulate fills by checking WS/CLOB price against threshold
+                up_price = self.get_live_price(pend["up_token_id"])
+                down_price = self.get_live_price(pend["down_token_id"])
+                if up_price is not None and up_price >= pend["price"]:
+                    fill_side = "up"
+                    fill_live_price = up_price
+                elif down_price is not None and down_price >= pend["price"]:
+                    fill_side = "down"
+                    fill_live_price = down_price
+            else:
+                # Live: query each open order for status
+                for _side, _oid_key in (("up", "up_order_id"), ("down", "down_order_id")):
+                    _oid = pend.get(_oid_key)
+                    if not _oid:
+                        continue
+                    try:
+                        info = self.client.get_order(_oid)
+                        if not isinstance(info, dict):
+                            continue
+                        status = info.get("status", "").lower()
+                        matched = float(info.get("matchedAmount") or info.get("filledSize") or 0)
+                        if status == "matched" or (matched > 0 and matched >= pend["amount"] * 0.5):
+                            fill_side = _side
+                            fill_live_price = pend["price"]
+                            break
+                        if status in ("cancelled", "expired", "dead") and not market_expired:
+                            # Order died but market still open — clear this side so
+                            # we can fall through to cleanup
+                            pend[_oid_key] = None
+                    except Exception as _e:
+                        if self.scans_completed % 60 == 1:
+                            print(f"[LIMIT-SIM] get_order error {_oid[:12]}: {_e}", flush=True)
+
+            # --- FILL ---
+            if fill_side is not None:
+                fill_tid = pend[f"{fill_side}_token_id"]
+                fill_outcome = pend[f"{fill_side}_outcome"]
+                fill_side_idx = 0 if fill_side == "up" else 1
+                entry_price = pend["price"]
+                trade_amount = pend["amount"]
+                coin = pend["coin"]
+                title = pend["title"]
+                slug = pend["slug"]
+
+                print(f"\n[LIMIT-SIM] FILL {coin.upper()} {fill_outcome} @ {entry_price*100:.1f}¢ "
+                      f"(WS={fill_live_price*100:.1f}¢) ${trade_amount:.2f}", flush=True)
+                print(f"           Market: {title}", flush=True)
+
+                # Cancel the opposite side (live only)
+                if not self.dry_run:
+                    other_key = "down_order_id" if fill_side == "up" else "up_order_id"
+                    other_oid = pend.get(other_key)
+                    if other_oid:
+                        try:
+                            self.client.cancel(other_oid)
+                            print(f"           Cancelled opposite order {other_oid[:16]}", flush=True)
+                        except Exception as _ce:
+                            print(f"           Cancel opposite error: {_ce}", flush=True)
+
+                # Promote to open position
+                trade_record = {
+                    "id": f"limsim_{cid[:12]}_{int(now_ts)}",
+                    "timestamp": now.isoformat(),
+                    "market": title,
+                    "slug": slug,
+                    "outcome": fill_outcome,
+                    "outcome_index": fill_side_idx,
+                    "side": "BUY",
+                    "amount": trade_amount,
+                    "coin": coin,
+                    "price": entry_price,
+                    "interval": pend.get("interval", "5m"),
+                    "source": "momentum",
+                    "status": "dry_run" if self.dry_run else "filled",
+                }
+
+                position = {
+                    "id": trade_record["id"],
+                    "timestamp": trade_record["timestamp"],
+                    "condition_id": cid,
+                    "token_id": fill_tid,
+                    "outcome_index": fill_side_idx,
+                    "outcome": fill_outcome,
+                    "market": title,
+                    "slug": slug,
+                    "entry_price": entry_price,
+                    "amount": trade_amount,
+                    "potential_payout": trade_amount / entry_price if entry_price > 0 else 0,
+                    "dry_run": self.dry_run,
+                    "source": "momentum",
+                    "interval": pend.get("interval", "5m"),
+                    "end_date": end_date.isoformat() if hasattr(end_date, "isoformat") else str(end_date),
+                }
+                self.positions.setdefault("open", []).append(position)
+                self._limit_sim_entered.add(cid)
+                self.entered_markets[(cid, fill_tid)] = entry_price
+                self.market_entry_count[(cid, fill_tid)] = 1
+
+                try:
+                    stats = self.positions.setdefault("stats", {})
+                    stats["balance"] = stats.get("balance", ALGO_STARTING_BALANCE) - trade_amount
+                    open_staked = sum(p.get("amount", 0) for p in self.positions.get("open", []))
+                    stats.setdefault("balance_history", []).append({
+                        "timestamp": trade_record["timestamp"],
+                        "balance": stats["balance"],
+                        "pnl": stats.get("total_pnl", 0.0),
+                        "equity": stats["balance"] + open_staked,
+                        "event": "momentum_trade",
+                        "detail": f"LIMSIM {coin.upper()} {fill_outcome} @{entry_price*100:.0f}¢",
+                    })
+                except Exception:
+                    pass
+                save_positions(self.positions)
+                self.trades_entered += 1
+
+                if self.on_trade:
+                    try:
+                        self.on_trade(trade_record)
+                    except Exception:
+                        pass
+
+                to_remove.append(cid)
+                continue
+
+            # --- MARKET CLOSED WITH NO FILL → cancel remaining orders ---
+            if market_expired:
+                if not self.dry_run:
+                    for _oid_key in ("up_order_id", "down_order_id"):
+                        _oid = pend.get(_oid_key)
+                        if _oid:
+                            try:
+                                self.client.cancel(_oid)
+                            except Exception:
+                                pass
+                print(f"[LIMIT-SIM] {pend['coin'].upper()} {pend['title'][:30]}: market closed, no fill", flush=True)
+                to_remove.append(cid)
+                continue
+
+        for cid in to_remove:
+            self._limit_sim_pending.pop(cid, None)
+
     def scan_and_trade(self) -> int:
         """Main loop iteration: discover markets, check prices, enter trades.
 
         Returns number of trades entered this cycle.
         """
         self.scans_completed += 1
+
+        # Check pending limit sim orders for fills / expiry
+        if LIMIT_SIM_ENABLED and self._limit_sim_pending:
+            try:
+                self._check_limit_sim_pending()
+            except Exception as _e:
+                print(f"[LIMIT-SIM] pending check error: {_e}", flush=True)
 
         # --- WS health check: force reconnect if stale ---
         if self.ws and self.ws.is_stale():
@@ -1470,8 +1671,14 @@ class MomentumEngine:
                 _dn = self.get_live_price(_tids[1])
                 _up_s = f"{_up*100:.0f}¢" if _up is not None else "?"
                 _dn_s = f"{_dn*100:.0f}¢" if _dn is not None else "?"
-                _already = " [entered]" if m.get("condition_id") in self._limit_sim_entered else ""
-                _open_5m.append(f"{m['coin'].upper()} U={_up_s} D={_dn_s} {_ml:.1f}m{_already}")
+                _cid = m.get("condition_id")
+                if _cid in self._limit_sim_entered:
+                    _status = " [filled]"
+                elif _cid in self._limit_sim_pending:
+                    _status = " [pending]"
+                else:
+                    _status = ""
+                _open_5m.append(f"{m['coin'].upper()} U={_up_s} D={_dn_s} {_ml:.1f}m{_status}")
             if _open_5m:
                 print(f"[LIMIT-SIM] Watching {len(_open_5m)} open 5m markets (threshold {LIMIT_SIM_PRICE*100:.0f}¢):", flush=True)
                 for _line in _open_5m:
@@ -1498,16 +1705,17 @@ class MomentumEngine:
             if coin in self.paused_coins:
                 continue
 
-            # =================== LIMIT SIMULATION MODE ===================
-            # Simulates a live limit order fill. Waits for WS price to cross
-            # the threshold, then records entry at the threshold price.
+            # ============ LIMIT SIMULATION / LIVE LIMIT ORDER MODE ============
+            # Places post-only GTC limit BUY orders on BOTH Up and Down at the
+            # threshold price (default 75¢). Only one can fill since Up+Down=$1.
+            # When one fills, the other is cancelled. Dry run simulates fills
+            # by checking if the WS price crosses the threshold.
             if LIMIT_SIM_ENABLED:
-                # One entry per market (only one side can fill since Up+Down=$1)
-                if condition_id in self._limit_sim_entered:
+                # Already placed orders for this market
+                if condition_id in self._limit_sim_entered or condition_id in self._limit_sim_pending:
                     continue
 
-                # Market must still be open (any time remaining is fine — limit
-                # orders can fill right up to close)
+                # Market must still be open
                 _end_date = market.get("end_date")
                 if _end_date is None:
                     if self.scans_completed % 60 == 1:
@@ -1524,10 +1732,7 @@ class MomentumEngine:
                 if mins_left <= 0 or mins_left > 6:
                     continue
 
-                # Settle delay: skip entries in first N seconds after market open.
-                # 5m markets have 5.0 min at open, so `mins_left > 5.0 - settle/60`
-                # means we're still in the settle window where WS prices spike to
-                # stale 99¢ values before real order book settles.
+                # Settle delay: skip placement in first N seconds after market open
                 _interval_mins = 5.0 if market.get("interval") == "5m" else 15.0
                 _settle_floor = _interval_mins - (LIMIT_SIM_SETTLE_SECS / 60.0)
                 if mins_left > _settle_floor:
@@ -1540,114 +1745,95 @@ class MomentumEngine:
                 if len(token_ids) < 2 or len(outcomes) < 2:
                     continue
 
-                # Check both sides — whichever crosses the threshold first fills.
-                # Since Up + Down = $1, only one side can be >= 75¢ at a time.
-                fill_side_idx = None
-                fill_price = None
-                fill_token_id = None
-                fill_outcome = None
-                _up_price = None
-                _down_price = None
-                for _idx in (0, 1):
-                    _tid = token_ids[_idx]
-                    _lp = self.get_live_price(_tid)
-                    if _idx == 0:
-                        _up_price = _lp
-                    else:
-                        _down_price = _lp
-                    if _lp is None:
-                        continue
-                    if _lp >= LIMIT_SIM_PRICE:
-                        fill_side_idx = _idx
-                        fill_price = _lp
-                        fill_token_id = _tid
-                        fill_outcome = outcomes[_idx]
-                        break
+                up_tid, down_tid = token_ids[0], token_ids[1]
+                up_outcome, down_outcome = outcomes[0], outcomes[1]
+                title = (question or slug)[:50]
+                limit_price = LIMIT_SIM_PRICE
+                trade_amount = LIMIT_SIM_LOT
 
-                if fill_side_idx is None:
-                    # No side crossed threshold — log periodically so we can see
-                    # what prices markets are hovering at vs our threshold.
-                    if self.scans_completed % 60 == 1:
-                        _up_str = f"{_up_price*100:.0f}¢" if _up_price is not None else "?"
-                        _down_str = f"{_down_price*100:.0f}¢" if _down_price is not None else "?"
-                        print(f"[LIMIT-SIM] {coin.upper()}_{market.get('interval','?')} "
-                              f"Up={_up_str} Down={_down_str} "
-                              f"(need >={LIMIT_SIM_PRICE*100:.0f}¢, {mins_left:.1f}m left)", flush=True)
+                # --- Place orders (dry run = virtual, live = real GTC post-only) ---
+                up_order_id = None
+                down_order_id = None
+
+                if self.dry_run:
+                    print(f"\n[LIMIT-SIM] PLACE {coin.upper()} {up_outcome}/{down_outcome} @ {limit_price*100:.0f}¢ "
+                          f"${trade_amount:.2f}/side (DRY)", flush=True)
+                    print(f"           Market: {title}", flush=True)
+                    up_order_id = f"dry_up_{condition_id[:12]}"
+                    down_order_id = f"dry_down_{condition_id[:12]}"
+                else:
+                    try:
+                        from py_clob_client.clob_types import OrderArgs, OrderType, PartialCreateOrderOptions
+                        from py_clob_client.order_builder.constants import BUY
+                        import math
+
+                        shares = math.floor((trade_amount / limit_price) * 100) / 100
+                        print(f"\n[LIMIT-SIM] PLACE LIVE {coin.upper()} BOTH sides @ {limit_price*100:.0f}¢ "
+                              f"${trade_amount:.2f}/side", flush=True)
+                        print(f"           Market: {title}", flush=True)
+
+                        # Place Up side
+                        up_args = OrderArgs(
+                            token_id=up_tid,
+                            price=round(limit_price, 2),
+                            size=shares,
+                            side=BUY,
+                        )
+                        up_signed = self.client.create_order(
+                            up_args, options=PartialCreateOrderOptions(tick_size="0.01")
+                        )
+                        up_result = self.client.post_order(up_signed, OrderType.GTC, post_only=True)
+                        if isinstance(up_result, dict):
+                            _s = up_result.get("status", "").lower()
+                            if _s not in ("rejected", "failed"):
+                                up_order_id = up_result.get("orderID") or up_result.get("id", "")
+                                print(f"           Up order: id={up_order_id[:16]} status={_s}", flush=True)
+                            else:
+                                print(f"           Up REJECTED: {up_result}", flush=True)
+
+                        # Place Down side
+                        down_args = OrderArgs(
+                            token_id=down_tid,
+                            price=round(limit_price, 2),
+                            size=shares,
+                            side=BUY,
+                        )
+                        down_signed = self.client.create_order(
+                            down_args, options=PartialCreateOrderOptions(tick_size="0.01")
+                        )
+                        down_result = self.client.post_order(down_signed, OrderType.GTC, post_only=True)
+                        if isinstance(down_result, dict):
+                            _s = down_result.get("status", "").lower()
+                            if _s not in ("rejected", "failed"):
+                                down_order_id = down_result.get("orderID") or down_result.get("id", "")
+                                print(f"           Down order: id={down_order_id[:16]} status={_s}", flush=True)
+                            else:
+                                print(f"           Down REJECTED: {down_result}", flush=True)
+                    except Exception as _e:
+                        print(f"[LIMIT-SIM] Order placement error for {coin.upper()}: {_e}", flush=True)
+
+                # Require at least one order placed to track this market
+                if not up_order_id and not down_order_id:
                     continue
 
-                # Simulate limit fill at the threshold price (not live price)
-                entry_price = LIMIT_SIM_PRICE
-                trade_amount = LIMIT_SIM_LOT
-                title = (question or slug)[:50]
-
-                print(f"\n[LIMIT-SIM] FILL {coin.upper()} {fill_outcome} @ {entry_price*100:.1f}¢ "
-                      f"(WS={fill_price*100:.1f}¢) ${trade_amount:.2f}", flush=True)
-                print(f"           Market: {title}", flush=True)
-
-                trade_record = {
-                    "id": f"limsim_{condition_id[:12]}_{int(time.time())}",
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                    "market": title,
-                    "slug": slug,
-                    "outcome": fill_outcome,
-                    "outcome_index": fill_side_idx,
-                    "side": "BUY",
-                    "amount": trade_amount,
+                self._limit_sim_pending[condition_id] = {
+                    "up_order_id": up_order_id,
+                    "down_order_id": down_order_id,
+                    "up_token_id": up_tid,
+                    "down_token_id": down_tid,
+                    "up_outcome": up_outcome,
+                    "down_outcome": down_outcome,
                     "coin": coin,
-                    "price": entry_price,
                     "interval": market.get("interval", "5m"),
-                    "source": "momentum",
-                    "status": "dry_run" if self.dry_run else "filled",
-                }
-
-                position = {
-                    "id": trade_record["id"],
-                    "timestamp": trade_record["timestamp"],
-                    "condition_id": condition_id,
-                    "token_id": fill_token_id,
-                    "outcome_index": fill_side_idx,
-                    "outcome": fill_outcome,
-                    "market": title,
+                    "title": title,
                     "slug": slug,
-                    "entry_price": entry_price,
+                    "end_date": _end_date,
+                    "placed_at": time.time(),
+                    "price": limit_price,
                     "amount": trade_amount,
-                    "potential_payout": trade_amount / entry_price if entry_price > 0 else 0,
-                    "dry_run": self.dry_run,
-                    "source": "momentum",
-                    "interval": market.get("interval", "5m"),
-                    "end_date": _end_date.isoformat() if hasattr(_end_date, "isoformat") else str(_end_date),
                 }
-                self.positions.setdefault("open", []).append(position)
-                self._limit_sim_entered.add(condition_id)
-                self.entered_markets[(condition_id, fill_token_id)] = entry_price
-                self.market_entry_count[(condition_id, fill_token_id)] = 1
-
-                # Deduct balance
-                try:
-                    stats = self.positions.setdefault("stats", {})
-                    stats["balance"] = stats.get("balance", ALGO_STARTING_BALANCE) - trade_amount
-                    open_staked = sum(p.get("amount", 0) for p in self.positions.get("open", []))
-                    stats.setdefault("balance_history", []).append({
-                        "timestamp": trade_record["timestamp"],
-                        "balance": stats["balance"],
-                        "pnl": stats.get("total_pnl", 0.0),
-                        "equity": stats["balance"] + open_staked,
-                        "event": "momentum_trade",
-                        "detail": f"LIMSIM {coin.upper()} {fill_outcome} @{entry_price*100:.0f}¢",
-                    })
-                except Exception:
-                    pass
-                save_positions(self.positions)
-                self.trades_entered += 1
                 entered += 1
-
-                if self.on_trade:
-                    try:
-                        self.on_trade(trade_record)
-                    except Exception:
-                        pass
-
-                continue  # skip normal momentum logic for this market
+                continue  # skip normal momentum logic
             # ================ END LIMIT SIMULATION MODE ================
 
             # --- Recalculate minutes_left live from stored end_date ---
