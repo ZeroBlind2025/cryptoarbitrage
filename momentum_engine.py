@@ -108,6 +108,7 @@ LIMIT_SIM_ENABLED = os.getenv("MOMENTUM_LIMIT_SIM", "false").lower() == "true"
 LIMIT_SIM_PRICE = float(os.getenv("MOMENTUM_LIMIT_SIM_PRICE", "0.75"))
 LIMIT_SIM_LOT = float(os.getenv("MOMENTUM_LIMIT_SIM_LOT", "5.0"))
 LIMIT_SIM_SIDE = os.getenv("MOMENTUM_LIMIT_SIM_SIDE", "Up")
+LIMIT_SIM_SETTLE_SECS = float(os.getenv("MOMENTUM_LIMIT_SIM_SETTLE", "10"))  # skip first N seconds after market open
 
 # ---------------------------------------------------------------------------
 # Per-interval entry price brackets (data-driven from bracket analysis)
@@ -1521,6 +1522,17 @@ class MomentumEngine:
                         print(f"[LIMIT-SIM] {coin.upper()} skip: end_date parse error {_e}", flush=True)
                     continue
                 if mins_left <= 0 or mins_left > 6:
+                    continue
+
+                # Settle delay: skip entries in first N seconds after market open.
+                # 5m markets have 5.0 min at open, so `mins_left > 5.0 - settle/60`
+                # means we're still in the settle window where WS prices spike to
+                # stale 99¢ values before real order book settles.
+                _interval_mins = 5.0 if market.get("interval") == "5m" else 15.0
+                _settle_floor = _interval_mins - (LIMIT_SIM_SETTLE_SECS / 60.0)
+                if mins_left > _settle_floor:
+                    if self.scans_completed % 60 == 1:
+                        print(f"[LIMIT-SIM] {coin.upper()} settling ({mins_left:.2f}m left, need ≤{_settle_floor:.2f}m)", flush=True)
                     continue
 
                 token_ids = market.get("token_ids", [])
