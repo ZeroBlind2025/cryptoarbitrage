@@ -1485,9 +1485,15 @@ class MomentumEngine:
                 fill_price = None
                 fill_token_id = None
                 fill_outcome = None
+                _up_price = None
+                _down_price = None
                 for _idx in (0, 1):
                     _tid = token_ids[_idx]
                     _lp = self.get_live_price(_tid)
+                    if _idx == 0:
+                        _up_price = _lp
+                    else:
+                        _down_price = _lp
                     if _lp is None:
                         continue
                     if _lp >= LIMIT_SIM_PRICE:
@@ -1498,8 +1504,14 @@ class MomentumEngine:
                         break
 
                 if fill_side_idx is None:
-                    # No side has crossed threshold — skip this market entirely.
-                    # Do NOT fall through to normal momentum (would enter at live price).
+                    # No side crossed threshold — log periodically so we can see
+                    # what prices markets are hovering at vs our threshold.
+                    if self.scans_completed % 60 == 1:
+                        _up_str = f"{_up_price*100:.0f}¢" if _up_price is not None else "?"
+                        _down_str = f"{_down_price*100:.0f}¢" if _down_price is not None else "?"
+                        print(f"[LIMIT-SIM] {coin.upper()}_{market.get('interval','?')} "
+                              f"Up={_up_str} Down={_down_str} "
+                              f"(need >={LIMIT_SIM_PRICE*100:.0f}¢, {mins_left:.1f}m left)", flush=True)
                     continue
 
                 # Simulate limit fill at the threshold price (not live price)
