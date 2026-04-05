@@ -139,9 +139,10 @@ MARTINGALE_MAX_LOT = float(os.getenv("MOMENTUM_MARTINGALE_MAX_LOT", "256.0"))  #
 MARTINGALE_SIDE = os.getenv("MOMENTUM_MARTINGALE_SIDE", "Up")  # which side to bet
 MARTINGALE_MAX_ENTRY = float(os.getenv("MOMENTUM_MARTINGALE_MAX_ENTRY", "0.50"))  # max entry price after a loss
 MARTINGALE_LIMIT_PRICE = float(os.getenv("MOMENTUM_MARTINGALE_PRICE", "0.475"))  # fixed limit price for GTC orders
-MARTINGALE_BREAK = os.getenv("MOMENTUM_MARTINGALE_BREAK", "true").lower() == "true"  # cooldown after 3 consecutive losses
+MARTINGALE_BREAK = os.getenv("MOMENTUM_MARTINGALE_BREAK", "true").lower() == "true"  # cooldown after N consecutive losses
 MARTINGALE_BREAK_LOSSES = int(os.getenv("MOMENTUM_MARTINGALE_BREAK_LOSSES", "3"))  # losses before cooldown
 MARTINGALE_BREAK_MINS = int(os.getenv("MOMENTUM_MARTINGALE_BREAK_MINS", "30"))  # cooldown duration in minutes
+MARTINGALE_LOSS_RESET = int(os.getenv("MOMENTUM_MARTINGALE_LOSS_RESET", "4"))  # after N losses, reset lot to base (cut losses, start over)
 
 # Minimum minutes before market close to allow entry.
 # Prevents placing trades after (or right at) the close time.
@@ -2653,18 +2654,29 @@ class MomentumEngine:
                         mg["cooldown_until"] = 0
                         print(f"[MARTINGALE] {_mg_coin.upper()} WIN — reset lot ${old_lot:.2f} → ${MARTINGALE_BASE_LOT:.2f}", flush=True)
                     elif won is False:
-                        # LOSS: double the lot, guard at MARTINGALE_MAX_ENTRY
+                        # LOSS: increment streak first
                         old_lot = mg["lot"]
-                        mg["lot"] = min(old_lot * 2, MARTINGALE_MAX_LOT)
-                        mg["max_price"] = MARTINGALE_MAX_ENTRY
                         mg["streak"] += 1
-                        print(f"[MARTINGALE] {_mg_coin.upper()} LOSS — double lot ${old_lot:.2f} → ${mg['lot']:.2f} "
-                              f"(streak={mg['streak']}, guard ≤{MARTINGALE_MAX_ENTRY*100:.0f}¢)", flush=True)
-                        # Initiate cooldown after N consecutive losses
-                        if MARTINGALE_BREAK and mg["streak"] >= MARTINGALE_BREAK_LOSSES:
-                            mg["cooldown_until"] = time.time() + MARTINGALE_BREAK_MINS * 60
-                            print(f"[MARTINGALE] {_mg_coin.upper()} BREAK — {mg['streak']} losses, "
-                                  f"cooling down for {MARTINGALE_BREAK_MINS}min", flush=True)
+
+                        # Cut losses: after MARTINGALE_LOSS_RESET losses, reset to base lot
+                        if MARTINGALE_LOSS_RESET > 0 and mg["streak"] >= MARTINGALE_LOSS_RESET:
+                            mg["lot"] = MARTINGALE_BASE_LOT
+                            mg["max_price"] = 1.0
+                            mg["streak"] = 0
+                            mg["cooldown_until"] = 0
+                            print(f"[MARTINGALE] {_mg_coin.upper()} LOSS #{MARTINGALE_LOSS_RESET} — "
+                                  f"CUT LOSSES, reset lot ${old_lot:.2f} → ${MARTINGALE_BASE_LOT:.2f}", flush=True)
+                        else:
+                            # Double the lot, guard at MARTINGALE_MAX_ENTRY
+                            mg["lot"] = min(old_lot * 2, MARTINGALE_MAX_LOT)
+                            mg["max_price"] = MARTINGALE_MAX_ENTRY
+                            print(f"[MARTINGALE] {_mg_coin.upper()} LOSS — double lot ${old_lot:.2f} → ${mg['lot']:.2f} "
+                                  f"(streak={mg['streak']}, guard ≤{MARTINGALE_MAX_ENTRY*100:.0f}¢)", flush=True)
+                            # Initiate cooldown after N consecutive losses
+                            if MARTINGALE_BREAK and mg["streak"] >= MARTINGALE_BREAK_LOSSES:
+                                mg["cooldown_until"] = time.time() + MARTINGALE_BREAK_MINS * 60
+                                print(f"[MARTINGALE] {_mg_coin.upper()} BREAK — {mg['streak']} losses, "
+                                      f"cooling down for {MARTINGALE_BREAK_MINS}min", flush=True)
 
             if self.on_resolution:
                 try:
