@@ -1414,6 +1414,17 @@ class MomentumEngine:
                 prices_raw = m.get("prices", [])
                 if len(prices_raw) == 2 and prices_raw[0] in (0.0, 1.0) and prices_raw[1] in (0.0, 1.0):
                     continue
+                # Compute minutes left so closed markets are clearly labelled
+                _ml = None
+                _ed = m.get("end_date")
+                if _ed is not None:
+                    try:
+                        if isinstance(_ed, str):
+                            _ed = datetime.fromisoformat(_ed.replace("Z", "+00:00"))
+                        _ml = (_ed - datetime.now(timezone.utc)).total_seconds() / 60
+                    except Exception:
+                        pass
+                _ml_label = f"{_ml:.1f}m" if _ml is not None and _ml > 0 else "CLOSED"
                 for oi in range(min(2, len(m.get("token_ids", [])))):
                     tid = m["token_ids"][oi]
                     lp = self.get_live_price(tid)
@@ -1425,7 +1436,7 @@ class MomentumEngine:
                         gp_str = f" gamma={gp*100:.1f}¢" if gp is not None else ""
                         price_lines.append(
                             f"  {m['coin'].upper()}_{m['interval']} {outcome}: "
-                            f"{p*100:.1f}¢ ({src}){gp_str}"
+                            f"{p*100:.1f}¢ ({src}) [{_ml_label}]{gp_str}"
                         )
             if price_lines:
                 print(f"[MOMENTUM] Prices >60¢ ({len(price_lines)}):", flush=True)
