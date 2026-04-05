@@ -103,7 +103,21 @@ class CLOBWebSocket:
         return elapsed > self.STALE_TIMEOUT
 
     def force_reconnect(self):
-        """Force close and reconnect the WebSocket."""
+        """Force close and reconnect the WebSocket.
+
+        Rate-limited: only one force reconnect per STALE_TIMEOUT seconds
+        to avoid spamming reconnects while the connection is re-establishing.
+        """
+        now = datetime.now()
+        last_force = getattr(self, "_last_force_reconnect", None)
+        if last_force is not None:
+            elapsed = (now - last_force).total_seconds()
+            if elapsed < self.STALE_TIMEOUT:
+                return  # cooldown — reconnect still in progress
+        self._last_force_reconnect = now
+        # Reset last_message_time so is_stale() won't fire again until reconnect
+        # either succeeds (real message resets it) or STALE_TIMEOUT passes again
+        self.last_message_time = now
         print(f"[CLOB WS] Force reconnect triggered (stale for >{self.STALE_TIMEOUT}s)", flush=True)
         if self.ws:
             try:
