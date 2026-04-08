@@ -869,6 +869,10 @@ class MomentumEngine:
         self.min_entry_price = MIN_ENTRY_PRICE
         self.max_entry_price = MAX_ENTRY_PRICE
         self.max_entries_per_market = MAX_ENTRIES_PER_MARKET
+
+        # Limit sim runtime-adjustable settings (env var sets default, dashboard can change)
+        self.limit_sim_lot = LIMIT_SIM_LOT
+        self.limit_sim_price = LIMIT_SIM_PRICE
         self.interval_price_brackets = dict(INTERVAL_PRICE_BRACKETS)
 
         # Track entered markets: (condition_id, token_id) → last_buy_price
@@ -1680,7 +1684,7 @@ class MomentumEngine:
                     _status = ""
                 _open_5m.append(f"{m['coin'].upper()} U={_up_s} D={_dn_s} {_ml:.1f}m{_status}")
             if _open_5m:
-                print(f"[LIMIT-SIM] Watching {len(_open_5m)} open 5m markets (threshold {LIMIT_SIM_PRICE*100:.0f}¢):", flush=True)
+                print(f"[LIMIT-SIM] Watching {len(_open_5m)} open 5m markets (threshold {self.limit_sim_price*100:.0f}¢ ${self.limit_sim_lot:.2f}/side):", flush=True)
                 for _line in _open_5m:
                     print(f"  {_line}", flush=True)
             else:
@@ -1748,8 +1752,8 @@ class MomentumEngine:
                 up_tid, down_tid = token_ids[0], token_ids[1]
                 up_outcome, down_outcome = outcomes[0], outcomes[1]
                 title = (question or slug)[:50]
-                limit_price = LIMIT_SIM_PRICE
-                trade_amount = LIMIT_SIM_LOT
+                limit_price = self.limit_sim_price
+                trade_amount = self.limit_sim_lot
 
                 # --- Place orders (dry run = virtual, live = real GTC post-only) ---
                 up_order_id = None
@@ -2947,6 +2951,10 @@ class MomentumEngine:
             "coin_bet_amounts": {k: v for k, v in self.coin_bet_amounts.items()},
             "paused_coins": list(self.paused_coins),
             "dry_run": self.dry_run,
+            "limit_sim_enabled": LIMIT_SIM_ENABLED,
+            "limit_sim_lot": self.limit_sim_lot,
+            "limit_sim_price": self.limit_sim_price,
+            "limit_sim_pending": len(self._limit_sim_pending),
             "active_entries": {
                 f"{cid[:12]}..._t{tid[-8:]}": f"{price*100:.1f}¢"
                 for (cid, tid), price in self.entered_markets.items()

@@ -2209,6 +2209,18 @@ def api_momentum_settings():
         momentum_engine.bet_amount = float(data['bet_amount'])
         changes.append(f"bet_amount: ${old:.2f} -> ${momentum_engine.bet_amount:.2f}")
 
+    if 'limit_sim_lot' in data:
+        old = getattr(momentum_engine, 'limit_sim_lot', None)
+        new_val = float(data['limit_sim_lot'])
+        momentum_engine.limit_sim_lot = new_val
+        changes.append(f"limit_sim_lot: ${old or 0:.2f} -> ${new_val:.2f}")
+
+    if 'limit_sim_price' in data:
+        old = getattr(momentum_engine, 'limit_sim_price', None)
+        new_val = float(data['limit_sim_price'])
+        momentum_engine.limit_sim_price = new_val
+        changes.append(f"limit_sim_price: {(old or 0)*100:.0f}¢ -> {new_val*100:.0f}¢")
+
     if 'coin_bet_amounts' in data:
         for coin, amt in data['coin_bet_amounts'].items():
             old = momentum_engine.coin_bet_amounts.get(coin, momentum_engine.bet_amount)
