@@ -1776,43 +1776,41 @@ class MomentumEngine:
                               f"${trade_amount:.2f}/side", flush=True)
                         print(f"           Market: {title}", flush=True)
 
-                        # Place Up side
-                        up_args = OrderArgs(
-                            token_id=up_tid,
-                            price=round(limit_price, 2),
-                            size=shares,
-                            side=BUY,
-                        )
-                        up_signed = self.client.create_order(
-                            up_args, options=PartialCreateOrderOptions(tick_size="0.01")
-                        )
-                        up_result = self.client.post_order(up_signed, OrderType.GTC, post_only=True)
-                        if isinstance(up_result, dict):
-                            _s = up_result.get("status", "").lower()
-                            if _s not in ("rejected", "failed"):
-                                up_order_id = up_result.get("orderID") or up_result.get("id", "")
-                                print(f"           Up order: id={up_order_id[:16]} status={_s}", flush=True)
-                            else:
-                                print(f"           Up REJECTED: {up_result}", flush=True)
+                        # Only place each side if our limit is BELOW the current ask
+                        # (so the order rests on the book as maker, not crosses).
+                        # If the ask is already below our limit, skip that side —
+                        # the pending fill checker will pick it up later when
+                        # the price actually crosses from below.
+                        for _side_label, _tid, _oid_attr in [
+                            ("Up", up_tid, "up"),
+                            ("Down", down_tid, "down"),
+                        ]:
+                            _live_ask = self.get_live_price(_tid)
+                            if _live_ask is not None and _live_ask <= limit_price:
+                                print(f"           {_side_label}: ask {_live_ask*100:.0f}¢ <= {limit_price*100:.0f}¢ — SKIP (would cross)", flush=True)
+                                continue
 
-                        # Place Down side
-                        down_args = OrderArgs(
-                            token_id=down_tid,
-                            price=round(limit_price, 2),
-                            size=shares,
-                            side=BUY,
-                        )
-                        down_signed = self.client.create_order(
-                            down_args, options=PartialCreateOrderOptions(tick_size="0.01")
-                        )
-                        down_result = self.client.post_order(down_signed, OrderType.GTC, post_only=True)
-                        if isinstance(down_result, dict):
-                            _s = down_result.get("status", "").lower()
-                            if _s not in ("rejected", "failed"):
-                                down_order_id = down_result.get("orderID") or down_result.get("id", "")
-                                print(f"           Down order: id={down_order_id[:16]} status={_s}", flush=True)
-                            else:
-                                print(f"           Down REJECTED: {down_result}", flush=True)
+                            _args = OrderArgs(
+                                token_id=_tid,
+                                price=round(limit_price, 2),
+                                size=shares,
+                                side=BUY,
+                            )
+                            _signed = self.client.create_order(
+                                _args, options=PartialCreateOrderOptions(tick_size="0.01")
+                            )
+                            _result = self.client.post_order(_signed, OrderType.GTC, post_only=True)
+                            if isinstance(_result, dict):
+                                _s = _result.get("status", "").lower()
+                                if _s not in ("rejected", "failed"):
+                                    _oid = _result.get("orderID") or _result.get("id", "")
+                                    if _side_label == "Up":
+                                        up_order_id = _oid
+                                    else:
+                                        down_order_id = _oid
+                                    print(f"           {_side_label} order: id={_oid[:16]} status={_s}", flush=True)
+                                else:
+                                    print(f"           {_side_label} REJECTED: {_result}", flush=True)
                     except Exception as _e:
                         print(f"[LIMIT-SIM] Order placement error for {coin.upper()}: {_e}", flush=True)
 
