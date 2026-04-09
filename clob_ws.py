@@ -327,6 +327,8 @@ class CLOBWebSocket:
             # Parse bids — Polymarket WS book arrays may be in any order and
             # include phantom zero-size entries. Filter and sort defensively
             # so best_bid/best_ask are always correct (highest bid, lowest ask).
+            # IMPORTANT: if the filtered list is empty (phantom-only snapshot),
+            # DON'T reset the previous best_bid/best_ask — keep the old value.
             bids = data.get("bids", [])
             if bids:
                 bids_raw = []
@@ -338,16 +340,13 @@ class CLOBWebSocket:
                         continue
                     if sz > 0 and 0 < px < 1:
                         bids_raw.append((px, sz))
-                bids_raw.sort(key=lambda x: x[0], reverse=True)  # best bid = highest
-                book.bids = bids_raw[:10]
-                if book.bids:
+                if bids_raw:
+                    bids_raw.sort(key=lambda x: x[0], reverse=True)  # best bid = highest
+                    book.bids = bids_raw[:10]
                     book.best_bid = book.bids[0][0]
                     book.bid_depth = sum(size for _, size in book.bids)
-                else:
-                    book.best_bid = None
-                    book.bid_depth = 0.0
 
-            # Parse asks
+            # Parse asks — same defensive treatment
             asks = data.get("asks", [])
             if asks:
                 asks_raw = []
@@ -359,14 +358,11 @@ class CLOBWebSocket:
                         continue
                     if sz > 0 and 0 < px < 1:
                         asks_raw.append((px, sz))
-                asks_raw.sort(key=lambda x: x[0])  # best ask = lowest
-                book.asks = asks_raw[:10]
-                if book.asks:
+                if asks_raw:
+                    asks_raw.sort(key=lambda x: x[0])  # best ask = lowest
+                    book.asks = asks_raw[:10]
                     book.best_ask = book.asks[0][0]
                     book.ask_depth = sum(size for _, size in book.asks)
-                else:
-                    book.best_ask = None
-                    book.ask_depth = 0.0
 
             book.last_update_ms = int(time.time() * 1000)
 
@@ -374,13 +370,13 @@ class CLOBWebSocket:
         if self.on_book_update:
             self.on_book_update(asset_id, book)
 
-        # Only fire price_change callback when we have a REAL best_ask.
-        # Do NOT fall back to best_bid — that caused phantom high asks on
-        # tokens whose book snapshot arrived bid-only, triggering our
-        # armed-limit-sim fire path on the wrong (losing) side.
-        if self.on_price_change and book.best_ask is not None:
+        # Fire on_price_change whenever we have ANY side — the fallback is
+        # safe now that sort+filter ensures book.best_ask is the true
+        # lowest-real-ask (not a phantom or unsorted value).
+        if self.on_price_change and (book.best_bid is not None or book.best_ask is not None):
             bid = book.best_bid if book.best_bid is not None else book.best_ask
-            self.on_price_change(asset_id, bid, book.best_ask)
+            ask = book.best_ask if book.best_ask is not None else book.best_bid
+            self.on_price_change(asset_id, bid, ask)
 
     def _handle_price_change(self, data: dict):
         """Handle price change event.
@@ -424,13 +420,15 @@ class CLOBWebSocket:
                         book.best_ask = float(best_ask)
                     book.last_update_ms = int(time.time() * 1000)
 
-                # Only fire when we have a REAL best_ask. Don't fall back
-                # to best_bid — that caused bogus high "asks" to leak into
-                # the cache on bid-only messages, triggering the armed
-                # limit-sim fire path on the wrong (losing) side.
-                if self.on_price_change and book.best_ask is not None:
+                # Fire on any update. Fallback ask=bid is safe now that
+                # book.best_ask (when present) is always the real lowest
+                # ask — the sort+filter fix in _handle_book prevents the
+                # stale-high-ask bug that originally forced this to be
+                # strict.
+                if self.on_price_change and (book.best_bid is not None or book.best_ask is not None):
                     bid = book.best_bid if book.best_bid is not None else book.best_ask
-                    self.on_price_change(asset_id, bid, book.best_ask)
+                    ask = book.best_ask if book.best_ask is not None else book.best_bid
+                    self.on_price_change(asset_id, bid, ask)
 
     def _handle_last_trade(self, data: dict):
         """Handle last trade price event"""

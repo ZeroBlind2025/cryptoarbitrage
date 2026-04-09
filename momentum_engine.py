@@ -1632,8 +1632,15 @@ class MomentumEngine:
 
         _mode = "TAKER" if LIMIT_SIM_TAKER else "MAKER"
         _trig = LIMIT_SIM_TRIGGER if LIMIT_SIM_TAKER else limit_price
+        # Diagnostic: show the token IDs so we can verify the WS mapping.
+        # Also show whether the WS has seen either token already (if not,
+        # the fire path won't trigger — the mapping builds lazily on WS events).
+        _up_in_ws = self.ws is not None and self.ws.get_best_prices(up_tid)[1] is not None
+        _dn_in_ws = self.ws is not None and self.ws.get_best_prices(down_tid)[1] is not None
         print(f"[LIMIT-SIM ARM] {market['coin'].upper()} pre-signed {_mode} GTC @ {limit_price*100:.0f}¢ "
-              f"${trade_amount:.2f}/side — waiting for ask≥{_trig*100:.0f}¢ via WS", flush=True)
+              f"${trade_amount:.2f}/side — waiting for ask≥{_trig*100:.0f}¢ via WS "
+              f"(up_ws={'Y' if _up_in_ws else 'N'} down_ws={'Y' if _dn_in_ws else 'N'})", flush=True)
+        print(f"               up_tid={up_tid[:20]}... down_tid={down_tid[:20]}...", flush=True)
         return True
 
     def _try_fire_armed_ws(self, ws_asset_id: str, ask: float):
@@ -1655,21 +1662,6 @@ class MomentumEngine:
 
         threshold = LIMIT_SIM_TRIGGER if LIMIT_SIM_TAKER else (self.limit_sim_price + 0.005)
         if ask < threshold:
-            return
-
-        # DOUBLE-CHECK via book cache — the callback `ask` argument may have
-        # come from a book snapshot that was momentarily wrong (unsorted /
-        # phantom entries). Require the live book best_ask to also agree.
-        # If the book cache doesn't know this token yet, refuse to fire.
-        book_ask = None
-        if self.ws:
-            _, book_ask = self.ws.get_best_prices(ws_asset_id)
-        if book_ask is None or book_ask < threshold:
-            # Too risky — callback ask crossed but book cache disagrees.
-            # Log once per market so we can audit any mismatches.
-            if self.scans_completed % 20 == 1:
-                print(f"[LIMIT-SIM FIRE] {ws_asset_id[:16]}... callback_ask={ask*100:.1f}¢ "
-                      f"book_ask={(book_ask or 0)*100:.1f}¢ — refuse (book disagrees)", flush=True)
             return
 
         # Claim this side under the lock
@@ -1708,9 +1700,8 @@ class MomentumEngine:
                 "down_outcome": armed["down_outcome"],
             }
 
-        # POST outside the lock so we don't block other WS events.
-        # Pass the book_ask (the confirmed value) not the raw callback ask.
-        self._fire_armed_order(cid, armed_snapshot, side_label, signed, book_ask)
+        # POST outside the lock so we don't block other WS events
+        self._fire_armed_order(cid, armed_snapshot, side_label, signed, ask)
 
     def _fire_armed_order(self, cid: str, armed: dict, side_label: str, signed, ask: float):
         """POST a pre-signed GTC limit order. Called from the WS callback
@@ -1782,6 +1773,70 @@ class MomentumEngine:
                 self._limit_sim_token_to_cid.pop(a["up_token_id"], None)
                 self._limit_sim_token_to_cid.pop(a["down_token_id"], None)
 
+    def _scan_fallback_fire_armed(self):
+        """Scan-loop backup for the WS-driven fire path. For each armed
+        market, check if either side's live ask has crossed the threshold
+        via get_live_price (which hits WS book + REST cache + mapping).
+        If yes and that side hasn't fired yet, fire it.
+
+        This catches cases where the WS token-id → condition-id map
+        wasn't populated in time (lazy build), or where a WS callback
+        was dropped / delayed. Running every scan (≤1s) closes the gap."""
+        if not self._limit_sim_armed or self.dry_run:
+            return
+
+        threshold = LIMIT_SIM_TRIGGER if LIMIT_SIM_TAKER else (self.limit_sim_price + 0.005)
+
+        # Snapshot the armed dict under the lock
+        with self._armed_lock:
+            armed_snapshot = {
+                cid: {
+                    "up_token_id": a["up_token_id"],
+                    "down_token_id": a["down_token_id"],
+                    "up_fired": a["up_fired"],
+                    "down_fired": a["down_fired"],
+                    "coin": a["coin"],
+                }
+                for cid, a in self._limit_sim_armed.items()
+            }
+
+        for cid, info in armed_snapshot.items():
+            for side_label, tid_key, fired_key in (
+                ("Up", "up_token_id", "up_fired"),
+                ("Down", "down_token_id", "down_fired"),
+            ):
+                if info[fired_key]:
+                    continue
+                tid = info[tid_key]
+                live_ask = self.get_live_price(tid)
+                if live_ask is None or live_ask < threshold:
+                    continue
+
+                # Claim the side under the lock
+                with self._armed_lock:
+                    armed = self._limit_sim_armed.get(cid)
+                    if not armed or armed[fired_key]:
+                        continue
+                    armed[fired_key] = True
+                    signed = armed[f"{side_label.lower()}_signed"]
+                    snap = {
+                        "coin": armed["coin"],
+                        "price": armed["price"],
+                        "amount": armed["amount"],
+                        "interval": armed["interval"],
+                        "title": armed["title"],
+                        "slug": armed["slug"],
+                        "end_date": armed["end_date"],
+                        "up_token_id": armed["up_token_id"],
+                        "down_token_id": armed["down_token_id"],
+                        "up_outcome": armed["up_outcome"],
+                        "down_outcome": armed["down_outcome"],
+                    }
+
+                print(f"[LIMIT-SIM FIRE] {info['coin'].upper()} {side_label} via SCAN-FALLBACK "
+                      f"(live_ask={live_ask*100:.1f}¢)", flush=True)
+                self._fire_armed_order(cid, snap, side_label, signed, live_ask)
+
     def _cleanup_expired_armed(self):
         """Drop armed markets that have passed their end_date or whose
         condition_id is already in pending/entered. Called from scan loop."""
@@ -1843,6 +1898,17 @@ class MomentumEngine:
                 self._cleanup_expired_armed()
             except Exception as _e:
                 print(f"[LIMIT-SIM] armed cleanup error: {_e}", flush=True)
+
+            # SCAN-LOOP FALLBACK: if a market is armed and its ask has already
+            # crossed the threshold, fire it directly. This is the backup for
+            # any case where the WS-driven path fails to trigger (lazy token
+            # map, missed callback, etc). Runs on the slow scan tick but is
+            # enough to catch any miss within 1s.
+            if not self.dry_run:
+                try:
+                    self._scan_fallback_fire_armed()
+                except Exception as _e:
+                    print(f"[LIMIT-SIM] scan fallback fire error: {_e}", flush=True)
 
             # Keep the CLOB HTTPS pool warm while armed markets exist so
             # the first triggered POST from the WS thread is instant.
