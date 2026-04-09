@@ -2637,7 +2637,8 @@ class MomentumEngine:
 
             if won is True:
                 if entry_price > 0:
-                    payout = amount / entry_price
+                    # Use potential_payout (fee-adjusted shares) if available
+                    payout = position.get("potential_payout") or (amount / entry_price)
                     pnl = payout - amount
                 else:
                     pnl = amount * 3
