@@ -109,6 +109,8 @@ LIMIT_SIM_PRICE = float(os.getenv("MOMENTUM_LIMIT_SIM_PRICE", "0.75"))
 LIMIT_SIM_LOT = float(os.getenv("MOMENTUM_LIMIT_SIM_LOT", "5.0"))
 LIMIT_SIM_SIDE = os.getenv("MOMENTUM_LIMIT_SIM_SIDE", "Up")
 LIMIT_SIM_SETTLE_SECS = float(os.getenv("MOMENTUM_LIMIT_SIM_SETTLE", "10"))  # skip first N seconds after market open
+LIMIT_SIM_TAKER = os.getenv("MOMENTUM_LIMIT_SIM_TAKER", "false").lower() == "true"  # simulate as taker (pay fees, catch every market)
+LIMIT_SIM_TAKER_FEE_PCT = float(os.getenv("MOMENTUM_LIMIT_SIM_TAKER_FEE", "1.8"))  # taker fee % for crypto (1.8%)
 
 # ---------------------------------------------------------------------------
 # Per-interval entry price brackets (data-driven from bracket analysis)
@@ -958,11 +960,17 @@ class MomentumEngine:
         print("\n" + "=" * 60)
         if LIMIT_SIM_ENABLED:
             _mode = "DRY RUN" if self.dry_run else "LIVE"
+            _order_type = "TAKER (GTC)" if LIMIT_SIM_TAKER else "MAKER (post-only GTC)"
             print(f"  MOMENTUM ENGINE (LIMIT MODE — {_mode})")
-            print(f"  Places post-only GTC BUY on BOTH Up and Down @ {LIMIT_SIM_PRICE*100:.0f}¢")
-            print(f"  Lot: ${LIMIT_SIM_LOT:.2f} per side (${LIMIT_SIM_LOT*2:.2f} total per market)")
+            print(f"  Order type: {_order_type}")
+            print(f"  Limit: BUY BOTH Up and Down @ {LIMIT_SIM_PRICE*100:.0f}¢")
+            print(f"  Lot: ${LIMIT_SIM_LOT:.2f} per side")
+            if LIMIT_SIM_TAKER:
+                _fee = LIMIT_SIM_LOT * LIMIT_SIM_TAKER_FEE_PCT / 100
+                _shares = LIMIT_SIM_LOT / LIMIT_SIM_PRICE * (1 - LIMIT_SIM_TAKER_FEE_PCT / 100)
+                _profit = _shares - LIMIT_SIM_LOT
+                print(f"  Taker fee: {LIMIT_SIM_TAKER_FEE_PCT:.1f}% → {_shares:.2f} shares (fee ~${_fee:.2f}) → win profit ${_profit:.2f}")
             print(f"  Settle delay: {LIMIT_SIM_SETTLE_SECS:.0f}s after market open")
-            print(f"  On fill: cancel opposite side, position resolves on market close")
             if self.dry_run:
                 print(f"  DRY: simulates fill when WS price crosses {LIMIT_SIM_PRICE*100:.0f}¢")
         else:
@@ -1325,6 +1333,21 @@ class MomentumEngine:
                 pass
             self.ws = None
 
+    def _calc_shares(self, trade_amount: float, entry_price: float) -> float:
+        """Calculate shares acquired, accounting for taker fee if applicable.
+
+        Fee reduces the number of shares acquired (deducted at entry):
+          maker: shares = amount / price
+          taker: shares = amount / price × (1 - fee_pct/100)
+        Loss is always flat $amount regardless of fee.
+        """
+        if entry_price <= 0:
+            return 0
+        shares = trade_amount / entry_price
+        if LIMIT_SIM_TAKER and LIMIT_SIM_TAKER_FEE_PCT > 0:
+            shares *= (1 - LIMIT_SIM_TAKER_FEE_PCT / 100)
+        return round(shares, 4)
+
     def _check_limit_sim_pending(self):
         """Check pending limit sim orders for fills / expiry.
 
@@ -1452,7 +1475,8 @@ class MomentumEngine:
                     "slug": slug,
                     "entry_price": entry_price,
                     "amount": trade_amount,
-                    "potential_payout": trade_amount / entry_price if entry_price > 0 else 0,
+                    "potential_payout": self._calc_shares(trade_amount, entry_price),
+                    "taker_fee_pct": LIMIT_SIM_TAKER_FEE_PCT if LIMIT_SIM_TAKER else 0,
                     "dry_run": self.dry_run,
                     "source": "momentum",
                     "interval": pend.get("interval", "5m"),
@@ -1786,9 +1810,15 @@ class MomentumEngine:
                             ("Down", down_tid, "down"),
                         ]:
                             _live_ask = self.get_live_price(_tid)
-                            if _live_ask is not None and _live_ask <= limit_price:
-                                print(f"           {_side_label}: ask {_live_ask*100:.0f}¢ <= {limit_price*100:.0f}¢ — SKIP (would cross)", flush=True)
-                                continue
+                            # In maker mode: skip sides where our limit would cross the book
+                            # In taker mode: skip sides where price is BELOW threshold (no signal yet)
+                            if LIMIT_SIM_TAKER:
+                                if _live_ask is None or _live_ask < limit_price:
+                                    continue  # taker: only place when price >= threshold
+                            else:
+                                if _live_ask is not None and _live_ask <= limit_price:
+                                    print(f"           {_side_label}: ask {_live_ask*100:.0f}¢ <= {limit_price*100:.0f}¢ — SKIP (would cross)", flush=True)
+                                    continue
 
                             _args = OrderArgs(
                                 token_id=_tid,
@@ -1799,7 +1829,8 @@ class MomentumEngine:
                             _signed = self.client.create_order(
                                 _args, options=PartialCreateOrderOptions(tick_size="0.01")
                             )
-                            _result = self.client.post_order(_signed, OrderType.GTC, post_only=True)
+                            _use_post_only = not LIMIT_SIM_TAKER
+                            _result = self.client.post_order(_signed, OrderType.GTC, post_only=_use_post_only)
                             if isinstance(_result, dict):
                                 _s = _result.get("status", "").lower()
                                 if _s not in ("rejected", "failed"):
