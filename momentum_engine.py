@@ -1657,6 +1657,21 @@ class MomentumEngine:
         if ask < threshold:
             return
 
+        # DOUBLE-CHECK via book cache — the callback `ask` argument may have
+        # come from a book snapshot that was momentarily wrong (unsorted /
+        # phantom entries). Require the live book best_ask to also agree.
+        # If the book cache doesn't know this token yet, refuse to fire.
+        book_ask = None
+        if self.ws:
+            _, book_ask = self.ws.get_best_prices(ws_asset_id)
+        if book_ask is None or book_ask < threshold:
+            # Too risky — callback ask crossed but book cache disagrees.
+            # Log once per market so we can audit any mismatches.
+            if self.scans_completed % 20 == 1:
+                print(f"[LIMIT-SIM FIRE] {ws_asset_id[:16]}... callback_ask={ask*100:.1f}¢ "
+                      f"book_ask={(book_ask or 0)*100:.1f}¢ — refuse (book disagrees)", flush=True)
+            return
+
         # Claim this side under the lock
         with self._armed_lock:
             armed = self._limit_sim_armed.get(cid)
@@ -1693,8 +1708,9 @@ class MomentumEngine:
                 "down_outcome": armed["down_outcome"],
             }
 
-        # POST outside the lock so we don't block other WS events
-        self._fire_armed_order(cid, armed_snapshot, side_label, signed, ask)
+        # POST outside the lock so we don't block other WS events.
+        # Pass the book_ask (the confirmed value) not the raw callback ask.
+        self._fire_armed_order(cid, armed_snapshot, side_label, signed, book_ask)
 
     def _fire_armed_order(self, cid: str, armed: dict, side_label: str, signed, ask: float):
         """POST a pre-signed GTC limit order. Called from the WS callback

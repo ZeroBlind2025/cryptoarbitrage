@@ -324,21 +324,49 @@ class CLOBWebSocket:
                 book = OrderBookState(token_id=asset_id)
                 self._books[asset_id] = book
 
-            # Parse bids
+            # Parse bids — Polymarket WS book arrays may be in any order and
+            # include phantom zero-size entries. Filter and sort defensively
+            # so best_bid/best_ask are always correct (highest bid, lowest ask).
             bids = data.get("bids", [])
             if bids:
-                book.bids = [(float(b.get("price", 0)), float(b.get("size", 0))) for b in bids[:10]]
+                bids_raw = []
+                for b in bids:
+                    try:
+                        px = float(b.get("price", 0))
+                        sz = float(b.get("size", 0))
+                    except (TypeError, ValueError):
+                        continue
+                    if sz > 0 and 0 < px < 1:
+                        bids_raw.append((px, sz))
+                bids_raw.sort(key=lambda x: x[0], reverse=True)  # best bid = highest
+                book.bids = bids_raw[:10]
                 if book.bids:
                     book.best_bid = book.bids[0][0]
                     book.bid_depth = sum(size for _, size in book.bids)
+                else:
+                    book.best_bid = None
+                    book.bid_depth = 0.0
 
             # Parse asks
             asks = data.get("asks", [])
             if asks:
-                book.asks = [(float(a.get("price", 0)), float(a.get("size", 0))) for a in asks[:10]]
+                asks_raw = []
+                for a in asks:
+                    try:
+                        px = float(a.get("price", 0))
+                        sz = float(a.get("size", 0))
+                    except (TypeError, ValueError):
+                        continue
+                    if sz > 0 and 0 < px < 1:
+                        asks_raw.append((px, sz))
+                asks_raw.sort(key=lambda x: x[0])  # best ask = lowest
+                book.asks = asks_raw[:10]
                 if book.asks:
                     book.best_ask = book.asks[0][0]
                     book.ask_depth = sum(size for _, size in book.asks)
+                else:
+                    book.best_ask = None
+                    book.ask_depth = 0.0
 
             book.last_update_ms = int(time.time() * 1000)
 
@@ -346,10 +374,13 @@ class CLOBWebSocket:
         if self.on_book_update:
             self.on_book_update(asset_id, book)
 
-        if self.on_price_change and (book.best_bid or book.best_ask):
-            bid = book.best_bid or book.best_ask
-            ask = book.best_ask or book.best_bid
-            self.on_price_change(asset_id, bid, ask)
+        # Only fire price_change callback when we have a REAL best_ask.
+        # Do NOT fall back to best_bid — that caused phantom high asks on
+        # tokens whose book snapshot arrived bid-only, triggering our
+        # armed-limit-sim fire path on the wrong (losing) side.
+        if self.on_price_change and book.best_ask is not None:
+            bid = book.best_bid if book.best_bid is not None else book.best_ask
+            self.on_price_change(asset_id, bid, book.best_ask)
 
     def _handle_price_change(self, data: dict):
         """Handle price change event.
@@ -393,12 +424,13 @@ class CLOBWebSocket:
                         book.best_ask = float(best_ask)
                     book.last_update_ms = int(time.time() * 1000)
 
-                # Fire callback — use best_bid as fallback if best_ask is
-                # not yet known (some messages only carry one side)
-                if self.on_price_change and (book.best_bid or book.best_ask):
-                    bid = book.best_bid or book.best_ask
-                    ask = book.best_ask or book.best_bid
-                    self.on_price_change(asset_id, bid, ask)
+                # Only fire when we have a REAL best_ask. Don't fall back
+                # to best_bid — that caused bogus high "asks" to leak into
+                # the cache on bid-only messages, triggering the armed
+                # limit-sim fire path on the wrong (losing) side.
+                if self.on_price_change and book.best_ask is not None:
+                    bid = book.best_bid if book.best_bid is not None else book.best_ask
+                    self.on_price_change(asset_id, bid, book.best_ask)
 
     def _handle_last_trade(self, data: dict):
         """Handle last trade price event"""
