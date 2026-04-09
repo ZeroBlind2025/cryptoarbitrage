@@ -1810,15 +1810,17 @@ class MomentumEngine:
                             ("Down", down_tid, "down"),
                         ]:
                             _live_ask = self.get_live_price(_tid)
-                            # In maker mode: skip sides where our limit would cross the book
-                            # In taker mode: skip sides where price is BELOW threshold (no signal yet)
-                            if LIMIT_SIM_TAKER:
-                                if _live_ask is None or _live_ask < limit_price:
-                                    continue  # taker: only place when price >= threshold
-                            else:
+                            # Maker mode: skip sides where our limit would cross the book (post_only rejects)
+                            # Taker mode: place GTC @ 75¢ immediately at market open. Order will either:
+                            #   - Match at current ask if ask <= 75¢ (taker fill, possibly better price)
+                            #   - Rest on book at 75¢ if ask > 75¢ (waits for a seller to cross)
+                            if not LIMIT_SIM_TAKER:
                                 if _live_ask is not None and _live_ask <= limit_price:
                                     print(f"           {_side_label}: ask {_live_ask*100:.0f}¢ <= {limit_price*100:.0f}¢ — SKIP (would cross)", flush=True)
                                     continue
+                            else:
+                                _ask_str = f"{_live_ask*100:.0f}¢" if _live_ask is not None else "?"
+                                print(f"           {_side_label}: placing GTC @ {limit_price*100:.0f}¢ (live ask {_ask_str})", flush=True)
 
                             _args = OrderArgs(
                                 token_id=_tid,
