@@ -898,6 +898,23 @@ class MomentumEngine:
         #    "end_date", "placed_at",
         # }}
         self._limit_sim_pending: dict = {}
+        # Limit sim ARMED orders (pre-signed, waiting for WS trigger to fire).
+        # Armed at settle time so placement is a fire-and-forget POST from the
+        # WS callback thread — no poll delay, no signing cost.
+        # {condition_id: {
+        #    "up_signed", "down_signed",  # pre-signed SignedOrder objects
+        #    "up_token_id", "down_token_id",
+        #    "up_outcome", "down_outcome",
+        #    "up_fired", "down_fired",  # bool — has this side been POSTed yet
+        #    "coin", "interval", "title", "slug",
+        #    "end_date", "price", "amount", "armed_at",
+        # }}
+        self._limit_sim_armed: dict = {}
+        # Fast lookup: token_id → condition_id, used by WS callback
+        self._limit_sim_token_to_cid: dict[str, str] = {}
+        # Guards _limit_sim_armed, _limit_sim_token_to_cid, and _limit_sim_pending
+        # from concurrent access by the scan-loop thread and the WS callback thread.
+        self._armed_lock = threading.Lock()
         self.hedged_markets: set = set()  # condition_ids already arb-hedged
         self.last_trade_time: dict = {}  # (condition_id, token_id) → epoch timestamp
 
@@ -1015,6 +1032,10 @@ class MomentumEngine:
             if not self.client:
                 print("[MOMENTUM] Failed to init client. Running in dry-run mode.", flush=True)
                 self.dry_run = True
+            elif LIMIT_SIM_ENABLED:
+                # Pre-warm TLS / connection pool so the first triggered POST
+                # doesn't pay the ~100ms handshake cost.
+                self._prewarm_clob_session()
 
         self._start_ws()
 
@@ -1046,6 +1067,14 @@ class MomentumEngine:
     def _on_ws_price(self, ws_asset_id: str, bid: float, ask: float):
         """Handle WS price update — cache it and try to map to our markets."""
         self._ws_price_cache[ws_asset_id] = ask
+
+        # Low-latency path: if an armed limit-sim market's trigger just hit,
+        # fire the pre-signed order from this WS thread (no poll wait, no sign cost).
+        if LIMIT_SIM_ENABLED and not self.dry_run:
+            try:
+                self._try_fire_armed_ws(ws_asset_id, ask)
+            except Exception as _e:
+                print(f"[LIMIT-SIM FIRE] WS trigger error: {_e}", flush=True)
 
         # Try to build the bidirectional map if not yet mapped
         if ws_asset_id not in self._ws_to_market_token:
@@ -1537,6 +1566,247 @@ class MomentumEngine:
         for cid in to_remove:
             self._limit_sim_pending.pop(cid, None)
 
+    # ------------------------------------------------------------------
+    # Limit sim: pre-sign + WS-driven firing (low-latency placement path)
+    # ------------------------------------------------------------------
+    def _prebuild_limit_sim_armed(self, market: dict) -> bool:
+        """Pre-sign both Up and Down GTC orders and arm the market for
+        WS-driven firing. Returns True if successfully armed.
+
+        The signed orders are stored in memory and POSTed later from the
+        WS callback thread when the trigger price is crossed, eliminating
+        both scan-loop lag (~500ms avg) and signing cost (~100-200ms/side).
+        """
+        if not self.client or self.dry_run:
+            return False
+
+        condition_id = market["condition_id"]
+        token_ids = market.get("token_ids", [])
+        outcomes = market.get("outcomes", [])
+        if len(token_ids) < 2 or len(outcomes) < 2:
+            return False
+
+        try:
+            from py_clob_client.clob_types import OrderArgs, PartialCreateOrderOptions
+            from py_clob_client.order_builder.constants import BUY
+            import math
+
+            limit_price = self.limit_sim_price
+            trade_amount = self.limit_sim_lot
+            shares = math.floor((trade_amount / limit_price) * 100) / 100
+            up_tid, down_tid = token_ids[0], token_ids[1]
+
+            up_signed = self.client.create_order(
+                OrderArgs(token_id=up_tid, price=round(limit_price, 2), size=shares, side=BUY),
+                options=PartialCreateOrderOptions(tick_size="0.01"),
+            )
+            down_signed = self.client.create_order(
+                OrderArgs(token_id=down_tid, price=round(limit_price, 2), size=shares, side=BUY),
+                options=PartialCreateOrderOptions(tick_size="0.01"),
+            )
+        except Exception as _e:
+            print(f"[LIMIT-SIM ARM] {market['coin'].upper()} pre-sign failed: {_e}", flush=True)
+            return False
+
+        with self._armed_lock:
+            self._limit_sim_armed[condition_id] = {
+                "up_signed": up_signed,
+                "down_signed": down_signed,
+                "up_token_id": up_tid,
+                "down_token_id": down_tid,
+                "up_outcome": outcomes[0],
+                "down_outcome": outcomes[1],
+                "up_fired": False,
+                "down_fired": False,
+                "coin": market["coin"],
+                "interval": market.get("interval", "5m"),
+                "title": (market.get("question") or market.get("slug", ""))[:50],
+                "slug": market.get("slug", ""),
+                "end_date": market.get("end_date"),
+                "price": limit_price,
+                "amount": trade_amount,
+                "armed_at": time.time(),
+            }
+            self._limit_sim_token_to_cid[up_tid] = condition_id
+            self._limit_sim_token_to_cid[down_tid] = condition_id
+
+        _mode = "TAKER" if LIMIT_SIM_TAKER else "MAKER"
+        _trig = LIMIT_SIM_TRIGGER if LIMIT_SIM_TAKER else limit_price
+        print(f"[LIMIT-SIM ARM] {market['coin'].upper()} pre-signed {_mode} GTC @ {limit_price*100:.0f}¢ "
+              f"${trade_amount:.2f}/side — waiting for ask≥{_trig*100:.0f}¢ via WS", flush=True)
+        return True
+
+    def _try_fire_armed_ws(self, ws_asset_id: str, ask: float):
+        """Called from the WS callback thread. If this ws_asset_id belongs to
+        an armed market and the ask just crossed the trigger, fire the
+        pre-signed order immediately.
+
+        Threshold:
+          - Taker mode: ask >= LIMIT_SIM_TRIGGER (default 65¢)
+          - Maker mode: ask > limit_price (so post_only resting order doesn't cross)
+        """
+        if not LIMIT_SIM_ENABLED or self.dry_run:
+            return
+
+        # Fast un-locked pre-check (avoid acquiring the lock for every WS tick)
+        cid = self._limit_sim_token_to_cid.get(ws_asset_id)
+        if not cid:
+            return
+
+        threshold = LIMIT_SIM_TRIGGER if LIMIT_SIM_TAKER else (self.limit_sim_price + 0.005)
+        if ask < threshold:
+            return
+
+        # Claim this side under the lock
+        with self._armed_lock:
+            armed = self._limit_sim_armed.get(cid)
+            if not armed:
+                return
+
+            if ws_asset_id == armed["up_token_id"]:
+                if armed["up_fired"]:
+                    return
+                armed["up_fired"] = True
+                side_label = "Up"
+                signed = armed["up_signed"]
+            elif ws_asset_id == armed["down_token_id"]:
+                if armed["down_fired"]:
+                    return
+                armed["down_fired"] = True
+                side_label = "Down"
+                signed = armed["down_signed"]
+            else:
+                return
+
+            # Snapshot the metadata we need outside the lock
+            armed_snapshot = {
+                "coin": armed["coin"],
+                "price": armed["price"],
+                "amount": armed["amount"],
+                "interval": armed["interval"],
+                "title": armed["title"],
+                "slug": armed["slug"],
+                "end_date": armed["end_date"],
+                "up_token_id": armed["up_token_id"],
+                "down_token_id": armed["down_token_id"],
+                "up_outcome": armed["up_outcome"],
+                "down_outcome": armed["down_outcome"],
+            }
+
+        # POST outside the lock so we don't block other WS events
+        self._fire_armed_order(cid, armed_snapshot, side_label, signed, ask)
+
+    def _fire_armed_order(self, cid: str, armed: dict, side_label: str, signed, ask: float):
+        """POST a pre-signed GTC limit order. Called from the WS callback
+        thread. Transfers the market from armed → pending on success so
+        the existing resolution checker picks up the fill."""
+        try:
+            from py_clob_client.clob_types import OrderType
+        except ImportError:
+            print(f"[LIMIT-SIM FIRE] py_clob_client not available", flush=True)
+            return
+
+        use_post_only = not LIMIT_SIM_TAKER
+        t0 = time.time()
+        try:
+            result = self.client.post_order(signed, OrderType.GTC, post_only=use_post_only)
+        except Exception as _e:
+            dt_ms = (time.time() - t0) * 1000
+            print(f"[LIMIT-SIM FIRE] {armed['coin'].upper()} {side_label} POST error ({dt_ms:.0f}ms): {_e}", flush=True)
+            # Allow a retry on the next trigger — reset fired flag
+            with self._armed_lock:
+                a = self._limit_sim_armed.get(cid)
+                if a:
+                    a[f"{side_label.lower()}_fired"] = False
+            return
+        dt_ms = (time.time() - t0) * 1000
+
+        oid = None
+        if isinstance(result, dict):
+            status = result.get("status", "").lower()
+            if status in ("rejected", "failed"):
+                print(f"[LIMIT-SIM FIRE] {armed['coin'].upper()} {side_label} REJECTED ({dt_ms:.0f}ms): {result}", flush=True)
+                return
+            oid = result.get("orderID") or result.get("id", "")
+
+        print(f"[LIMIT-SIM FIRE] {armed['coin'].upper()} {side_label} @ {armed['price']*100:.0f}¢ "
+              f"(ask {ask*100:.1f}¢, {dt_ms:.0f}ms) id={str(oid)[:16]}", flush=True)
+
+        # Move into pending so the existing resolution checker handles it
+        with self._armed_lock:
+            pending = self._limit_sim_pending.get(cid)
+            if not pending:
+                pending = {
+                    "up_order_id": None,
+                    "down_order_id": None,
+                    "up_token_id": armed["up_token_id"],
+                    "down_token_id": armed["down_token_id"],
+                    "up_outcome": armed["up_outcome"],
+                    "down_outcome": armed["down_outcome"],
+                    "coin": armed["coin"],
+                    "interval": armed["interval"],
+                    "title": armed["title"],
+                    "slug": armed["slug"],
+                    "end_date": armed["end_date"],
+                    "placed_at": time.time(),
+                    "price": armed["price"],
+                    "amount": armed["amount"],
+                }
+                self._limit_sim_pending[cid] = pending
+
+            if side_label == "Up":
+                pending["up_order_id"] = oid
+            else:
+                pending["down_order_id"] = oid
+
+            # If both sides have fired, drop from armed & token map
+            a = self._limit_sim_armed.get(cid)
+            if a and a.get("up_fired") and a.get("down_fired"):
+                self._limit_sim_armed.pop(cid, None)
+                self._limit_sim_token_to_cid.pop(a["up_token_id"], None)
+                self._limit_sim_token_to_cid.pop(a["down_token_id"], None)
+
+    def _cleanup_expired_armed(self):
+        """Drop armed markets that have passed their end_date or whose
+        condition_id is already in pending/entered. Called from scan loop."""
+        if not self._limit_sim_armed:
+            return
+        now_utc = datetime.now(timezone.utc)
+        with self._armed_lock:
+            to_drop = []
+            for cid, a in self._limit_sim_armed.items():
+                end_date = a.get("end_date")
+                if isinstance(end_date, str):
+                    try:
+                        end_date = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
+                    except Exception:
+                        end_date = None
+                if end_date is not None and end_date <= now_utc:
+                    to_drop.append(cid)
+                elif cid in self._limit_sim_entered:
+                    to_drop.append(cid)
+            for cid in to_drop:
+                a = self._limit_sim_armed.pop(cid, None)
+                if a:
+                    self._limit_sim_token_to_cid.pop(a.get("up_token_id", ""), None)
+                    self._limit_sim_token_to_cid.pop(a.get("down_token_id", ""), None)
+            if to_drop:
+                print(f"[LIMIT-SIM ARM] Dropped {len(to_drop)} expired/resolved armed markets", flush=True)
+
+    def _prewarm_clob_session(self):
+        """Pre-warm the HTTPS connection to the CLOB API so the first live
+        POST doesn't pay the TLS handshake cost. Safe no-op on any failure."""
+        if not self.client or self.dry_run:
+            return
+        for _method in ("get_server_time", "get_ok"):
+            _fn = getattr(self.client, _method, None)
+            if callable(_fn):
+                try:
+                    _fn()
+                    return
+                except Exception:
+                    pass
+
     def scan_and_trade(self) -> int:
         """Main loop iteration: discover markets, check prices, enter trades.
 
@@ -1550,6 +1820,21 @@ class MomentumEngine:
                 self._check_limit_sim_pending()
             except Exception as _e:
                 print(f"[LIMIT-SIM] pending check error: {_e}", flush=True)
+
+        # Drop expired/resolved armed markets (pre-signed orders that never fired)
+        if LIMIT_SIM_ENABLED and self._limit_sim_armed:
+            try:
+                self._cleanup_expired_armed()
+            except Exception as _e:
+                print(f"[LIMIT-SIM] armed cleanup error: {_e}", flush=True)
+
+            # Keep the CLOB HTTPS pool warm while armed markets exist so
+            # the first triggered POST from the WS thread is instant.
+            if not self.dry_run and self.scans_completed % 30 == 0:
+                try:
+                    self._prewarm_clob_session()
+                except Exception:
+                    pass
 
         # --- WS health check: force reconnect if stale ---
         if self.ws and self.ws.is_stale():
@@ -1711,6 +1996,8 @@ class MomentumEngine:
                     _status = " [filled]"
                 elif _cid in self._limit_sim_pending:
                     _status = " [pending]"
+                elif _cid in self._limit_sim_armed:
+                    _status = " [armed]"
                 else:
                     _status = ""
                 _open_5m.append(f"{m['coin'].upper()} U={_up_s} D={_dn_s} {_ml:.1f}m{_status}")
@@ -1741,13 +2028,16 @@ class MomentumEngine:
                 continue
 
             # ============ LIMIT SIMULATION / LIVE LIMIT ORDER MODE ============
-            # Places post-only GTC limit BUY orders on BOTH Up and Down at the
-            # threshold price (default 75¢). Only one can fill since Up+Down=$1.
-            # When one fills, the other is cancelled. Dry run simulates fills
-            # by checking if the WS price crosses the threshold.
+            # Dry run: marks market as pending and simulates fills by checking
+            # if WS price crosses the threshold.
+            # Live: pre-signs BOTH Up and Down GTC orders and arms the market.
+            # The WS callback fires the POST the instant the trigger is crossed,
+            # bypassing the scan loop and signing cost entirely.
             if LIMIT_SIM_ENABLED:
-                # Already placed orders for this market
-                if condition_id in self._limit_sim_entered or condition_id in self._limit_sim_pending:
+                # Already placed, pending, or armed for this market
+                if (condition_id in self._limit_sim_entered
+                        or condition_id in self._limit_sim_pending
+                        or condition_id in self._limit_sim_armed):
                     continue
 
                 # Market must still be open
@@ -1786,100 +2076,34 @@ class MomentumEngine:
                 limit_price = self.limit_sim_price
                 trade_amount = self.limit_sim_lot
 
-                # --- Place orders (dry run = virtual, live = real GTC post-only) ---
-                up_order_id = None
-                down_order_id = None
-
                 if self.dry_run:
+                    # Dry run: no real order. Mark as pending so the resolution
+                    # checker simulates fills when WS price crosses the threshold.
                     print(f"\n[LIMIT-SIM] PLACE {coin.upper()} {up_outcome}/{down_outcome} @ {limit_price*100:.0f}¢ "
                           f"${trade_amount:.2f}/side (DRY)", flush=True)
                     print(f"           Market: {title}", flush=True)
-                    up_order_id = f"dry_up_{condition_id[:12]}"
-                    down_order_id = f"dry_down_{condition_id[:12]}"
+                    self._limit_sim_pending[condition_id] = {
+                        "up_order_id": f"dry_up_{condition_id[:12]}",
+                        "down_order_id": f"dry_down_{condition_id[:12]}",
+                        "up_token_id": up_tid,
+                        "down_token_id": down_tid,
+                        "up_outcome": up_outcome,
+                        "down_outcome": down_outcome,
+                        "coin": coin,
+                        "interval": market.get("interval", "5m"),
+                        "title": title,
+                        "slug": slug,
+                        "end_date": _end_date,
+                        "placed_at": time.time(),
+                        "price": limit_price,
+                        "amount": trade_amount,
+                    }
+                    entered += 1
                 else:
-                    try:
-                        from py_clob_client.clob_types import OrderArgs, OrderType, PartialCreateOrderOptions
-                        from py_clob_client.order_builder.constants import BUY
-                        import math
-
-                        shares = math.floor((trade_amount / limit_price) * 100) / 100
-                        print(f"\n[LIMIT-SIM] PLACE LIVE {coin.upper()} BOTH sides @ {limit_price*100:.0f}¢ "
-                              f"${trade_amount:.2f}/side", flush=True)
-                        print(f"           Market: {title}", flush=True)
-
-                        # Placement rules:
-                        #   Maker mode: only place if live ask is ABOVE our limit
-                        #     (post_only rejects orders that would cross the book).
-                        #   Taker mode: only place once live ask has crossed the
-                        #     TRIGGER price (default 65¢). Using a 65¢ trigger with
-                        #     a 75¢ order price gives the resting order time to sit
-                        #     on the book before fast momentum blows past 75¢. If we
-                        #     waited for 75¢ to trigger, momentum frequently flies
-                        #     right through and we miss the fill.
-                        for _side_label, _tid, _oid_attr in [
-                            ("Up", up_tid, "up"),
-                            ("Down", down_tid, "down"),
-                        ]:
-                            _live_ask = self.get_live_price(_tid)
-                            _ask_str = f"{_live_ask*100:.0f}¢" if _live_ask is not None else "?"
-                            if not LIMIT_SIM_TAKER:
-                                if _live_ask is not None and _live_ask <= limit_price:
-                                    print(f"           {_side_label}: ask {_ask_str} <= {limit_price*100:.0f}¢ — SKIP (would cross)", flush=True)
-                                    continue
-                            else:
-                                # Taker: wait for ask to cross the trigger before placing
-                                if _live_ask is None or _live_ask < LIMIT_SIM_TRIGGER:
-                                    if self.scans_completed % 10 == 1:
-                                        print(f"           {_side_label}: ask {_ask_str} < trigger {LIMIT_SIM_TRIGGER*100:.0f}¢ — WAIT", flush=True)
-                                    continue
-                                print(f"           {_side_label}: ask {_ask_str} ≥ trigger {LIMIT_SIM_TRIGGER*100:.0f}¢ → placing GTC @ {limit_price*100:.0f}¢", flush=True)
-
-                            _args = OrderArgs(
-                                token_id=_tid,
-                                price=round(limit_price, 2),
-                                size=shares,
-                                side=BUY,
-                            )
-                            _signed = self.client.create_order(
-                                _args, options=PartialCreateOrderOptions(tick_size="0.01")
-                            )
-                            _use_post_only = not LIMIT_SIM_TAKER
-                            _result = self.client.post_order(_signed, OrderType.GTC, post_only=_use_post_only)
-                            if isinstance(_result, dict):
-                                _s = _result.get("status", "").lower()
-                                if _s not in ("rejected", "failed"):
-                                    _oid = _result.get("orderID") or _result.get("id", "")
-                                    if _side_label == "Up":
-                                        up_order_id = _oid
-                                    else:
-                                        down_order_id = _oid
-                                    print(f"           {_side_label} order: id={_oid[:16]} status={_s}", flush=True)
-                                else:
-                                    print(f"           {_side_label} REJECTED: {_result}", flush=True)
-                    except Exception as _e:
-                        print(f"[LIMIT-SIM] Order placement error for {coin.upper()}: {_e}", flush=True)
-
-                # Require at least one order placed to track this market
-                if not up_order_id and not down_order_id:
-                    continue
-
-                self._limit_sim_pending[condition_id] = {
-                    "up_order_id": up_order_id,
-                    "down_order_id": down_order_id,
-                    "up_token_id": up_tid,
-                    "down_token_id": down_tid,
-                    "up_outcome": up_outcome,
-                    "down_outcome": down_outcome,
-                    "coin": coin,
-                    "interval": market.get("interval", "5m"),
-                    "title": title,
-                    "slug": slug,
-                    "end_date": _end_date,
-                    "placed_at": time.time(),
-                    "price": limit_price,
-                    "amount": trade_amount,
-                }
-                entered += 1
+                    # Live: pre-sign both sides & arm. The WS callback will POST
+                    # the instant the trigger is crossed.
+                    if self._prebuild_limit_sim_armed(market):
+                        entered += 1
                 continue  # skip normal momentum logic
             # ================ END LIMIT SIMULATION MODE ================
 
@@ -2999,6 +3223,7 @@ class MomentumEngine:
             "limit_sim_lot": self.limit_sim_lot,
             "limit_sim_price": self.limit_sim_price,
             "limit_sim_pending": len(self._limit_sim_pending),
+            "limit_sim_armed": len(self._limit_sim_armed),
             "active_entries": {
                 f"{cid[:12]}..._t{tid[-8:]}": f"{price*100:.1f}¢"
                 for (cid, tid), price in self.entered_markets.items()
