@@ -55,6 +55,7 @@ class CLOBWebSocket:
         self,
         on_book_update: Optional[Callable[[str, OrderBookState], None]] = None,
         on_price_change: Optional[Callable[[str, float, float], None]] = None,
+        on_trade: Optional[Callable[[str, float, float, str], None]] = None,
         on_connect: Optional[Callable[[], None]] = None,
         on_disconnect: Optional[Callable[[], None]] = None,
     ):
@@ -64,11 +65,14 @@ class CLOBWebSocket:
         Args:
             on_book_update: Callback(token_id, book_state) for any book update
             on_price_change: Callback(token_id, best_bid, best_ask) for price changes
+            on_trade: Callback(token_id, price, size, side) fired on every
+                last_trade_price event. `side` is 'BUY' or 'SELL' (aggressor side).
             on_connect: Callback when connected
             on_disconnect: Callback when disconnected
         """
         self.on_book_update = on_book_update
         self.on_price_change = on_price_change
+        self.on_trade = on_trade
         self.on_connect = on_connect
         self.on_disconnect = on_disconnect
 
@@ -387,9 +391,42 @@ class CLOBWebSocket:
                     self.on_price_change(asset_id, bid, ask)
 
     def _handle_last_trade(self, data: dict):
-        """Handle last trade price event"""
-        # We can use this to infer market activity but don't need to store
-        pass
+        """Handle last trade price event.
+
+        Expected payload (one of):
+          {"event_type":"last_trade_price","asset_id":"0x...","price":"0.65",
+           "size":"100","side":"BUY","timestamp":"..."}
+        Or batched inside "trades": [...].
+
+        Fires on_trade(token_id, price, size, side) for each trade.
+        """
+        trades = data.get("trades")
+        if isinstance(trades, list):
+            items = trades
+        else:
+            items = [data]
+
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            asset_id = item.get("asset_id") or data.get("asset_id")
+            if not asset_id:
+                continue
+            try:
+                price = float(item.get("price"))
+                size = float(item.get("size"))
+            except (TypeError, ValueError):
+                continue
+            side = str(item.get("side", "")).upper() or "UNKNOWN"
+
+            # Keep a counter so callers can tell how many trades we've seen
+            self.book_updates  # no-op, just ensuring attr exists
+
+            if self.on_trade:
+                try:
+                    self.on_trade(asset_id, price, size, side)
+                except Exception as _e:
+                    print(f"[CLOB WS] on_trade callback error: {_e}", flush=True)
 
     def _on_error(self, ws, error):
         """Handle WebSocket error"""
