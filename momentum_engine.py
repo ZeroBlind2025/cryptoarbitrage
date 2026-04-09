@@ -111,6 +111,11 @@ LIMIT_SIM_SIDE = os.getenv("MOMENTUM_LIMIT_SIM_SIDE", "Up")
 LIMIT_SIM_SETTLE_SECS = float(os.getenv("MOMENTUM_LIMIT_SIM_SETTLE", "10"))  # skip first N seconds after market open
 LIMIT_SIM_TAKER = os.getenv("MOMENTUM_LIMIT_SIM_TAKER", "false").lower() == "true"  # simulate as taker (pay fees, catch every market)
 LIMIT_SIM_TAKER_FEE_PCT = float(os.getenv("MOMENTUM_LIMIT_SIM_TAKER_FEE", "1.8"))  # taker fee % for crypto (1.8%)
+# Live placement trigger: when live ask crosses this price we PLACE the GTC @ LIMIT_SIM_PRICE.
+# Using 65¢ trigger + 75¢ order price gives the order time to rest on the book before
+# fast momentum blows past 75¢. If we waited for 75¢ to PLACE, the price would often fly
+# right through and we'd miss the fill entirely.
+LIMIT_SIM_TRIGGER = float(os.getenv("MOMENTUM_LIMIT_SIM_TRIGGER", "0.65"))
 
 # ---------------------------------------------------------------------------
 # Per-interval entry price brackets (data-driven from bracket analysis)
@@ -970,6 +975,8 @@ class MomentumEngine:
                 _shares = LIMIT_SIM_LOT / LIMIT_SIM_PRICE * (1 - LIMIT_SIM_TAKER_FEE_PCT / 100)
                 _profit = _shares - LIMIT_SIM_LOT
                 print(f"  Taker fee: {LIMIT_SIM_TAKER_FEE_PCT:.1f}% → {_shares:.2f} shares (fee ~${_fee:.2f}) → win profit ${_profit:.2f}")
+                if not self.dry_run:
+                    print(f"  Live trigger: place GTC @ {LIMIT_SIM_PRICE*100:.0f}¢ once live ask crosses {LIMIT_SIM_TRIGGER*100:.0f}¢")
             print(f"  Settle delay: {LIMIT_SIM_SETTLE_SECS:.0f}s after market open")
             if self.dry_run:
                 print(f"  DRY: simulates fill when WS price crosses {LIMIT_SIM_PRICE*100:.0f}¢")
@@ -1800,27 +1807,32 @@ class MomentumEngine:
                               f"${trade_amount:.2f}/side", flush=True)
                         print(f"           Market: {title}", flush=True)
 
-                        # Only place each side if our limit is BELOW the current ask
-                        # (so the order rests on the book as maker, not crosses).
-                        # If the ask is already below our limit, skip that side —
-                        # the pending fill checker will pick it up later when
-                        # the price actually crosses from below.
+                        # Placement rules:
+                        #   Maker mode: only place if live ask is ABOVE our limit
+                        #     (post_only rejects orders that would cross the book).
+                        #   Taker mode: only place once live ask has crossed the
+                        #     TRIGGER price (default 65¢). Using a 65¢ trigger with
+                        #     a 75¢ order price gives the resting order time to sit
+                        #     on the book before fast momentum blows past 75¢. If we
+                        #     waited for 75¢ to trigger, momentum frequently flies
+                        #     right through and we miss the fill.
                         for _side_label, _tid, _oid_attr in [
                             ("Up", up_tid, "up"),
                             ("Down", down_tid, "down"),
                         ]:
                             _live_ask = self.get_live_price(_tid)
-                            # Maker mode: skip sides where our limit would cross the book (post_only rejects)
-                            # Taker mode: place GTC @ 75¢ immediately at market open. Order will either:
-                            #   - Match at current ask if ask <= 75¢ (taker fill, possibly better price)
-                            #   - Rest on book at 75¢ if ask > 75¢ (waits for a seller to cross)
+                            _ask_str = f"{_live_ask*100:.0f}¢" if _live_ask is not None else "?"
                             if not LIMIT_SIM_TAKER:
                                 if _live_ask is not None and _live_ask <= limit_price:
-                                    print(f"           {_side_label}: ask {_live_ask*100:.0f}¢ <= {limit_price*100:.0f}¢ — SKIP (would cross)", flush=True)
+                                    print(f"           {_side_label}: ask {_ask_str} <= {limit_price*100:.0f}¢ — SKIP (would cross)", flush=True)
                                     continue
                             else:
-                                _ask_str = f"{_live_ask*100:.0f}¢" if _live_ask is not None else "?"
-                                print(f"           {_side_label}: placing GTC @ {limit_price*100:.0f}¢ (live ask {_ask_str})", flush=True)
+                                # Taker: wait for ask to cross the trigger before placing
+                                if _live_ask is None or _live_ask < LIMIT_SIM_TRIGGER:
+                                    if self.scans_completed % 10 == 1:
+                                        print(f"           {_side_label}: ask {_ask_str} < trigger {LIMIT_SIM_TRIGGER*100:.0f}¢ — WAIT", flush=True)
+                                    continue
+                                print(f"           {_side_label}: ask {_ask_str} ≥ trigger {LIMIT_SIM_TRIGGER*100:.0f}¢ → placing GTC @ {limit_price*100:.0f}¢", flush=True)
 
                             _args = OrderArgs(
                                 token_id=_tid,
