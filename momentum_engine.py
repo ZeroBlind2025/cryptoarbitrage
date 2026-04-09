@@ -63,18 +63,13 @@ from copy_trader import (
     GAMMA_API,
     COIN_BET_AMOUNTS,
     BET_AMOUNT,
-    PROBE_AMOUNT,
-    PRICE_BUFFER_BPS,
     ALGO_STARTING_BALANCE,
     CRYPTO_SLUGS,
     STOP_LOSS_PCT,
-    PRICE_BUFFER_BPS,
-    ARB_HEDGE_MIN_ENTRY,
     detect_coin,
     get_clob_client,
     place_bet,
     place_sell,
-    calc_arb_hedge,
     load_positions,
     save_positions,
     get_active_crypto_tokens,
@@ -82,78 +77,40 @@ from copy_trader import (
 
 
 # =============================================================================
-# CONFIGURATION
+# CONFIGURATION — SIMPLE UP @ 49¢ STRATEGY
+# -----------------------------------------------------------------------------
+# One solitary bet per market open: UP side, limit price 49¢, dashboard lot
+# size.  Scans both 5m and 15m crypto updown markets.  No martingale, no
+# re-entries, no doubling, no hedging, no entry delays, no cooldowns.
+#
+# The ONLY tunable env var is DOWN_BETS_DISABLED (default true).  Everything
+# else is hardcoded.
 # =============================================================================
 
-# Minimum price to enter a market (88 cents = 0.88)
-MIN_ENTRY_PRICE = float(os.getenv("MOMENTUM_MIN_ENTRY_PRICE", "0.88"))
-MOMENTUM_HEDGE_ENABLE = os.getenv("MOMENTUM_HEDGE_ENABLE", "true").lower() == "true"
-MOMENTUM_HEDGE_PCT = float(os.getenv("MOMENTUM_HEDGE_PCT", "5"))  # Gap in cents (e.g. 5 = 5¢)
+# The only env var kept.  Default true → only UP positions are taken.
+DOWN_BETS_DISABLED = os.getenv("DOWN_BETS_DISABLED", "true").lower() == "true"
 
-MOMENTUM_5M_MARKET = os.getenv("MOMENTUM_5M_MARKET", "true").lower() == "true"
-MOMENTUM_15M_MARKET = os.getenv("MOMENTUM_15M_MARKET", "false").lower() == "true"
+# Entry price cap — never pay more than 49¢ for UP.
+MIN_ENTRY_PRICE = 0.01
+MAX_ENTRY_PRICE = 0.49
 
-# Maximum price to enter — 98.9¢ cap filters out 99¢+ "last second" entries
-# that linger at market close and likely wouldn't fill in live trading
-MAX_ENTRY_PRICE = float(os.getenv("MOMENTUM_MAX_ENTRY_PRICE", "0.989"))
+# Scan both 5m and 15m crypto updown markets.
+MOMENTUM_5M_MARKET = True
+MOMENTUM_15M_MARKET = True
 
-# ---------------------------------------------------------------------------
-# Per-interval entry price brackets (data-driven from bracket analysis)
-# Each interval maps to a list of (min, max) tuples.  A price must fall in
-# at least ONE bracket to qualify.  Intervals not listed here use the global
-# MIN_ENTRY_PRICE / MAX_ENTRY_PRICE range.
-#
-# 5m  bracket: 85-<98.9¢ (uber conservative)
-# ---------------------------------------------------------------------------
+# Single solitary bet per market — no re-entries, no doubling.
+MAX_ENTRIES_PER_MARKET = 1
+
+# Fixed 1-second poll interval (imported by hft_server.momentum_loop).
+POLL_INTERVAL = 1
+
+# Per-interval price brackets (kept for dashboard display).
 INTERVAL_PRICE_BRACKETS: dict[str, list[tuple[float, float]]] = {
-    "5m":  [(MIN_ENTRY_PRICE, 0.989)],
+    "5m":  [(MIN_ENTRY_PRICE, MAX_ENTRY_PRICE)],
+    "15m": [(MIN_ENTRY_PRICE, MAX_ENTRY_PRICE)],
 }
 
-# How often to poll prices (seconds)
-POLL_INTERVAL = int(os.getenv("MOMENTUM_POLL_INTERVAL", "1"))
-
-# Max entries per market (same as copy trader default)
-MAX_ENTRIES_PER_MARKET = int(os.getenv("MOMENTUM_MAX_ENTRIES_PER_MARKET", "2"))
-
-# Cooldown between re-entries into the same market (seconds).
-# Prevents rapid-fire follow-ups when price ticks up within the same scan cycle.
-FOLLOW_UP_COOLDOWN = int(os.getenv("MOMENTUM_FOLLOW_UP_COOLDOWN", "30"))
-FOLLOW_UP_COOLDOWN_15M = int(os.getenv("MOMENTUM_15m_COOLDOWN", "240"))  # 4 minutes for 15m markets
-REENTRY_MIN_PRICE = float(os.getenv("MOMENTUM_REENTRY_MIN_PRICE", "0.899"))  # only re-enter above 89.9¢
-
-# Minimum minutes before market close to allow entry.
-# Prevents placing trades after (or right at) the close time.
-MIN_MINUTES_BEFORE_CLOSE = float(os.getenv("MOMENTUM_MIN_MINUTES_BEFORE_CLOSE", "1.0"))
-
-# Maximum entry price — skip entries at or above this price (default 0.90 = 90¢).
-# High-price entries win often but the tiny upside doesn't cover losses.
-MAX_PRICE_ENTRY = float(os.getenv("MOMENTUM_MAX_PRICE_ENTRY", "0.90"))
-
-# No-trade hours (ET).  Comma-separated list of hour starts (24h format).
-# Trading pauses for 60 minutes starting at each listed hour.
-# Default: 4,7,8,9 (4AM, 7AM, 8AM, 9AM ET — historically worst hours).
-_NO_TRADE_HOURS_RAW = os.getenv("MOMENTUM_NO_TRADE_HOURS", "4,7,8,9")
-NO_TRADE_HOURS: set[int] = set()
-if _NO_TRADE_HOURS_RAW.strip():
-    NO_TRADE_HOURS = {int(h.strip()) for h in _NO_TRADE_HOURS_RAW.split(",") if h.strip()}
-
-# Allow DOWN bets.  Default FALSE — only take UP positions.
-DOWN_BETS_ENABLED = os.getenv("MOMENTUM_DOWN_BETS_ENABLED", "false").lower() == "true"
-
-# ---------------------------------------------------------------------------
-# Market entry delay — wait N seconds after a market opens before entering.
-# Early-market prices are volatile and reversals are common.  By waiting,
-# we only enter once the direction has stabilised.
-#
-#  5m market  → wait 180s (3 min)
-# 15m market  → wait 540s (9 min)
-# ---------------------------------------------------------------------------
-MARKET_ENTRY_DELAY: dict[str, float] = {
-    "5m":  float(os.getenv("MOMENTUM_5M_ENTRY_DELAY",  "180")) / 60,
-    "15m": float(os.getenv("MOMENTUM_15M_ENTRY_DELAY", "540")) / 60,
-}
-
-# Interval durations in minutes (used to derive market start time from end time)
+# Interval durations in minutes (used by discovery filters)
 _INTERVAL_DURATION_MINUTES: dict[str, float] = {
     "5m": 5,
     "15m": 15,
@@ -914,38 +871,14 @@ class MomentumEngine:
     def start(self):
         """Initialize the momentum engine."""
 
-        # No probe sizing (applies to both demo and live)
-        self._dry_run_no_probe = True
-        # Entry delays: enforce even in dry runs
-        self._dry_run_no_delays = False
-
-        # --- DRY RUN OVERRIDES ---
-        # None — dry run uses identical rules to live mode
-
         balance = self.positions.get("stats", {}).get("balance", ALGO_STARTING_BALANCE)
         lot_sizes = ", ".join(f"{c.upper()}=${a}" for c, a in sorted(self.coin_bet_amounts.items()))
         print("\n" + "=" * 60)
-        print("  MOMENTUM ENGINE")
-        print(f"  Global entry range: {self.min_entry_price*100:.0f}-{self.max_entry_price*100:.0f}¢")
-        if self.interval_price_brackets:
-            print("  Per-interval brackets:")
-            for ivl, brackets in sorted(self.interval_price_brackets.items()):
-                ranges = " | ".join(f"{lo*100:.0f}-{hi*100:.0f}¢" for lo, hi in brackets)
-                print(f"    {ivl}: {ranges}")
-            other = [i for i in INTERVALS if i not in self.interval_price_brackets]
-            if other:
-                print(f"    {', '.join(other)}: global range ({self.min_entry_price*100:.0f}-{self.max_entry_price*100:.0f}¢)")
-        print(f"  Markets: {', '.join(INTERVALS) if INTERVALS else 'NONE (all disabled!)'}")
-        print(f"  Hedge: {'ENABLED' if MOMENTUM_HEDGE_ENABLE else 'DISABLED'} | gap: {MOMENTUM_HEDGE_PCT:.0f}¢")
-        print(f"  Re-entry: upward only, max {self.max_entries_per_market} entries/market")
-        _delay_status = "DISABLED" if getattr(self, '_dry_run_no_delays', False) else "ENABLED"
-        _delay_info = ", ".join(f"{k}={int(v*60)}s" for k, v in MARKET_ENTRY_DELAY.items()) if _delay_status == "ENABLED" else ""
-        print(f"  Delays/cooldowns: {_delay_status}" + (f" ({_delay_info})" if _delay_info else ""))
-        print(f"  Max entry price: {MAX_PRICE_ENTRY*100:.0f}¢")
-        _no_trade_str = ", ".join(f"{h}:00" for h in sorted(NO_TRADE_HOURS)) if NO_TRADE_HOURS else "NONE"
-        print(f"  No-trade hours (ET): {_no_trade_str}")
-        print(f"  DOWN bets: {'ENABLED' if DOWN_BETS_ENABLED else 'DISABLED'}")
-        print(f"  Probe sizing: DISABLED (using dashboard lot sizes)")
+        print("  MOMENTUM ENGINE — SIMPLE UP @ 49¢")
+        print(f"  Markets: {', '.join(INTERVALS) if INTERVALS else 'NONE'}")
+        print(f"  Strategy: 1 bet per market open, UP side, limit {MAX_ENTRY_PRICE*100:.0f}¢")
+        print(f"  Max entries per market: {self.max_entries_per_market}")
+        print(f"  DOWN bets: {'DISABLED' if DOWN_BETS_DISABLED else 'ENABLED'}")
         print(f"  Lot sizes: {lot_sizes} (default: ${self.bet_amount})")
         print(f"  Balance: ${balance:.2f}")
         print(f"  Mode: {'DRY RUN' if self.dry_run else 'LIVE'}")
@@ -1409,401 +1342,187 @@ class MomentumEngine:
 
         entered = 0
 
-        # --- GUARD: No-trade hours (ET) ---
-        if NO_TRADE_HOURS:
-            _utc_now = datetime.now(timezone.utc)
-            _et_hour = (_utc_now.hour - 4) % 24  # UTC → ET (EDT)
-            if _et_hour in NO_TRADE_HOURS:
-                if self.scans_completed % 60 == 1:
-                    print(f"[MOMENTUM] NO-TRADE HOUR: {_et_hour}:00 ET — skipping scan", flush=True)
-                return 0
-
+        # --- SIMPLE UP @ 49¢ LOOP ---
+        # One solitary bet per market: UP side only, limit price 49¢, dashboard
+        # lot size.  No re-entries, no doubling, no hedging, no delays.
         for market in markets:
             coin = market["coin"]
             condition_id = market["condition_id"]
             slug = market["slug"]
             question = market["question"]
+            interval = market.get("interval", "")
 
             # Per-coin pause
             if coin in self.paused_coins:
                 continue
 
-            # --- Recalculate minutes_left live from stored end_date ---
-            # The cached minutes_until_close goes stale; recompute from
-            # the absolute end_date so delay/close guards are accurate.
+            # Market must still be open
             end_date = market.get("end_date")
             if end_date is not None:
                 minutes_left = (end_date - datetime.now(timezone.utc)).total_seconds() / 60
             else:
                 minutes_left = market.get("minutes_until_close")
-
-            # --- GUARD: Market must still be open ---
             if minutes_left is not None and minutes_left < 0:
                 continue
 
-            # --- GUARD: Market must be old enough (entry delay) ---
-            # Derive market age from end_date and interval duration.
-            # If the market just opened, early prices are volatile and
-            # reversals are common — wait for the direction to stabilise.
-            # SKIP in dry run mode — no delays.
-            interval = market.get("interval", "")
-            if not getattr(self, '_dry_run_no_delays', False):
-                entry_delay = MARKET_ENTRY_DELAY.get(interval)
-                if entry_delay and minutes_left is not None:
-                    duration = _INTERVAL_DURATION_MINUTES.get(interval)
-                    if duration:
-                        market_age_minutes = duration - minutes_left
-                        if market_age_minutes < entry_delay:
-                            wait_remaining = entry_delay - market_age_minutes
-                            # Log once per market per scan cycle (only when candidate price would qualify)
-                            _delay_label = f"{coin.upper()}_{interval} {slug[:30]}"
-                            _wait_secs = int(wait_remaining * 60)
-                            _wait_m, _wait_s = divmod(_wait_secs, 60)
-                            _wait_display = f"{_wait_m}m{_wait_s:02d}s" if _wait_m else f"{_wait_s}s"
-                            print(f"[MOMENTUM] DELAY {_delay_label}: market age {market_age_minutes:.1f}m < {entry_delay:.0f}m delay "
-                                  f"(wait {_wait_display} more)", flush=True)
-                            continue
-                        else:
-                            # Delay satisfied — log that we're past the wait
-                            _delay_label = f"{coin.upper()}_{interval} {slug[:30]}"
-                            print(f"[MOMENTUM] DELAY OK {_delay_label}: market age {market_age_minutes:.1f}m >= {entry_delay:.0f}m delay", flush=True)
+            _mkt_label = f"{coin.upper()}_{interval} {slug[:30]}"
 
-            # Build a short label for rejection logging
-            _mkt_label = f"{coin.upper()}_{market['interval']} {slug[:30]}"
+            # Locate the UP outcome.  We only ever look at the UP side.
+            up_idx = None
+            for i, outcome_name in enumerate(market.get("outcomes", [])):
+                if str(outcome_name).lower().strip() == "up":
+                    up_idx = i
+                    break
+            if up_idx is None or up_idx >= len(market.get("token_ids", [])):
+                continue
 
-            # Check each side (outcome 0 and 1)
-            for oi in range(2):
-                outcome = market["outcomes"][oi]
-                token_id = market["token_ids"][oi]
-                other_token_id = market["token_ids"][1 - oi]
-                gamma_price = market["prices"][oi]
+            outcome = market["outcomes"][up_idx]
+            token_id = market["token_ids"][up_idx]
 
-                # --- GUARD: Skip DOWN bets if disabled ---
-                if not DOWN_BETS_ENABLED and outcome.lower() == "down":
-                    continue
+            # Safety check: DOWN_BETS_DISABLED should be honoured.  Strategy
+            # is UP-only regardless, but bail explicitly if someone mislabels.
+            if DOWN_BETS_DISABLED and outcome.lower() != "up":
+                continue
 
-                # Get best available price (WS → WS cache → CLOB REST → Gamma)
-                live_price = self.get_live_price(token_id)
-                if live_price is not None:
-                    price = live_price
-                    # Determine source for logging
-                    _price_src = "gamma"  # default
-                    if self.ws:
-                        _, ws_ask = self.ws.get_best_prices(token_id)
-                        if ws_ask is not None:
-                            _price_src = "ws"
-                        elif token_id in self._ws_price_cache or self._market_token_to_ws.get(token_id) in self._ws_price_cache:
+            market_key = (condition_id, token_id)
+
+            # Single solitary bet per market — no re-entries, no doubling.
+            if self.market_entry_count.get(market_key, 0) >= self.max_entries_per_market:
+                continue
+
+            # Get best available price (WS → WS cache → CLOB REST → Gamma)
+            live_price = self.get_live_price(token_id)
+            gamma_price = market["prices"][up_idx] if up_idx < len(market.get("prices", [])) else None
+            if live_price is not None:
+                price = live_price
+                _price_src = "ws"
+                if self.ws:
+                    _, ws_ask = self.ws.get_best_prices(token_id)
+                    if ws_ask is None:
+                        if token_id in self._ws_price_cache or self._market_token_to_ws.get(token_id) in self._ws_price_cache:
                             _price_src = "ws_cache"
                         elif token_id in self._clob_price_cache:
                             _price_src = "clob_rest"
-                else:
-                    price = gamma_price
-                    _price_src = "gamma"
-                    # Warn once per scan when using gamma fallback (likely stale)
-                    if self.scans_completed % 60 == 1:
-                        print(f"  WARN gamma_fallback: {_mkt_label} {outcome} no live price, using gamma={gamma_price*100:.1f}¢", flush=True)
-
-                # --- FILTER: Price must be in range ---
-                # Use per-interval brackets if defined, else global min/max
-                interval = market.get("interval", "")
-                if interval in self.interval_price_brackets:
-                    brackets = self.interval_price_brackets[interval]
-                    in_bracket = any(lo <= price < hi for lo, hi in brackets)
-                    if not in_bracket:
-                        _ranges = " | ".join(f"{lo*100:.0f}-{hi*100:.0f}¢" for lo, hi in brackets)
-                        print(f"  REJECT price_range: {_mkt_label} {outcome} @ {price*100:.1f}¢ not in [{_ranges}]", flush=True)
-                        continue
-                else:
-                    if price < self.min_entry_price or price > self.max_entry_price:
-                        print(f"  REJECT price_range: {_mkt_label} {outcome} @ {price*100:.1f}¢ outside {self.min_entry_price*100:.0f}-{self.max_entry_price*100:.0f}¢", flush=True)
-                        continue
-
-                # --- GUARD: Hard ceiling on entry price ---
-                if price >= MAX_PRICE_ENTRY:
-                    continue
-
-                # --- Price qualifies! Log that we're evaluating this candidate ---
-                print(f"[MOMENTUM] CANDIDATE {_mkt_label} {outcome} @ {price*100:.1f}¢ ({_price_src})", flush=True)
-
-                # Key by (condition_id, token_id) — stable across API ordering changes
-                market_key = (condition_id, token_id)
-
-                # --- GUARD: No opposite side ---
-                # Check if we already hold the OTHER token on this condition_id
-                opposite_key = (condition_id, other_token_id)
-                if opposite_key in self.entered_markets:
-                    self.trades_skipped += 1
-                    print(f"  REJECT opposite_held: already hold other side of {_mkt_label}", flush=True)
-                    continue
-
-                # --- HEDGE TRIGGER: Price risen 5¢+ above probe → hedge opposite side ---
-                # This runs BEFORE the max-entries / cooldown guards because
-                # it's not a re-entry on primary — it's a hedge on the opposite side.
-                is_first_entry = market_key not in self.entered_markets
-                if market_key in self.entered_markets:
-                    last_buy_price = self.entered_markets[market_key]
-                    price_rise = round(price - last_buy_price, 4)
-
-                    if MOMENTUM_HEDGE_ENABLE:
-                        # Hedge mode: require minimum gap before triggering hedge
-                        if price_rise < MOMENTUM_HEDGE_PCT / 100:
-                            continue
-                    else:
-                        # Re-entry mode: just require upward movement
-                        if price_rise <= 0:
-                            continue
-
-                    # Price has risen 5¢+ — trigger hedge instead of re-entry
-                    if (MOMENTUM_HEDGE_ENABLE
-                            and other_token_id
-                            and condition_id not in self.hedged_markets):
-                        title = (question or slug)[:50]
-                        print(f"\n[ARB] HEDGE TRIGGER: {coin.upper()} {outcome} risen {price_rise*100:.1f}¢ "
-                              f"({last_buy_price*100:.1f}¢ → {price*100:.1f}¢)", flush=True)
-
-                        # Sum primary spend on this condition_id
-                        total_primary = sum(
-                            p.get("amount", 0) for p in self.positions.get("open", [])
-                            if p.get("condition_id") == condition_id
-                            and p.get("source") in ("momentum", "copy")
-                        )
-
-                        arb = calc_arb_hedge(last_buy_price, total_primary)
-                        if arb:
-                            # Use full price chain (WS → WS cache → CLOB REST → gamma)
-                            opp_ask = self.get_live_price(other_token_id)
-                            if opp_ask is None:
-                                # Fallback to gamma price for opposite side
-                                opp_gamma = market["prices"][1 - oi] if (1 - oi) < len(market.get("prices", [])) else None
-                                if opp_gamma is not None:
-                                    opp_ask = opp_gamma
-
-                            opp_price_ok = opp_ask is not None and opp_ask <= arb["hedge_max_price"]
-                            if opp_price_ok:
-                                buffer = PRICE_BUFFER_BPS / 10000
-                                hedge_limit = min(opp_ask * (1 + buffer), arb["hedge_max_price"]) if opp_ask else arb["hedge_max_price"]
-                                actual_gap = round(1 - price - hedge_limit, 4)
-                                actual_arb = calc_arb_hedge(price, total_primary, gap=actual_gap) if actual_gap > 0 else None
-                                hedge_amt = (actual_arb or arb)["hedge_amount"]
-                                hedge_max = hedge_limit
-                                arb_info = actual_arb or arb
-
-                                other_outcome = market["outcomes"][1 - oi]
-                                print(f"       Primary: {outcome} @ {last_buy_price*100:.1f}¢ (${total_primary:.2f})", flush=True)
-                                print(f"       Hedge:   {other_outcome} @ {hedge_max*100:.1f}¢ (${hedge_amt:.2f})", flush=True)
-                                print(f"       Total cost: ${arb_info['total_cost']:.2f} | "
-                                      f"Profit either way: +${arb_info['profit_if_primary_wins']:.2f} / +${arb_info['profit_if_hedge_wins']:.2f}", flush=True)
-
-                                if not self.dry_run:
-                                    hedge_fill = place_bet(self.client, other_token_id, hedge_amt, max_price=hedge_max)
-                                    if hedge_fill.get("success"):
-                                        h_price = hedge_fill.get("fill_price", hedge_max)
-                                        print(f"[ARB] HEDGE FILLED @ {h_price*100:.1f}¢!", flush=True)
-                                        hedge_position = {
-                                            "id": f"arb_{condition_id[:12]}_{int(time.time())}",
-                                            "timestamp": datetime.now(timezone.utc).isoformat(),
-                                            "condition_id": condition_id,
-                                            "token_id": other_token_id,
-                                            "outcome_index": 1 - oi,
-                                            "outcome": other_outcome,
-                                            "market": title,
-                                            "slug": slug,
-                                            "interval": market.get("interval", ""),
-                                            "end_date": end_date.isoformat() if end_date else None,
-                                            "entry_price": h_price,
-                                            "amount": hedge_amt,
-                                            "potential_payout": hedge_amt / h_price if h_price > 0 else 0,
-                                            "dry_run": False,
-                                            "source": "arb_hedge",
-                                            "hedge_of": f"momentum_{condition_id[:12]}",
-                                        }
-                                        self.positions["open"].append(hedge_position)
-                                        self.total_spent += hedge_amt
-                                        stats = self.positions["stats"]
-                                        stats["balance"] = stats.get("balance", ALGO_STARTING_BALANCE) - hedge_amt
-                                        save_positions(self.positions)
-                                        self.hedged_markets.add(condition_id)
-                                        _log_trade("arb_hedge", {
-                                            "market": title, "outcome": other_outcome,
-                                            "price": h_price, "amount": hedge_amt,
-                                            "total_primary": total_primary,
-                                            "primary_outcome": outcome, "probe_price": last_buy_price,
-                                            "current_price": price, "rise": price_rise,
-                                            "condition_id": condition_id,
-                                        })
-                                    else:
-                                        print(f"[ARB] Hedge order FAILED", flush=True)
-                                else:
-                                    print(f"[ARB] DRY RUN — hedge would execute @ {hedge_max*100:.1f}¢", flush=True)
-                                    hedge_position = {
-                                        "id": f"arb_{condition_id[:12]}_{int(time.time())}",
-                                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                                        "condition_id": condition_id,
-                                        "token_id": other_token_id,
-                                        "outcome_index": 1 - oi,
-                                        "outcome": other_outcome,
-                                        "market": title,
-                                        "slug": slug,
-                                        "interval": market.get("interval", ""),
-                                        "entry_price": hedge_max,
-                                        "amount": hedge_amt,
-                                        "potential_payout": hedge_amt / hedge_max if hedge_max > 0 else 0,
-                                        "dry_run": True,
-                                        "source": "arb_hedge",
-                                        "hedge_of": f"momentum_{condition_id[:12]}",
-                                    }
-                                    self.positions["open"].append(hedge_position)
-                                    self.hedged_markets.add(condition_id)
-                                    # Deduct balance for dry-run hedge so equity stays accurate
-                                    stats = self.positions["stats"]
-                                    stats["balance"] = stats.get("balance", ALGO_STARTING_BALANCE) - hedge_amt
-                                    save_positions(self.positions)
-                            elif opp_ask is not None:
-                                print(f"[ARB] Skip: opposite ask {opp_ask*100:.1f}¢ > max {arb['hedge_max_price']*100:.1f}¢", flush=True)
-                            else:
-                                print(f"[ARB] Skip: no WS price for opposite token", flush=True)
                         else:
-                            print(f"[ARB] Skip: no profitable arb at {price*100:.1f}¢", flush=True)
-                    else:
-                        if condition_id in self.hedged_markets:
-                            pass  # already hedged, silent
-                        elif not MOMENTUM_HEDGE_ENABLE:
-                            pass  # hedge disabled — fall through to re-entry
+                            _price_src = "gamma"
+            elif gamma_price is not None:
+                price = gamma_price
+                _price_src = "gamma"
+            else:
+                continue
 
-                    # If hedge was placed or already hedged, skip re-entry
-                    if condition_id in self.hedged_markets:
-                        continue
+            # Entry gate: UP must be at or below 49¢.
+            if price > MAX_ENTRY_PRICE:
+                continue
 
-                    # --- RE-ENTRY GATE: allow re-entry if under max entries ---
-                    entry_count = self.market_entry_count.get(market_key, 0)
-                    if entry_count >= self.max_entries_per_market:
-                        continue  # hit max entries for this market
+            print(f"[MOMENTUM] CANDIDATE {_mkt_label} {outcome} @ {price*100:.1f}¢ ({_price_src})", flush=True)
 
-                    # --- FOLLOW-UP COOLDOWN: prevent rapid-fire re-entries ---
-                    last_t = self.last_trade_time.get(market_key, 0)
-                    if last_t:
-                        cooldown = FOLLOW_UP_COOLDOWN_15M if market.get("interval") == "15m" else FOLLOW_UP_COOLDOWN
-                        elapsed = time.time() - last_t
-                        if elapsed < cooldown:
-                            continue  # still in cooldown
+            # --- ENTER THE TRADE (single solitary bet) ---
+            trade_amount = self.coin_bet_amounts.get(coin, self.bet_amount)
+            title = (question or slug)[:50]
 
-                    # Update last buy price for upward-only tracking
-                    # (fall through to ENTER THE TRADE block below)
+            print(f"\n[MOMENTUM] ENTERING {coin.upper()} {outcome} @ {price*100:.1f}¢", flush=True)
+            print(f"           Market: {title}", flush=True)
+            print(f"           Interval: {interval}", flush=True)
+            print(f"           Amount: ${trade_amount:.2f}", flush=True)
 
-                # --- ENTER THE TRADE (probe / re-entry) ---
-                full_lot = self.coin_bet_amounts.get(coin, self.bet_amount)
-                trade_amount = PROBE_AMOUNT if not getattr(self, '_dry_run_no_probe', False) else full_lot
-                title = (question or slug)[:50]
-                entry_type = "RE-ENTRY" if not is_first_entry else "PROBE"
+            trade_record = {
+                "id": f"momentum_{condition_id[:12]}_{up_idx}_{int(time.time())}",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "market": title,
+                "slug": slug,
+                "outcome": outcome,
+                "outcome_index": up_idx,
+                "side": "BUY",
+                "amount": trade_amount,
+                "coin": coin,
+                "price": price,
+                "interval": interval,
+                "source": "momentum",
+            }
 
-                print(f"\n[MOMENTUM] ENTERING {coin.upper()} {outcome} @ {price*100:.1f}¢ ({entry_type})", flush=True)
-                print(f"           Market: {title}", flush=True)
-                print(f"           Interval: {market['interval']}", flush=True)
-                print(f"           Amount: ${trade_amount:.2f} ({entry_type})", flush=True)
-
-                trade_record = {
-                    "id": f"momentum_{condition_id[:12]}_{oi}_{int(time.time())}",
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                    "market": title,
-                    "slug": slug,
-                    "outcome": outcome,
-                    "outcome_index": oi,
-                    "side": "BUY",
-                    "amount": trade_amount,
-                    "coin": coin,
-                    "price": price,
-                    "interval": market["interval"],
-                    "source": "momentum",
-                }
-
-                if self.dry_run:
-                    print(f"           DRY RUN - would buy @ {price*100:.1f}¢", flush=True)
-                    trade_record["status"] = "dry_run"
+            if self.dry_run:
+                print(f"           DRY RUN - would buy @ {price*100:.1f}¢", flush=True)
+                trade_record["status"] = "dry_run"
+                entered += 1
+            else:
+                fill = place_bet(self.client, token_id, trade_amount, max_price=MAX_ENTRY_PRICE)
+                if fill.get("success"):
+                    if fill.get("fill_price"):
+                        price = fill["fill_price"]
+                        trade_record["price"] = price
+                    print(f"           EXECUTED @ {price*100:.1f}¢", flush=True)
+                    trade_record["status"] = "filled"
                     entered += 1
+                    self.total_spent += trade_amount
                 else:
-                    buffer = PRICE_BUFFER_BPS / 10000
-                    max_price = min(price * (1 + buffer), 0.99)
-                    fill = place_bet(self.client, token_id, trade_amount, max_price=max_price)
-                    if fill.get("success"):
-                        if fill.get("fill_price"):
-                            price = fill["fill_price"]
-                            trade_record["price"] = price
-                        print(f"           EXECUTED @ {price*100:.1f}¢", flush=True)
-                        trade_record["status"] = "filled"
-                        entered += 1
-                        self.total_spent += trade_amount
-                    else:
-                        print(f"           FAILED!", flush=True)
-                        trade_record["status"] = "failed"
+                    print(f"           FAILED!", flush=True)
+                    trade_record["status"] = "failed"
 
-                self.trade_history.append(trade_record)
-                _log_trade(trade_record["status"], {
+            self.trade_history.append(trade_record)
+            _log_trade(trade_record["status"], {
+                "id": trade_record["id"],
+                "coin": coin,
+                "interval": interval,
+                "outcome": outcome,
+                "price": price,
+                "amount": trade_amount,
+                "slug": slug,
+                "market": title,
+                "condition_id": condition_id,
+                "token_id": token_id,
+                "minutes_until_close": minutes_left,
+            })
+
+            if trade_record["status"] in ("filled", "dry_run"):
+                self.entered_markets[market_key] = price
+                self.market_entry_count[market_key] = self.market_entry_count.get(market_key, 0) + 1
+                self.last_trade_time[market_key] = time.time()
+
+                position = {
                     "id": trade_record["id"],
-                    "coin": coin,
-                    "interval": market["interval"],
-                    "outcome": outcome,
-                    "price": price,
-                    "amount": trade_amount,
-                    "slug": slug,
-                    "market": title,
+                    "timestamp": trade_record["timestamp"],
                     "condition_id": condition_id,
                     "token_id": token_id,
-                    "minutes_until_close": minutes_left,
-                })
+                    "outcome_index": up_idx,
+                    "outcome": outcome,
+                    "market": title,
+                    "slug": slug,
+                    "interval": interval,
+                    "end_date": end_date.isoformat() if end_date else None,
+                    "entry_price": price,
+                    "amount": trade_amount,
+                    "potential_payout": trade_amount / price if price > 0 else 0,
+                    "dry_run": self.dry_run,
+                    "source": "momentum",
+                }
+                self.positions["open"].append(position)
 
-                if trade_record["status"] in ("filled", "dry_run"):
-                    # Update last buy price (NOT first — this is the key difference)
-                    self.entered_markets[market_key] = price
-                    self.market_entry_count[market_key] = self.market_entry_count.get(market_key, 0) + 1
-                    self.last_trade_time[market_key] = time.time()
-
-                    # Save position
-                    position = {
-                        "id": trade_record["id"],
+                try:
+                    stats = self.positions["stats"]
+                    stats["balance"] = stats.get("balance", ALGO_STARTING_BALANCE) - trade_amount
+                    open_staked = sum(p.get("amount", 0) for p in self.positions.get("open", []))
+                    stats.setdefault("balance_history", []).append({
                         "timestamp": trade_record["timestamp"],
-                        "condition_id": condition_id,
-                        "token_id": token_id,
-                        "outcome_index": oi,
-                        "outcome": outcome,
-                        "market": title,
-                        "slug": slug,
-                        "interval": market.get("interval", ""),
-                        "end_date": end_date.isoformat() if end_date else None,
-                        "entry_price": price,
-                        "amount": trade_amount,
-                        "potential_payout": trade_amount / price if price > 0 else 0,
-                        "dry_run": self.dry_run,
-                        "source": "momentum",
-                    }
-                    self.positions["open"].append(position)
+                        "balance": stats["balance"],
+                        "pnl": stats.get("total_pnl", 0.0),
+                        "equity": stats["balance"] + open_staked,
+                        "event": "momentum_trade",
+                        "detail": f"{coin.upper()} {outcome} {title[:30]}",
+                    })
+                except Exception:
+                    pass
 
-                    # Deduct balance
+                save_positions(self.positions)
+                print(f"           Position saved. Balance: ${self.positions['stats'].get('balance', 0):.2f}", flush=True)
+
+                self.trades_entered += 1
+
+                if self.on_trade:
                     try:
-                        stats = self.positions["stats"]
-                        stats["balance"] = stats.get("balance", ALGO_STARTING_BALANCE) - trade_amount
-                        open_staked = sum(p.get("amount", 0) for p in self.positions.get("open", []))
-                        stats.setdefault("balance_history", []).append({
-                            "timestamp": trade_record["timestamp"],
-                            "balance": stats["balance"],
-                            "pnl": stats.get("total_pnl", 0.0),
-                            "equity": stats["balance"] + open_staked,
-                            "event": "momentum_trade",
-                            "detail": f"{coin.upper()} {outcome} {title[:30]}",
-                        })
-                    except Exception:
-                        pass
-
-                    save_positions(self.positions)
-                    print(f"           Position saved. Balance: ${self.positions['stats'].get('balance', 0):.2f}", flush=True)
-
-                    self.trades_entered += 1
-
-                    # Callback
-                    if self.on_trade:
-                        try:
-                            self.on_trade(trade_record)
-                        except Exception as e:
-                            print(f"[MOMENTUM] Callback error: {e}", flush=True)
+                        self.on_trade(trade_record)
+                    except Exception as e:
+                        print(f"[MOMENTUM] Callback error: {e}", flush=True)
 
         return entered
 
