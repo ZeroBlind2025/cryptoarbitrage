@@ -127,6 +127,15 @@ class HFEConfig:
     contrary_flow_threshold: float = 0.20
     exit_time_buffer_sec: float = 15.0
 
+    # Minimum time between closing a position and being allowed to
+    # open a new one on the same market. Without this the engine
+    # cycles through cascade -> enter -> contrary-flow -> exit ->
+    # cascade -> enter on the same market every few seconds, which
+    # inflates trade counts and (in a real market) would burn the
+    # entire risk budget on friction alone. 30 seconds is a
+    # conservative starting point; tune via HFE_REENTRY_COOLDOWN_SEC.
+    reentry_cooldown_sec: float = 30.0
+
     # ------------------------------------------------------------------
     # Scanner / market selection (Section 9)
     # ------------------------------------------------------------------
@@ -224,6 +233,9 @@ class HFEConfig:
         )
         cfg.exit_time_buffer_sec = _getenv_float(
             "HFE_EXIT_TIME_BUFFER_SEC", cfg.exit_time_buffer_sec
+        )
+        cfg.reentry_cooldown_sec = _getenv_float(
+            "HFE_REENTRY_COOLDOWN_SEC", cfg.reentry_cooldown_sec
         )
 
         # Scanner

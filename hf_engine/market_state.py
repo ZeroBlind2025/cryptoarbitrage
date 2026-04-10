@@ -124,6 +124,11 @@ class MarketState:
     # Paper position (at most one open at a time per market)
     open_position: Optional[PaperPosition] = None
     closed_positions: List[PaperPosition] = field(default_factory=list)
+    # Timestamp (epoch seconds) when the last position on this market
+    # was closed. Used to enforce ``reentry_cooldown_sec`` so the
+    # engine cannot flap cascade -> enter -> contrary-flow -> exit ->
+    # enter every few seconds on the same market.
+    last_close_time: Optional[float] = None
 
     # Baseline-rate observation window
     first_trade_time: Optional[float] = None
@@ -388,6 +393,18 @@ class MarketState:
 
         if self.open_position is not None:
             return Signal(action="none", reason="position-already-open")
+
+        # Re-entry cooldown: after closing a position on this market
+        # we impose a quiet period before a new entry is allowed,
+        # otherwise the cascade/contrary-flow alternation can open and
+        # close several positions per second on the same market.
+        if self.last_close_time is not None:
+            elapsed = time.time() - self.last_close_time
+            if elapsed < self.cfg.reentry_cooldown_sec:
+                return Signal(
+                    action="none",
+                    reason=f"reentry-cooldown({elapsed:.0f}s)",
+                )
 
         # Gate 0a: the trading window must have opened.
         #

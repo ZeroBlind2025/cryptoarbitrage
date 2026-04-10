@@ -280,6 +280,7 @@ class PaperExecutor:
 
         market.open_position = None
         market.closed_positions.append(pos)
+        market.last_close_time = pos.exit_time
         self._record_closed(market, pos, event="close", outcome_yes=None)
 
         self._append(
@@ -337,6 +338,7 @@ class PaperExecutor:
 
         market.open_position = None
         market.closed_positions.append(pos)
+        market.last_close_time = pos.exit_time
         self._record_closed(market, pos, event="resolve", outcome_yes=yes_wins)
 
         self._append(
