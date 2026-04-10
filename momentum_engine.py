@@ -939,6 +939,7 @@ class MomentumEngine:
         print(f"  Hedge: {'ENABLED' if MOMENTUM_HEDGE_ENABLE else 'DISABLED'} | gap: {MOMENTUM_HEDGE_PCT:.0f}¢")
         print(f"  Re-entry: upward only, max {self.max_entries_per_market} entries/market")
         print(f"  Re-entry confirmation floor: {REENTRY_MIN_PRICE*100:.0f}¢ (MOMENTUM_REENTRY_MIN_PRICE)")
+        print(f"  Cooldown: {FOLLOW_UP_COOLDOWN}s (5m) / {FOLLOW_UP_COOLDOWN_15M}s (15m) — one-shot, gates 2nd market entry only")
         _delay_status = "DISABLED" if getattr(self, '_dry_run_no_delays', False) else "ENABLED"
         _delay_info = ", ".join(f"{k}={int(v*60)}s" for k, v in MARKET_ENTRY_DELAY.items()) if _delay_status == "ENABLED" else ""
         print(f"  Delays/cooldowns: {_delay_status}" + (f" ({_delay_info})" if _delay_info else ""))
@@ -1554,6 +1555,52 @@ class MomentumEngine:
                     self.trades_skipped += 1
                     continue
 
+                # --- COOLDOWN GATE: one-shot, only applies to the 2nd
+                # entry in the market ---
+                # The cooldown exists to stop us chasing the initial
+                # surge: probe at 60¢, market spikes to 85¢ inside a few
+                # seconds, we slam in a same-side re-entry, then it
+                # reverts and we eat a double loss.  The 250s wait forces
+                # us to sit on our hands after the probe.
+                #
+                # But once we've committed a 2nd entry, whatever comes
+                # next (a same-side stack at 82¢ or a Down re-entry at
+                # 81¢) is part of the reversal/trend we actually want to
+                # ride — throttling those kills the recoup.  So: the
+                # cooldown gates ONLY the transition from entry #1 → #2
+                # in the market.  #3 → #4 → … fire immediately, bounded
+                # only by max_entries_per_market and the upward-movement
+                # check for same-side re-entries.
+                current_market_entries = sum(
+                    1 for (cid, _) in self.entered_markets
+                    if cid == condition_id
+                )
+                if current_market_entries == 1:
+                    market_last_time = max(
+                        (
+                            t for (cid, _), t in self.last_trade_time.items()
+                            if cid == condition_id
+                        ),
+                        default=0,
+                    )
+                    if market_last_time:
+                        cooldown = (
+                            FOLLOW_UP_COOLDOWN_15M
+                            if market.get("interval") == "15m"
+                            else FOLLOW_UP_COOLDOWN
+                        )
+                        elapsed = time.time() - market_last_time
+                        if elapsed < cooldown:
+                            if self.scans_completed % 30 == 1:
+                                print(
+                                    f"  COOLDOWN GATED {_mkt_label} {outcome} "
+                                    f"@ {price*100:.1f}¢: 2nd-entry cooldown "
+                                    f"{elapsed:.0f}/{cooldown}s",
+                                    flush=True,
+                                )
+                            self.trades_skipped += 1
+                            continue
+
                 # --- HEDGE TRIGGER: Price risen 5¢+ above probe → hedge opposite side ---
                 # This runs BEFORE the max-entries / cooldown guards because
                 # it's not a re-entry on primary — it's a hedge on the opposite side.
@@ -1698,21 +1745,14 @@ class MomentumEngine:
                     # --- RE-ENTRY GATE: allow re-entry if under max entries ---
                     entry_count = self.market_entry_count.get(market_key, 0)
                     if entry_count >= self.max_entries_per_market:
-                        continue  # hit max entries for this market
+                        continue  # hit max entries for this side
 
-                    # --- FOLLOW-UP COOLDOWN: prevent rapid-fire re-entries ---
-                    last_t = self.last_trade_time.get(market_key, 0)
-                    if last_t:
-                        cooldown = FOLLOW_UP_COOLDOWN_15M if market.get("interval") == "15m" else FOLLOW_UP_COOLDOWN
-                        elapsed = time.time() - last_t
-                        if elapsed < cooldown:
-                            continue  # still in cooldown
-
-                    # NOTE: REENTRY_MIN_PRICE (80¢) gate now handled by the
-                    # market-level SUBSEQUENT GATED check above, which also
-                    # covers opposite-side first entries.  Same-side
-                    # re-entries still require upward movement from last
-                    # buy price (enforced above).
+                    # NOTE: cooldown and REENTRY_MIN_PRICE (80¢) are both
+                    # handled by the market-level gates above — a one-shot
+                    # cooldown on the transition to entry #2, and an 80¢
+                    # floor on any subsequent entry.  Same-side re-entries
+                    # still require upward movement from the last same-side
+                    # buy price (enforced earlier in this block).
 
                 # --- ENTER THE TRADE (probe / re-entry / opposite-side) ---
                 full_lot = self.coin_bet_amounts.get(coin, self.bet_amount)
