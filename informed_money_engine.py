@@ -97,9 +97,11 @@ class InformedMoneyEngine(MomentumEngine):
         )
         print("\n" + "=" * 60)
         print("  INFORMED MONEY ENGINE")
+        print(f"  Class: {type(self).__name__} "
+              f"(scan_and_trade={type(self).scan_and_trade.__qualname__})")
         print("  Theory: smart money enters early at good liquidity")
         print(f"  Entry: price >= {self.min_entry_price * 100:.0f}¢ "
-              f"on EITHER side (market order, FOK)")
+              f"on EITHER side (Up AND Down, market order, FOK)")
         print("  Both-sides betting: DISABLED (one entry per market total)")
         print(f"  Lot sizes: {lot_sizes} (default: ${self.bet_amount})")
         print(f"  Balance: ${balance:.2f}")
@@ -237,6 +239,31 @@ class InformedMoneyEngine(MomentumEngine):
                 continue
 
             _mkt_label = f"{coin.upper()}_{market['interval']} {slug[:30]}"
+
+            # --- DIAGNOSTIC: log BOTH sides' prices so DOWN can't silently
+            # be "ignored".  Logs every ~30s (periodic summary) AND every
+            # scan when either side is within 5¢ of the entry threshold.
+            _side_prices = []
+            for _oi in range(2):
+                _tid = market["token_ids"][_oi]
+                _out = market["outcomes"][_oi]
+                _lp = self.get_live_price(_tid)
+                _gp = market["prices"][_oi] if _oi < len(market.get("prices", [])) else None
+                _p = _lp if _lp is not None else _gp
+                _src = "live" if _lp is not None else "gamma"
+                _side_prices.append((_out, _p, _src))
+
+            _near_threshold = any(
+                p is not None and p >= (self.min_entry_price - 0.05)
+                for _, p, _ in _side_prices
+            )
+            _periodic = (self.scans_completed % 30 == 1)
+            if _near_threshold or _periodic:
+                _mk_str = " ".join(
+                    f"{o}={p*100:.1f}¢({s})" if p is not None else f"{o}=?"
+                    for o, p, s in _side_prices
+                )
+                print(f"[INFORMED] EVAL {_mkt_label}: {_mk_str}", flush=True)
 
             # Check each side; enter the first one that qualifies.
             for oi in range(2):
