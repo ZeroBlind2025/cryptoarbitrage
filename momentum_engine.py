@@ -101,6 +101,11 @@ MOMENTUM_15M_MARKET = True
 # Single solitary bet per market — no re-entries, no doubling.
 MAX_ENTRIES_PER_MARKET = 1
 
+# Close-window guard — do not place new orders inside this many minutes of
+# market close.  Avoids "price crush" fills in the final seconds when the UP
+# side dumps toward zero on a losing market.  45 seconds = 0.75 minutes.
+CLOSE_BUFFER_MINUTES = 0.75
+
 # Fixed 1-second poll interval (imported by hft_server.momentum_loop).
 POLL_INTERVAL = 1
 
@@ -1356,13 +1361,17 @@ class MomentumEngine:
             if coin in self.paused_coins:
                 continue
 
-            # Market must still be open
+            # Market must still be open — and we must be outside the final
+            # 45-second close window.  Orders are FAK (no resting book), but
+            # in the final seconds the UP price can dump to near-zero as the
+            # winner becomes obvious on-chain, and a buy @ 0.49 would fill
+            # at that crushed price for an almost-guaranteed loss.
             end_date = market.get("end_date")
             if end_date is not None:
                 minutes_left = (end_date - datetime.now(timezone.utc)).total_seconds() / 60
             else:
                 minutes_left = market.get("minutes_until_close")
-            if minutes_left is not None and minutes_left < 0:
+            if minutes_left is not None and minutes_left < CLOSE_BUFFER_MINUTES:
                 continue
 
             _mkt_label = f"{coin.upper()}_{interval} {slug[:30]}"
