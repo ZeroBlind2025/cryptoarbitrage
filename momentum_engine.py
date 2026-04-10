@@ -119,7 +119,7 @@ MAX_ENTRIES_PER_MARKET = int(os.getenv("MOMENTUM_MAX_ENTRIES_PER_MARKET", "2"))
 # Prevents rapid-fire follow-ups when price ticks up within the same scan cycle.
 FOLLOW_UP_COOLDOWN = int(os.getenv("MOMENTUM_FOLLOW_UP_COOLDOWN", "30"))
 FOLLOW_UP_COOLDOWN_15M = int(os.getenv("MOMENTUM_15m_COOLDOWN", "240"))  # 4 minutes for 15m markets
-REENTRY_MIN_PRICE = float(os.getenv("MOMENTUM_REENTRY_MIN_PRICE", "0.899"))  # only re-enter above 89.9¢
+REENTRY_MIN_PRICE = float(os.getenv("MOMENTUM_REENTRY_MIN_PRICE", "0.80"))  # only re-enter once momentum is confirmed (price >= 80¢)
 
 # Minimum minutes before market close to allow entry.
 # Prevents placing trades after (or right at) the close time.
@@ -938,6 +938,7 @@ class MomentumEngine:
         print(f"  Markets: {', '.join(INTERVALS) if INTERVALS else 'NONE (all disabled!)'}")
         print(f"  Hedge: {'ENABLED' if MOMENTUM_HEDGE_ENABLE else 'DISABLED'} | gap: {MOMENTUM_HEDGE_PCT:.0f}¢")
         print(f"  Re-entry: upward only, max {self.max_entries_per_market} entries/market")
+        print(f"  Re-entry confirmation floor: {REENTRY_MIN_PRICE*100:.0f}¢ (MOMENTUM_REENTRY_MIN_PRICE)")
         _delay_status = "DISABLED" if getattr(self, '_dry_run_no_delays', False) else "ENABLED"
         _delay_info = ", ".join(f"{k}={int(v*60)}s" for k, v in MARKET_ENTRY_DELAY.items()) if _delay_status == "ENABLED" else ""
         print(f"  Delays/cooldowns: {_delay_status}" + (f" ({_delay_info})" if _delay_info else ""))
@@ -1686,6 +1687,23 @@ class MomentumEngine:
                         elapsed = time.time() - last_t
                         if elapsed < cooldown:
                             continue  # still in cooldown
+
+                    # --- RE-ENTRY CONFIRMATION FLOOR: only re-enter once
+                    # momentum has been confirmed by price reaching the
+                    # REENTRY_MIN_PRICE threshold (default 80¢).  This stops
+                    # rapid-fire probes at 60-79¢ where momentum is still
+                    # unconfirmed and lets the engine stack entries once the
+                    # market has decisively trended in our direction.
+                    if price < REENTRY_MIN_PRICE:
+                        if self.scans_completed % 30 == 1:
+                            _re_label = f"{coin.upper()}_{market['interval']} {slug[:30]}"
+                            print(
+                                f"  RE-ENTRY GATED {_re_label} {outcome} "
+                                f"@ {price*100:.1f}¢: below confirmation "
+                                f"{REENTRY_MIN_PRICE*100:.0f}¢",
+                                flush=True,
+                            )
+                        continue
 
                     # Update last buy price for upward-only tracking
                     # (fall through to ENTER THE TRADE block below)
