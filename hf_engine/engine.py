@@ -358,6 +358,13 @@ class HFEngine:
         priors = self.calibrator.current_priors()
         with self._markets_lock:
             active = len(self.markets)
+
+        # Top 3 reject reasons from the signal executor so we can see
+        # at a glance which gate is eating signals.
+        hist = self.executor.reject_reason_histogram()
+        top_rejects = sorted(hist.items(), key=lambda kv: -kv[1])[:3]
+        reject_str = ", ".join(f"{k}={v}" for k, v in top_rejects) or "-"
+
         self._log(
             f"heartbeat "
             f"uptime={self.uptime_seconds:.0f}s "
@@ -369,7 +376,11 @@ class HFEngine:
             f"subs={feed_stats['subscribed_tokens']}, "
             f"reg={feed_stats['registered_tokens']}, "
             f"msgs={feed_stats['messages_received']}, "
-            f"trades={feed_stats['trades_received']}) "
+            f"books={feed_stats['book_updates']}, "
+            f"trades={feed_stats['trades_received']}, "
+            f"unknown={feed_stats['unknown_asset_events']}) "
+            f"signals(pass={self.executor.signals_accepted_total}, "
+            f"rej={self.executor.signals_rejected_total}, {reject_str}) "
             f"pnl=${ex_stats['realized_pnl']:+.3f} "
             f"W/L={ex_stats['wins']}/{ex_stats['losses']} "
             f"priors(α={priors[0]:.3f} β={priors[1]:.3f} π={priors[2]:.3f})"

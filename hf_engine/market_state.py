@@ -166,7 +166,29 @@ class MarketState:
 
     @property
     def branching_ratio_max(self) -> float:
+        """Static model parameter max(alpha_buy/beta_buy, alpha_sell/beta_sell).
+
+        Kept for compatibility with the snapshot / calibration code.
+        Cascade detection no longer uses this value — see
+        ``excitation_ratio_max`` for the live cascade signal.
+        """
         return max(self.hawkes_buy.branching_ratio, self.hawkes_sell.branching_ratio)
+
+    @property
+    def excitation_ratio_max(self) -> float:
+        """Live cascade signal across both sides.
+
+        This is ``max(intensity_buy / mu_buy, intensity_sell / mu_sell)``.
+        Unlike the branching ratio (which is a static parameter of the
+        model), this responds to trade clustering in real time — each
+        trade bumps the corresponding side's intensity by ``alpha`` and
+        the bump decays exponentially between events. When a burst of
+        informed trades hits the book the ratio climbs well above its
+        steady-state value, which is the signature of a cascade.
+        """
+        return max(
+            self.hawkes_buy.excitation_ratio, self.hawkes_sell.excitation_ratio
+        )
 
     @property
     def time_remaining_sec(self) -> float:
@@ -288,15 +310,30 @@ class MarketState:
         total = lam_buy + lam_sell
         self.flow_imbalance = (lam_buy / total - 0.5) if total > 0 else 0.0
 
-        # 3. Branching ratio / cascade flag.
-        n_max = self.branching_ratio_max
-        self.cascade_active = n_max > self.cfg.cascade_threshold
+        # 3. Cascade detection.
+        #
+        # Use the live excitation ratio (intensity / mu) rather than
+        # the static branching ratio (alpha / beta). The branching
+        # ratio is a parameter of the model, fixed by the priors, and
+        # therefore never changes during a market's life — it cannot
+        # serve as a "cascade is happening right now" signal. The
+        # excitation ratio responds directly to trade clustering: each
+        # trade bumps the corresponding side's intensity by alpha, the
+        # bump decays exponentially between events, and the ratio
+        # climbs well above its steady-state value during a burst.
+        exc_max = self.excitation_ratio_max
+        self.cascade_active = exc_max > self.cfg.cascade_threshold
 
         # 4. Hawkes-adaptive pi (Section 4.5 Method 3).
-        if self.cascade_active and self.cfg.cascade_threshold < 1.0:
-            boost = self.cfg.pi_hawkes_boost * max(0.0, n_max - self.cfg.cascade_threshold) / (
-                1.0 - self.cfg.cascade_threshold
-            )
+        #
+        # When a cascade is active, scale the informed-fraction upwards
+        # by how far the excitation ratio exceeds the cascade threshold.
+        # At the threshold the boost is 0; at 2x the threshold the boost
+        # reaches its configured maximum.
+        if self.cascade_active and self.cfg.cascade_threshold > 0.0:
+            excess = exc_max - self.cfg.cascade_threshold
+            boost_frac = min(1.0, max(0.0, excess / self.cfg.cascade_threshold))
+            boost = self.cfg.pi_hawkes_boost * boost_frac
             self.pi_effective = min(self.cfg.pi_base + boost, self.cfg.pi_cap)
         else:
             self.pi_effective = self.cfg.pi_base
@@ -373,7 +410,7 @@ class MarketState:
         # Confidence is the scaled absolute imbalance, bounded to [0,1].
         confidence = min(1.0, abs(self.flow_imbalance) * 2.0)
         reason = (
-            f"cascade n={self.branching_ratio_max:.2f} "
+            f"cascade exc={self.excitation_ratio_max:.2f} "
             f"imbalance={self.flow_imbalance:+.3f} "
             f"posterior={self.posterior:.3f} "
             f"clob={clob_price:.3f} "

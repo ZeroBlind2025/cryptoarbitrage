@@ -94,9 +94,31 @@ class HawkesTracker:
 
     @property
     def branching_ratio(self) -> float:
+        """Static model parameter ``alpha / beta``.
+
+        This is **not** a live cascade signal — it is a property of the
+        Hawkes model itself, fixed by the priors (and updated only by
+        the post-resolution calibrator). For the "is a cascade happening
+        right now?" question, use ``excitation_ratio`` instead.
+        """
         if self.beta <= 0.0:
             return float("inf")
         return self.alpha / self.beta
+
+    @property
+    def excitation_ratio(self) -> float:
+        """Live cascade signal: current intensity relative to baseline.
+
+        Returns ``intensity / mu``. At steady state on a subcritical
+        Hawkes process with branching ratio ``n``, the expected value
+        is ``1 / (1 - n)`` (so ~2.0 for n=0.5). Values well above the
+        steady-state level indicate the process is receiving more
+        events than its baseline rate predicts — i.e. a self-exciting
+        cascade is underway.
+        """
+        if self.mu <= 0.0:
+            return 0.0
+        return self.intensity / self.mu
 
     def snapshot(self) -> dict:
         return {

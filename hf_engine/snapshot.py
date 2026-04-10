@@ -152,11 +152,16 @@ def market_snapshot(m: MarketState) -> Dict[str, Any]:
         "progress": progress,
         "hawkesBuy": {
             "intensity": float(m.hawkes_buy.intensity),
-            "n": float(min(m.hawkes_buy.branching_ratio, 5.0)),
+            # ``n`` is the live excitation ratio (intensity / mu), not
+            # the static branching ratio. This is what the dashboard's
+            # cascade gauge reads.
+            "n": float(min(m.hawkes_buy.excitation_ratio, 10.0)),
+            "branching_ratio": float(m.hawkes_buy.branching_ratio),
         },
         "hawkesSell": {
             "intensity": float(m.hawkes_sell.intensity),
-            "n": float(min(m.hawkes_sell.branching_ratio, 5.0)),
+            "n": float(min(m.hawkes_sell.excitation_ratio, 10.0)),
+            "branching_ratio": float(m.hawkes_sell.branching_ratio),
         },
         "posterior": float(m.posterior),
         "logOdds": float(m.gm.log_odds),

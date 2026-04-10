@@ -111,6 +111,13 @@ class HFETradeFeed:
         # for each discovered market.
         self._first_trade_logged: Set[str] = set()
         self._first_book_logged: Set[str] = set()
+        # Counter for events whose asset_id wasn't in the registry.
+        # These are silently dropped by ``_handle_book`` / ``_handle_trade``
+        # but if the count is non-zero something is subscribing with
+        # the wrong token id — we log a sample periodically so the
+        # problem is visible rather than invisible.
+        self.unknown_asset_events: int = 0
+        self._unknown_asset_samples: Set[str] = set()
 
     # ------------------------------------------------------------------ #
     # Public API
@@ -151,6 +158,29 @@ class HFETradeFeed:
                 market_id=market_id, token_id=no_token_id, is_yes=False
             )
         self._subscribe([yes_token_id, no_token_id])
+
+    def _note_unknown_asset(self, asset_id: str, kind: str) -> None:
+        """Rate-limited log of events received for asset ids we didn't
+        register. Seeing a high count here means the subscription token
+        ids do not match what Polymarket's WebSocket is pushing — the
+        classic Gamma-vs-CLOB token-id mismatch.
+        """
+        self.unknown_asset_events += 1
+        if len(self._unknown_asset_samples) < 3:
+            if asset_id not in self._unknown_asset_samples:
+                self._unknown_asset_samples.add(asset_id)
+                print(
+                    f"{self.log_prefix} UNKNOWN asset_id ({kind}) {asset_id[:24]}... "
+                    f"— subscribed tokens do not match WS asset_ids "
+                    f"(count={self.unknown_asset_events})",
+                    flush=True,
+                )
+        elif self.unknown_asset_events % 500 == 0:
+            print(
+                f"{self.log_prefix} UNKNOWN asset_id count now "
+                f"{self.unknown_asset_events}",
+                flush=True,
+            )
 
     def unregister_market(self, market_id: str) -> None:
         """Drop a market from the registry. We cannot unsubscribe on
@@ -320,6 +350,7 @@ class HFETradeFeed:
         with self._lock:
             reg = self._registry.get(asset_id)
         if reg is None:
+            self._note_unknown_asset(asset_id, kind="trade")
             return
 
         try:
@@ -382,6 +413,7 @@ class HFETradeFeed:
         with self._lock:
             reg = self._registry.get(asset_id)
         if reg is None:
+            self._note_unknown_asset(asset_id, kind="book")
             return
 
         bids = data.get("bids", []) or []
@@ -440,6 +472,7 @@ class HFETradeFeed:
             with self._lock:
                 reg = self._registry.get(asset_id)
             if reg is None:
+                self._note_unknown_asset(asset_id, kind="price_change")
                 continue
 
             best_bid = None
@@ -479,5 +512,6 @@ class HFETradeFeed:
             "messages_received": self.messages_received,
             "trades_received": self.trades_received,
             "book_updates": self.book_updates,
+            "unknown_asset_events": self.unknown_asset_events,
             "last_message": self.last_message_time,
         }

@@ -74,11 +74,17 @@ class HFEConfig:
     hawkes_mu_fallback: float = 0.2
 
     # Duration of the early-observation window used to estimate mu fresh
-    # for each market before signal gating is enabled.
-    mu_observation_window_sec: float = 15.0
+    # for each market before signal gating is enabled. 5m markets are
+    # only 300s long, so 15s is 5% of the whole market life; 5s keeps
+    # gates active for 98% of the market.
+    mu_observation_window_sec: float = 5.0
 
-    # Cascade threshold on the branching ratio n = alpha / beta.
-    cascade_threshold: float = 0.5
+    # Cascade threshold on the **live excitation ratio** intensity/mu
+    # (not the static branching ratio alpha/beta — that is a model
+    # parameter, not an observable). Steady-state intensity on a
+    # subcritical Hawkes process with n=0.5 sits around 2.0 * mu, so
+    # ``cascade_threshold=2.0`` flags any above-steady-state burst.
+    cascade_threshold: float = 2.0
 
     # Hard cap on the per-side intensity to keep the recursion stable if
     # a pathological burst of trades arrives.
@@ -101,7 +107,11 @@ class HFEConfig:
     min_flow_imbalance: float = 0.15
     min_edge: float = 0.05                 # dollars (posterior vs CLOB)
     min_time_remaining_sec: float = 30.0
-    min_book_depth: float = 50.0           # contracts
+    # Top-of-book depth in contracts. Polymarket 5m updown markets often
+    # have thin books — the old default of 50 was rejecting essentially
+    # every candidate. 10 is a safer floor while still guarding against
+    # single-lot markets where slippage would dominate.
+    min_book_depth: float = 10.0
 
     # ------------------------------------------------------------------
     # 10.4 — Position sizing

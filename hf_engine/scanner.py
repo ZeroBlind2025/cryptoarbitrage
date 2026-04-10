@@ -92,6 +92,7 @@ class MarketScanner:
         raw_count = len(raw_markets)
         kept_count = 0
         new_count = 0
+        fixed_token_ids = 0
         out: List[MarketMeta] = []
         for raw in raw_markets:
             meta = self._normalize(raw, now)
@@ -100,6 +101,23 @@ class MarketScanner:
             kept_count += 1
             if meta.market_id in self._seen:
                 continue
+
+            # CRITICAL: Polymarket's Gamma ``clobTokenIds`` sometimes
+            # differ in format from the canonical CLOB order-book token
+            # IDs that the WebSocket keys events on. If we subscribe
+            # with the Gamma IDs the feed silently drops every trade
+            # and every book update. Re-query the CLOB API to get the
+            # exact IDs the WS uses.
+            canonical = self._fetch_canonical_token_ids(meta.market_id)
+            if canonical and len(canonical) == 2:
+                gamma_ids = (meta.yes_token_id, meta.no_token_id)
+                if canonical != list(gamma_ids) and canonical != [gamma_ids[1], gamma_ids[0]]:
+                    fixed_token_ids += 1
+                    # The CLOB endpoint returns tokens in the same
+                    # order as ``outcomes`` (usually Up/Yes first).
+                    meta.yes_token_id = canonical[0]
+                    meta.no_token_id = canonical[1]
+
             new_count += 1
             self._seen[meta.market_id] = now
             out.append(meta)
@@ -111,11 +129,7 @@ class MarketScanner:
             if self._seen[k] < cutoff:
                 del self._seen[k]
 
-        # Log the first scan (so we know the scanner ran at all) and
-        # then a short summary every 6 scans (~1 minute at default
-        # cadence) so the Railway log doesn't get too noisy but still
-        # tells us what the filters are doing.
-        if self._scan_count == 1 or self._scan_count % 6 == 0:
+        if self._scan_count == 1 or self._scan_count % 6 == 0 or new_count > 0:
             top_rejects = sorted(
                 self._reject_reasons.items(), key=lambda kv: -kv[1]
             )[:3]
@@ -123,6 +137,7 @@ class MarketScanner:
             print(
                 f"{self.cfg.log_prefix} scan#{self._scan_count} "
                 f"raw={raw_count} kept={kept_count} new={new_count} "
+                f"token-id-fixed={fixed_token_ids} "
                 f"total_seen={len(self._seen)} "
                 f"top_rejects={reject_str} "
                 f"errors={self._fetch_errors}",
@@ -284,6 +299,55 @@ class MarketScanner:
             self._fetch_errors += errors_this_scan
 
         return list(merged_by_id.values())
+
+    # ------------------------------------------------------------------ #
+    # Canonical CLOB token IDs
+    # ------------------------------------------------------------------ #
+
+    def _fetch_canonical_token_ids(self, condition_id: str) -> Optional[List[str]]:
+        """Re-fetch the canonical CLOB token IDs for a market.
+
+        The Gamma API's ``clobTokenIds`` field sometimes has a different
+        string format than the token IDs the CLOB WebSocket keys events
+        on. Subscribing with the Gamma IDs then silently drops every
+        incoming trade / book update because ``_handle_book`` can't find
+        the asset id in ``self._registry``.
+
+        This helper hits ``GET /markets/{condition_id}`` on the CLOB
+        REST API which returns the canonical pair. Mirrors
+        ``momentum_engine._fetch_clob_token_ids`` so the HF engine
+        inherits the same fix without importing from that module.
+
+        Returns ``[token_id_0, token_id_1]`` on success, ``None`` on
+        any error. A soft 3-second timeout keeps a slow CLOB API from
+        stalling the scanner.
+        """
+        if not condition_id:
+            return None
+        try:
+            resp = self._session.get(
+                f"{self.cfg.clob_api_base}/markets/{condition_id}",
+                timeout=3,
+            )
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+        except Exception:
+            return None
+
+        tokens = data.get("tokens") if isinstance(data, dict) else None
+        if not isinstance(tokens, list) or len(tokens) < 2:
+            return None
+
+        out = []
+        for t in tokens[:2]:
+            if not isinstance(t, dict):
+                return None
+            tid = t.get("token_id")
+            if not tid:
+                return None
+            out.append(str(tid))
+        return out
 
     # ------------------------------------------------------------------ #
     # Normalization

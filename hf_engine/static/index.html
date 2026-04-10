@@ -214,11 +214,11 @@ function render() {
     hawkesDiv.append(bsLabels);
     metrics.append(hawkesDiv);
 
-    // Branching ratio
+    // Excitation ratio (live intensity / baseline mu)
     const brDiv = h('div', {});
-    brDiv.append(h('div', { style: { fontSize:'7px', color:'#444', marginBottom:'2px' }}, 'BRANCHING RATIO'));
-    brDiv.append(h('div', { style: { fontSize:'14px', fontWeight:700, color: maxN>.7?'#ef4444':maxN>.5?'#f59e0b':'#555' }}, fmt(maxN,2)));
-    brDiv.append(h('div', { style: { fontSize:'7px', color: maxN>.5?'#f59e0b':'#333' }}, maxN>.7?'CRITICAL':maxN>.5?'ACTIVE':'SUBCRIT'));
+    brDiv.append(h('div', { style: { fontSize:'7px', color:'#444', marginBottom:'2px' }}, 'EXCITATION'));
+    brDiv.append(h('div', { style: { fontSize:'14px', fontWeight:700, color: maxN>4?'#ef4444':maxN>2?'#f59e0b':'#555' }}, fmt(maxN,2) + 'x'));
+    brDiv.append(h('div', { style: { fontSize:'7px', color: maxN>2?'#f59e0b':'#333' }}, maxN>4?'BURST':maxN>2?'ACTIVE':'CALM'));
     metrics.append(brDiv);
 
     // Flow imbalance
