@@ -1710,9 +1710,12 @@ class MomentumEngine:
     def check_resolutions(self):
         """Check if any momentum-sourced open positions have resolved.
 
-        Delegates to the same resolution logic as the copy trader.
+        Uses ONLY the CLOB API `winner` flag (sourced from the on-chain UMA
+        oracle resolution).  No price-based shortcuts, no outcome-name
+        fallbacks, no Gamma-API thresholds — because those can be wrong when
+        prices spike in the last few seconds of a market.
         """
-        from copy_trader import get_market_resolution, retry_pending_redemptions
+        from copy_trader import check_clob_market_resolution, retry_pending_redemptions
 
         now = time.time()
 
@@ -1737,115 +1740,85 @@ class MomentumEngine:
         resolved_count = 0
 
         # Cache resolution results by condition_id to avoid duplicate API calls
-        # when multiple position entries exist for the same market (e.g. re-entries).
-        _resolution_cache = {}
+        # when multiple position entries exist for the same market.
+        _resolution_cache: dict = {}
 
         for position in momentum_positions[:]:
             condition_id = position.get("condition_id", "")
-            slug = position.get("slug", "")
             token_id = position.get("token_id", "")
-            our_outcome = position.get("outcome")
+            slug = position.get("slug", "")
 
-            if not token_id and not condition_id and not slug:
+            if not condition_id:
                 continue
 
-            # Use cached result if we already checked this condition_id this cycle
-            cache_key = condition_id or slug or token_id
-            if cache_key in _resolution_cache:
-                result = dict(_resolution_cache[cache_key])  # copy — don't mutate cache
-                # Re-derive our_token_won for THIS position's token_id
-                # (probe and hedge share condition_id but have different tokens)
-                winning_tid = result.get("winning_token_id", "")
-                if winning_tid and token_id:
-                    result["our_token_won"] = (str(token_id).strip() == str(winning_tid).strip())
-                elif "our_token_won" in result:
-                    del result["our_token_won"]  # stale — fall through to outcome/index match
+            # Cache per condition_id so probe + hedge share one API call
+            if condition_id in _resolution_cache:
+                result = _resolution_cache[condition_id]
             else:
-                result = get_market_resolution(
-                    condition_id=condition_id,
-                    slug=slug,
-                    token_id=token_id,
-                    our_outcome=our_outcome,
-                )
-                _resolution_cache[cache_key] = result
+                result = check_clob_market_resolution(condition_id, token_id)
+                _resolution_cache[condition_id] = result
 
-            if not result or not result.get("resolved"):
-                # Fallback: use live WebSocket price for resolution
-                # Only trigger in the final 10 seconds of a market to avoid
-                # false wins/losses from mid-window price spikes to 99¢.
-                live_price = self.get_live_price(token_id) if token_id else None
-                _in_final_seconds = False
-                end_date_str = position.get("end_date")
-                if end_date_str:
-                    try:
-                        end_dt = datetime.fromisoformat(end_date_str) if isinstance(end_date_str, str) else end_date_str
-                        secs_left = (end_dt - datetime.now(timezone.utc)).total_seconds()
-                        _in_final_seconds = secs_left <= 10
-                    except Exception:
-                        pass
-                if _in_final_seconds and live_price is not None and (live_price >= 0.98 or live_price <= 0.02):
-                    our_token_won = live_price >= 0.98
-                    print(f"[MOMENTUM] Price-based resolution (final 10s): {position['market'][:30]} "
-                          f"| price={live_price:.4f} → {'WIN' if our_token_won else 'LOSS'}", flush=True)
-                    result = {
-                        "resolved": True,
-                        "our_token_won": our_token_won,
-                        "winning_outcome": our_outcome if our_token_won else None,
-                    }
+            # --- NOT RESOLVED ON-CHAIN YET ---
+            # CLOB returns None / resolved=False until the UMA oracle has set
+            # the `winner` flag.  Retry until a long timeout, then mark UNKNOWN.
+            if not result or not result.get("resolved") or not result.get("winning_token_id"):
+                if "_first_resolve_check" not in position:
+                    position["_first_resolve_check"] = time.time()
+                first_check = position["_first_resolve_check"]
+                elapsed_mins = (time.time() - first_check) / 60
+                interval = position.get("interval", "")
+                if interval == "5m":
+                    max_wait_mins = 15
+                elif interval == "15m":
+                    max_wait_mins = 30
                 else:
-                    # Track unresolved attempts with timestamps for smarter retry
-                    attempts = position.get("_resolve_attempts", 0) + 1
-                    position["_resolve_attempts"] = attempts
-                    if attempts == 1:
-                        position["_first_resolve_check"] = time.time()
+                    max_wait_mins = 120
+                if elapsed_mins < max_wait_mins:
                     continue
+
+                # Timeout reached — mark UNKNOWN with zero pnl and move on.
+                position["result"] = "UNKNOWN"
+                position["pnl"] = 0
+                position["won"] = None
+                position["resolved_at"] = datetime.now(timezone.utc).isoformat()
+                print(f"[MOMENTUM] UNKNOWN after {elapsed_mins:.0f}min: {position['market'][:30]}", flush=True)
+                _log_trade("resolved", {
+                    "id": position.get("id", ""),
+                    "coin": position.get("slug", "").split("-")[0] if position.get("slug") else "",
+                    "interval": interval,
+                    "outcome": position.get("outcome", ""),
+                    "entry_price": position.get("entry_price", 0),
+                    "amount": position.get("amount", 0),
+                    "result": "UNKNOWN",
+                    "pnl": 0,
+                    "won": None,
+                    "slug": slug,
+                    "market": position.get("market", ""),
+                    "condition_id": condition_id,
+                    "entered_at": position.get("timestamp", ""),
+                })
+                if position in self.positions.get("open", []):
+                    self.positions["open"].remove(position)
+                self.positions.setdefault("resolved", []).append(position)
+                resolved_count += 1
+                continue
+
+            # --- RESOLVED ON-CHAIN ---
+            # Strict token_id comparison against the CLOB winner flag.
+            # `winning_token_id` comes from CLOB /markets → tokens[i].winner,
+            # which is set from the UMA oracle on-chain resolution.
+            winning_tid = str(result.get("winning_token_id", "")).strip()
+            our_tid = str(token_id).strip()
+            if not winning_tid or not our_tid:
+                # Shouldn't happen after the guard above, but be safe
+                continue
+            won = (our_tid == winning_tid)
+            winning_outcome = result.get("winning_outcome")
 
             entry_price = position.get("entry_price", 0)
             amount = position.get("amount", 0)
-            our_index = position.get("outcome_index")
 
-            won = None
-            winning_outcome = result.get("winning_outcome")
-            winning_index = result.get("winning_index")
-
-            # --- Determine win/loss using multiple signals ---
-            # Priority 1: Direct token_id comparison from CLOB API
-            if "our_token_won" in result and result["our_token_won"] is not None:
-                won = result["our_token_won"]
-
-            # Priority 2: Outcome name comparison
-            if won is None and winning_outcome and our_outcome:
-                our_norm = our_outcome.lower().strip()
-                win_norm = winning_outcome.lower().strip()
-                if our_norm == win_norm or our_norm.startswith(win_norm) or win_norm.startswith(our_norm):
-                    won = True
-                else:
-                    won = False
-
-            # Priority 3: Outcome index comparison
-            if won is None and winning_index is not None and our_index is not None:
-                won = (winning_index == our_index)
-
-            # Safety net: if CLOB token comparison said LOSS but outcome name
-            # says WIN (e.g. token_id formatting mismatch), trust the name match.
-            # A genuine loss can't have matching outcome names.
-            if won is False and winning_outcome and our_outcome:
-                our_norm = our_outcome.lower().strip()
-                win_norm = winning_outcome.lower().strip()
-                if our_norm == win_norm or our_norm.startswith(win_norm) or win_norm.startswith(our_norm):
-                    print(f"[MOMENTUM] OVERRIDE: token_id said LOSS but outcome name matches "
-                          f"(ours={our_outcome}, winner={winning_outcome}). Correcting to WIN.", flush=True)
-                    won = True
-
-            # Priority 4: Live price fallback when API says resolved but no winner info
-            # This catches the case where Gamma returns resolved=True with no outcome data
-            if won is None and token_id:
-                live_price = self.get_live_price(token_id)
-                if live_price is not None and (live_price >= 0.95 or live_price <= 0.05):
-                    won = live_price >= 0.95
-                    print(f"[MOMENTUM] Resolved-but-no-winner fallback: price={live_price:.4f} → {'WIN' if won else 'LOSS'}", flush=True)
-
-            if won is True:
+            if won:
                 if entry_price > 0:
                     payout = amount / entry_price
                     pnl = payout - amount
@@ -1862,7 +1835,6 @@ class MomentumEngine:
                     # Skip if already queued — retry_pending_redemptions will handle it
                     if _is_pending_redemption(condition_id):
                         position["redeemed"] = False
-                        # Don't spam — just note once and let the queue handle it
                     else:
                         redeemed = redeem_winning_position(
                             condition_id=condition_id,
@@ -1899,34 +1871,12 @@ class MomentumEngine:
                             _queue_pending_redemption(condition_id, token_id, slug)
                     except Exception:
                         pass
-
-            elif won is False:
+            else:
                 pnl = -amount
                 position["result"] = "LOSS"
                 position["pnl"] = pnl
                 self.positions["stats"]["losses"] = self.positions["stats"].get("losses", 0) + 1
                 print(f"[MOMENTUM] LOSS: {position['market'][:30]} | -${amount:.2f}", flush=True)
-            else:
-                # Interval-aware retry: 60m markets need much longer to settle
-                # than 5m/15m. Use time-based threshold instead of fixed attempts.
-                if "_first_resolve_check" not in position:
-                    position["_first_resolve_check"] = time.time()
-                first_check = position["_first_resolve_check"]
-                elapsed_mins = (time.time() - first_check) / 60
-                # Max wait: 15 min for 5m, 30 min for 15m, 120 min for 60m
-                interval = position.get("interval", "")
-                if interval == "5m":
-                    max_wait_mins = 15
-                elif interval == "15m":
-                    max_wait_mins = 30
-                else:
-                    max_wait_mins = 120  # 60m markets can take a while
-                if elapsed_mins < max_wait_mins:
-                    continue
-                pnl = 0
-                position["result"] = "UNKNOWN"
-                position["pnl"] = 0
-                print(f"[MOMENTUM] UNKNOWN after {elapsed_mins:.0f}min: {position['market'][:30]}", flush=True)
 
             # Update totals
             self.positions["stats"]["total_pnl"] = self.positions["stats"].get("total_pnl", 0) + pnl
@@ -1935,12 +1885,12 @@ class MomentumEngine:
             try:
                 stats = self.positions["stats"]
                 bal = stats.get("balance", ALGO_STARTING_BALANCE)
-                if won is True:
+                if won:
                     payout = amount / entry_price if entry_price > 0 else amount
                     bal += payout
                 stats["balance"] = bal
                 open_staked = sum(p.get("amount", 0) for p in self.positions.get("open", []) if p is not position)
-                event_type = "win" if won is True else "loss" if won is False else "resolved"
+                event_type = "win" if won else "loss"
                 stats.setdefault("balance_history", []).append({
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                     "balance": bal,
@@ -1967,9 +1917,9 @@ class MomentumEngine:
                 "pnl": pnl,
                 "won": won,
                 "winning_outcome": winning_outcome,
-                "slug": position.get("slug", ""),
+                "slug": slug,
                 "market": position.get("market", ""),
-                "condition_id": position.get("condition_id", ""),
+                "condition_id": condition_id,
                 "entered_at": position.get("timestamp", ""),
             })
             self.positions["open"].remove(position)
