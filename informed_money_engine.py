@@ -503,41 +503,15 @@ class InformedMoneyEngine(MomentumEngine):
                 _resolution_cache[cache_key] = result
 
             if not result or not result.get("resolved"):
-                # Live-price fallback in final 10 seconds (mirror of parent)
-                live_price = self.get_live_price(token_id) if token_id else None
-                _in_final_seconds = False
-                end_date_str = position.get("end_date")
-                if end_date_str:
-                    try:
-                        end_dt = (
-                            datetime.fromisoformat(end_date_str)
-                            if isinstance(end_date_str, str)
-                            else end_date_str
-                        )
-                        secs_left = (
-                            end_dt - datetime.now(timezone.utc)
-                        ).total_seconds()
-                        _in_final_seconds = secs_left <= 10
-                    except Exception:
-                        pass
-                if (_in_final_seconds
-                        and live_price is not None
-                        and (live_price >= 0.98 or live_price <= 0.02)):
-                    our_token_won = live_price >= 0.98
-                    print(f"[INFORMED] Price-based resolution (final 10s): "
-                          f"{position['market'][:30]} | price={live_price:.4f} "
-                          f"→ {'WIN' if our_token_won else 'LOSS'}", flush=True)
-                    result = {
-                        "resolved": True,
-                        "our_token_won": our_token_won,
-                        "winning_outcome": our_outcome if our_token_won else None,
-                    }
-                else:
-                    attempts = position.get("_resolve_attempts", 0) + 1
-                    position["_resolve_attempts"] = attempts
-                    if attempts == 1:
-                        position["_first_resolve_check"] = time.time()
-                    continue
+                # On-chain only — no live-price shortcuts.  Last-second
+                # WS price spikes have caused paper-trading mismarks,
+                # so we wait for the CLOB API winner to come back before
+                # marking a position WIN/LOSS.
+                attempts = position.get("_resolve_attempts", 0) + 1
+                position["_resolve_attempts"] = attempts
+                if attempts == 1:
+                    position["_first_resolve_check"] = time.time()
+                continue
 
             entry_price = position.get("entry_price", 0)
             amount = position.get("amount", 0)
@@ -574,14 +548,9 @@ class InformedMoneyEngine(MomentumEngine):
                           "name matches. Correcting to WIN.", flush=True)
                     won = True
 
-            # Last-resort live price fallback
-            if won is None and token_id:
-                live_price = self.get_live_price(token_id)
-                if live_price is not None and (live_price >= 0.95 or live_price <= 0.05):
-                    won = live_price >= 0.95
-                    print(f"[INFORMED] Resolved-but-no-winner fallback: "
-                          f"price={live_price:.4f} → "
-                          f"{'WIN' if won else 'LOSS'}", flush=True)
+            # No live-price fallback: if on-chain said "resolved" but we
+            # can't derive a winner from outcome name / index / token id,
+            # leave won=None so the unknown-timeout path below handles it.
 
             pnl = 0.0
             if won is True:
