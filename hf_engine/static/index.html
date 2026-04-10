@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Hawkes-GM Engine | HarwoodLabs</title>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #06060c; color: #e2e8f0; font-family: 'JetBrains Mono', monospace; padding: 14px; min-height: 100vh; }
+  @keyframes pulse { 0%,100% { opacity:1 } 50% { opacity:.6 } }
+  @keyframes badgePulse { 0%,100% { opacity:1 } 50% { opacity:.65 } }
+  .badge { padding: 1px 6px; border-radius: 3px; font-size: 8px; font-weight: 700; letter-spacing: .5px; display: inline-block; }
+  .card { background: #0d0d14; border: 1px solid #1a1a2e; border-radius: 6px; padding: 12px; margin-bottom: 8px; transition: all .3s; }
+  .card.cascade { border-color: #f59e0b33; }
+  .card.positioned { background: #0a1628; }
+  .card.resolved { opacity: .65; background: #08080f; }
+  .stat-grid { display: grid; gap: 6px; margin-bottom: 12px; background: #0a0a14; border: 1px solid #1a1a2e; border-radius: 6px; padding: 10px; }
+  .stat-label { font-size: 7px; color: #444; letter-spacing: .5px; margin-bottom: 1px; }
+  .stat-value { font-size: 13px; font-weight: 700; }
+  .stat-sub { font-size: 7px; color: #444; }
+  .section-label { font-size: 9px; color: #333; letter-spacing: 1px; margin-bottom: 4px; }
+  .btn { background: #0d0d14; border: 1px solid; padding: 5px 10px; border-radius: 3px; font-size: 8px; cursor: pointer; font-family: 'JetBrains Mono', monospace; font-weight: 700; letter-spacing: .5px; }
+  .flow-bar, .posterior-bar { position: relative; overflow: hidden; border-radius: 3px; }
+  .resolved-table { max-height: 220px; overflow-y: auto; }
+  .resolved-row { display: grid; gap: 2px; font-size: 9px; padding: 4px 0; border-bottom: 1px solid #0a0a14; }
+  .green { color: #10b981; } .red { color: #ef4444; } .amber { color: #f59e0b; } .blue { color: #3b82f6; } .purple { color: #8b5cf6; }
+  .dim { color: #555; } .dimmer { color: #333; } .bright { color: #e2e8f0; }
+</style>
+</head>
+<body>
+<div id="app">
+  <div style="text-align:center;padding:40px;color:#333">Connecting to engine...</div>
+</div>
+
+<script>
+// ── Vanilla JS Dashboard — no build step ──
+const $ = (s, p) => (p || document).querySelector(s);
+const $$ = (s, p) => [...(p || document).querySelectorAll(s)];
+const h = (tag, attrs, ...ch) => {
+  const el = document.createElement(tag);
+  if (attrs) Object.entries(attrs).forEach(([k, v]) => {
+    if (k === 'style' && typeof v === 'object') Object.assign(el.style, v);
+    else if (k.startsWith('on')) el.addEventListener(k.slice(2).toLowerCase(), v);
+    else el.setAttribute(k, v);
+  });
+  ch.flat().forEach(c => { if (c != null) el.append(typeof c === 'string' ? c : c); });
+  return el;
+};
+const fmt = (n, d=2) => Number(n).toFixed(d);
+const pc = v => v >= 0 ? '#10b981' : '#ef4444';
+const ps = v => v >= 0 ? '+' : '';
+
+let state = null;
+let paused = false;
+let lastPollOk = 0;
+const POLL_MS = 1500;
+
+// ── HTTP polling against the live Python HF engine ──
+async function pollState() {
+  if (paused) return;
+  try {
+    const r = await fetch('/api/state', { cache: 'no-store' });
+    if (!r.ok) throw new Error('status ' + r.status);
+    const d = await r.json();
+    state = d;
+    lastPollOk = Date.now();
+    render();
+  } catch (e) {
+    // Surface the error in the dashboard instead of silently freezing.
+    const app = document.getElementById('app');
+    if (app && !state) {
+      app.innerHTML =
+        '<div style="text-align:center;padding:40px;color:#ef4444;font-family:monospace">' +
+        'Cannot reach HF engine: ' + e.message +
+        '<br><span style="color:#555;font-size:10px">retrying in ' + (POLL_MS/1000) + 's...</span></div>';
+    }
+  }
+}
+setInterval(pollState, POLL_MS);
+pollState();
+
+// ── Render ──
+function render() {
+  if (!state) return;
+  const app = $('#app');
+  app.innerHTML = '';
+
+  const s = state;
+  const active = s.markets.filter(m => !m.resolved);
+  const resolved = s.markets.filter(m => m.resolved && m.position);
+  const wr = s.totalTrades > 0 ? ((s.totalWins / s.totalTrades) * 100).toFixed(1) : '—';
+
+  // Header
+  app.append(h('div', { style: { display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:'12px' }},
+    h('div', {},
+      h('div', { style: { fontSize:'7px', letterSpacing:'3px', color:'#333' }}, 'HARWOODLABS · POLYMARKET'),
+      h('div', { style: { fontSize:'14px', fontWeight:700, color:'#f8fafc', fontFamily:"'Space Mono',monospace" }}, 'HAWKES—GM ENGINE'),
+      h('div', { style: { fontSize:'8px', color:'#333', marginTop:'1px' }}, 'HIGH-FREQUENCY BINARY · CASCADE DETECTION · BAYESIAN FLOW'),
+    ),
+    h('div', { style: { display:'flex', alignItems:'center', gap:'6px' }},
+      h('span', { class:'badge', style: { background:'#0f0a1e', border:'1px solid #8b5cf6', color:'#8b5cf6' }}, '5m/15m'),
+      h('span', { class:'badge', style: { background:'#0a1e14', border:'1px solid #10b981', color:'#10b981' }}, 'LIVE PAPER'),
+      h('button', { class:'btn', style: { borderColor: paused ? '#ef4444' : '#10b981', color: paused ? '#ef4444' : '#10b981' }, onClick: () => { paused = !paused; if (!paused) pollState(); render(); }},
+        paused ? '■ PAUSED' : '● SCANNING'
+      ),
+    ),
+  ));
+
+  // Stats
+  const statGrid = h('div', { class:'stat-grid', style: { gridTemplateColumns:'repeat(7,1fr)' }});
+  const stats = [
+    ['BALANCE', `$${fmt(s.balance)}`, null, '#f8fafc'],
+    ['SESSION P/L', `${ps(s.totalPnl)}$${fmt(Math.abs(s.totalPnl),3)}`, null, pc(s.totalPnl)],
+    ['RESOLVED', String(s.totalTrades), `${s.totalWins}W / ${s.totalTrades-s.totalWins}L`, '#f8fafc'],
+    ['WIN RATE', wr==='—'?'—':`${wr}%`, null, wr!=='—'&&parseFloat(wr)>=50?'#10b981':'#ef4444'],
+    ['ACTIVE', String(s.activeCount), `${s.positionCount} positioned`, '#f8fafc'],
+    ['CASCADES', String(s.cascadeCount), null, s.cascadeCount>0?'#f59e0b':'#333'],
+    ['SIGNALS', String(s.signalCount), null, s.signalCount>0?'#10b981':'#333'],
+  ];
+  stats.forEach(([label, value, sub, color]) => {
+    const d = h('div', {},
+      h('div', { class:'stat-label' }, label),
+      h('div', { class:'stat-value', style: { color }}, value),
+    );
+    if (sub) d.append(h('div', { class:'stat-sub' }, sub));
+    statGrid.append(d);
+  });
+  app.append(statGrid);
+
+  // Active markets
+  app.append(h('div', { class:'section-label' }, `ACTIVE MARKETS · ${active.length} scanning`));
+
+  const sorted = active.sort((a, b) => {
+    const sc = m => (m.signal?4:0) + (m.cascadeActive?2:0) + (m.position?1:0);
+    const diff = sc(b) - sc(a);
+    return diff !== 0 ? diff : a.remaining - b.remaining;
+  });
+
+  sorted.forEach(m => {
+    const remSec = Math.floor(m.remaining / 1000);
+    const remStr = `${Math.floor(remSec/60)}:${String(remSec%60).padStart(2,'0')}`;
+    const maxN = Math.max(m.hawkesBuy.n, m.hawkesSell.n);
+    const edge = m.posterior - m.clobPrice;
+    const hasPos = !!m.position;
+
+    let classes = 'card';
+    if (m.cascadeActive) classes += ' cascade';
+    if (hasPos) classes += ' positioned';
+
+    const card = h('div', { class: classes });
+
+    // Header row
+    const header = h('div', { style: { display:'flex', justifyContent:'space-between', alignItems:'flex-start', marginBottom:'8px' }});
+    const left = h('div', { style: { flex:1 }});
+    const badges = h('div', { style: { display:'flex', alignItems:'center', gap:'6px', marginBottom:'3px', flexWrap:'wrap' }});
+    badges.append(h('span', { style: { fontSize:'9px', color:'#555' }}, m.id));
+    badges.append(h('span', { style: { fontSize:'8px', color:'#333' }}, `${m.duration}m`));
+    if (m.cascadeActive) badges.append(h('span', { class:'badge', style: { background:'#1a1400', border:'1px solid #f59e0b', color:'#f59e0b', animation:'badgePulse 1.5s infinite' }}, 'CASCADE'));
+    if (m.signal) badges.append(h('span', { class:'badge', style: { background: m.signal==='BUY_YES'?'#064e3b':'#4a1d1d', border:`1px solid ${m.signal==='BUY_YES'?'#10b981':'#ef4444'}`, color: m.signal==='BUY_YES'?'#10b981':'#ef4444' }}, m.signal));
+    left.append(badges);
+    left.append(h('div', { style: { fontSize:'11px', color:'#94a3b8', lineHeight:'1.3' }}, m.question));
+    header.append(left);
+
+    const right = h('div', { style: { textAlign:'right', minWidth:'70px' }});
+    right.append(h('div', { style: { fontSize:'14px', fontWeight:700, color: remSec<60?'#ef4444':'#e2e8f0', fontFamily:"'Space Mono',monospace" }}, remStr));
+    right.append(h('div', { style: { fontSize:'7px', color:'#444' }}, 'REMAINING'));
+    header.append(right);
+    card.append(header);
+
+    // Time bar
+    const timePct = Math.max(0, (m.remaining / (m.duration*60*1000)) * 100);
+    const timeBar = h('div', { style: { height:'3px', background:'#111', borderRadius:'2px', overflow:'hidden' }});
+    timeBar.append(h('div', { style: { width:`${timePct}%`, height:'100%', background: timePct<20?'#ef4444':timePct<50?'#f59e0b':'#10b981', borderRadius:'2px', transition:'width .5s' }}));
+    card.append(timeBar);
+
+    // Posterior vs CLOB bar
+    const pBar = h('div', { style: { marginTop:'8px', marginBottom:'8px' }});
+    const pHeader = h('div', { style: { display:'flex', justifyContent:'space-between', marginBottom:'3px' }});
+    pHeader.append(h('span', { style: { fontSize:'8px', color:'#444' }}, 'POSTERIOR vs CLOB'));
+    pHeader.append(h('span', { style: { fontSize:'9px', fontWeight:700, color: Math.abs(edge)>0.05?pc(edge):'#555' }}, `EDGE: ${ps(edge)}${fmt(edge*100,1)}¢`));
+    pBar.append(pHeader);
+
+    const barContainer = h('div', { style: { position:'relative', height:'20px', background:'#0a0a14', borderRadius:'3px', overflow:'hidden', border:'1px solid #1a1a2e' }});
+    barContainer.append(h('div', { style: { position:'absolute', left:`${m.clobPrice*100}%`, top:0, bottom:0, width:'2px', background:'#f59e0b', zIndex:2 }}));
+    barContainer.append(h('div', { style: { position:'absolute', left:`${m.posterior*100}%`, top:0, bottom:0, width:'2px', background:'#3b82f6', zIndex:2 }}));
+    if (Math.abs(edge) > 0.03) {
+      barContainer.append(h('div', { style: { position:'absolute', left:`${Math.min(m.posterior,m.clobPrice)*100}%`, width:`${Math.abs(edge)*100}%`, top:0, bottom:0, background: edge>0?'rgba(16,185,129,.15)':'rgba(239,68,68,.15)' }}));
+    }
+    pBar.append(barContainer);
+
+    const pLabels = h('div', { style: { display:'flex', justifyContent:'space-between', marginTop:'2px' }});
+    pLabels.append(h('span', { style: { fontSize:'7px', color:'#333' }}, '0%'));
+    pLabels.append(h('span', { style: { fontSize:'7px', color:'#f59e0b' }}, `CLOB ${fmt(m.clobPrice*100,1)}¢`));
+    pLabels.append(h('span', { style: { fontSize:'7px', color:'#3b82f6' }}, `GM ${fmt(m.posterior*100,1)}¢`));
+    pLabels.append(h('span', { style: { fontSize:'7px', color:'#333' }}, '100%'));
+    pBar.append(pLabels);
+    card.append(pBar);
+
+    // Metrics row
+    const metrics = h('div', { style: { display:'grid', gridTemplateColumns:'1fr 1fr 1fr 1fr', gap:'8px' }});
+
+    // Hawkes intensity
+    const hawkesDiv = h('div', {});
+    hawkesDiv.append(h('div', { style: { fontSize:'7px', color:'#444', marginBottom:'2px' }}, 'HAWKES INTENSITY'));
+    const bars = h('div', { style: { display:'flex', alignItems:'flex-end', gap:'2px', height:'24px' }});
+    const maxI = Math.max(m.hawkesBuy.intensity, m.hawkesSell.intensity, 1);
+    bars.append(h('div', { style: { width:'20px', height:`${(m.hawkesBuy.intensity/maxI)*24}px`, background:'linear-gradient(to top,#064e3b,#10b981)', borderRadius:'2px 2px 0 0', transition:'height .3s' }}));
+    bars.append(h('div', { style: { width:'20px', height:`${(m.hawkesSell.intensity/maxI)*24}px`, background:'linear-gradient(to top,#4a1d1d,#ef4444)', borderRadius:'2px 2px 0 0', transition:'height .3s' }}));
+    hawkesDiv.append(bars);
+    const bsLabels = h('div', { style: { display:'flex', gap:'2px', marginTop:'1px' }});
+    bsLabels.append(h('span', { style: { fontSize:'7px', color:'#10b981', width:'20px', textAlign:'center', display:'inline-block' }}, 'B'));
+    bsLabels.append(h('span', { style: { fontSize:'7px', color:'#ef4444', width:'20px', textAlign:'center', display:'inline-block' }}, 'S'));
+    hawkesDiv.append(bsLabels);
+    metrics.append(hawkesDiv);
+
+    // Branching ratio
+    const brDiv = h('div', {});
+    brDiv.append(h('div', { style: { fontSize:'7px', color:'#444', marginBottom:'2px' }}, 'BRANCHING RATIO'));
+    brDiv.append(h('div', { style: { fontSize:'14px', fontWeight:700, color: maxN>.7?'#ef4444':maxN>.5?'#f59e0b':'#555' }}, fmt(maxN,2)));
+    brDiv.append(h('div', { style: { fontSize:'7px', color: maxN>.5?'#f59e0b':'#333' }}, maxN>.7?'CRITICAL':maxN>.5?'ACTIVE':'SUBCRIT'));
+    metrics.append(brDiv);
+
+    // Flow imbalance
+    const fiDiv = h('div', {});
+    fiDiv.append(h('div', { style: { fontSize:'7px', color:'#444', marginBottom:'2px' }}, 'FLOW IMBALANCE'));
+    const fiBar = h('div', { style: { position:'relative', height:'6px', background:'#111', borderRadius:'3px', overflow:'hidden' }});
+    fiBar.append(h('div', { style: { position:'absolute', left:'50%', top:0, bottom:0, width:'1px', background:'#333' }}));
+    const fiPct = (m.flowImbalance + 0.5) * 100;
+    const fiColor = m.flowImbalance > 0.15 ? '#10b981' : m.flowImbalance < -0.15 ? '#ef4444' : '#555';
+    fiBar.append(h('div', { style: { position:'absolute', left: m.flowImbalance>=0?'50%':`${fiPct}%`, width:`${Math.abs(fiPct-50)}%`, top:0, bottom:0, background:fiColor, borderRadius:'3px', transition:'all .3s' }}));
+    fiDiv.append(fiBar);
+    fiDiv.append(h('div', { style: { fontSize:'9px', fontWeight:700, color: Math.abs(m.flowImbalance)>.15?pc(m.flowImbalance):'#444', marginTop:'2px' }}, `${ps(m.flowImbalance)}${fmt(m.flowImbalance*100,1)}%`));
+    metrics.append(fiDiv);
+
+    // GM posterior
+    const gmDiv = h('div', {});
+    gmDiv.append(h('div', { style: { fontSize:'7px', color:'#444', marginBottom:'2px' }}, 'GM POSTERIOR'));
+    gmDiv.append(h('div', { style: { fontSize:'14px', fontWeight:700, color:'#3b82f6' }}, `${fmt(m.posterior*100,1)}%`));
+    gmDiv.append(h('div', { style: { fontSize:'7px', color:'#444' }}, `π=${fmt(m.piEffective,2)} · ${m.tradeCount} trades`));
+    metrics.append(gmDiv);
+
+    card.append(metrics);
+
+    // Position
+    if (hasPos) {
+      const posDiv = h('div', { style: { marginTop:'8px', background:'#0d1a2e', border:'1px solid #1e3a5f', borderRadius:'4px', padding:'8px', display:'flex', justifyContent:'space-between', alignItems:'center' }});
+      const posLeft = h('span', { style: { fontSize:'9px' }});
+      posLeft.append(h('span', { class:'dim' }, 'POS: '));
+      posLeft.append(h('span', { style: { color: m.position.side==='YES'?'#10b981':'#ef4444', fontWeight:700 }}, m.position.side));
+      posLeft.append(h('span', { class:'dim' }, ` · ${m.position.size} @ ${fmt(m.position.entry)}¢ · edge ${fmt(m.position.edge*100,1)}¢`));
+      posDiv.append(posLeft);
+
+      const livePnl = (m.clobPrice - m.position.entry) * m.position.size * (m.position.side==='YES'?1:-1);
+      posDiv.append(h('div', { style: { fontSize:'12px', fontWeight:700, color: pc(livePnl) }}, `${ps(livePnl)}$${fmt(Math.abs(livePnl),3)}`));
+      card.append(posDiv);
+    }
+
+    app.append(card);
+  });
+
+  // Resolved positions
+  if (resolved.length > 0) {
+    const resSection = h('div', { style: { marginTop:'12px' }});
+    const resCard = h('div', { class:'card' });
+
+    const netPnl = resolved.reduce((s, m) => s + ((m.position.side===m.outcome?1:0) - m.position.entry) * m.position.size, 0);
+    const resHeader = h('div', { style: { display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:'8px' }});
+    const resLeft = h('div', { style: { display:'flex', alignItems:'center', gap:'6px' }});
+    resLeft.append(h('span', { style: { fontSize:'10px', color:'#666', fontWeight:700, letterSpacing:'1px' }}, 'RESOLVED POSITIONS'));
+    resLeft.append(h('span', { style: { background:'#1a1a2e', color:'#555', padding:'0 5px', borderRadius:'8px', fontSize:'9px', fontWeight:700 }}, String(resolved.length)));
+    resHeader.append(resLeft);
+    resHeader.append(h('div', { style: { fontSize:'9px', color:'#64748b' }}, [
+      'NET: ', h('span', { style: { color: pc(netPnl), fontWeight:700 }}, `${ps(netPnl)}$${fmt(Math.abs(netPnl),3)}`)
+    ]));
+    resCard.append(resHeader);
+
+    // Table header
+    const cols = '64px 1fr 40px 44px 40px 52px 52px';
+    const tHead = h('div', { style: { display:'grid', gridTemplateColumns:cols, gap:'2px', fontSize:'7px', color:'#333', fontWeight:700, paddingBottom:'3px', borderBottom:'1px solid #111' }});
+    ['MARKET','QUESTION','SIDE','ENTRY','RESULT','P/L $','EDGE'].forEach(l => tHead.append(h('div', {}, l)));
+    resCard.append(tHead);
+
+    const tbody = h('div', { class:'resolved-table' });
+    resolved.slice().reverse().forEach(m => {
+      const won = m.position.side === m.outcome;
+      const pnl = (won ? 1-m.position.entry : -m.position.entry) * m.position.size;
+      const row = h('div', { class:'resolved-row', style: { gridTemplateColumns: cols }});
+      row.append(h('div', { class:'dim' }, m.id));
+      row.append(h('div', { style: { color:'#555', overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}, m.question));
+      row.append(h('div', { style: { color: m.position.side==='YES'?'#10b981':'#ef4444', fontWeight:700 }}, m.position.side));
+      row.append(h('div', { class:'dim' }, `${fmt(m.position.entry)}¢`));
+      row.append(h('div', { style: { color: won?'#10b981':'#ef4444', fontWeight:700 }}, won?'WIN':'LOSS'));
+      row.append(h('div', { style: { color: pc(pnl), fontWeight:700 }}, `${ps(pnl)}$${fmt(Math.abs(pnl),3)}`));
+      row.append(h('div', { class:'dim' }, `${fmt(m.position.edge*100,1)}¢`));
+      tbody.append(row);
+    });
+    resCard.append(tbody);
+    resSection.append(resCard);
+    app.append(resSection);
+  }
+
+  // Export buttons
+  const exportRow = h('div', { style: { marginTop:'10px', display:'flex', gap:'6px' }});
+  exportRow.append(h('button', { class:'btn', style: { borderColor:'#3b82f6', color:'#3b82f6' }, onClick: () => window.open('/api/export/trades') }, 'EXPORT RESULTS CSV'));
+  exportRow.append(h('button', { class:'btn', style: { borderColor:'#8b5cf6', color:'#8b5cf6' }, onClick: () => window.open('/api/export/snapshot') }, 'EXPORT LIVE SNAPSHOT'));
+  app.append(exportRow);
+
+  // Footer
+  const priorsStr = s.priors
+    ? `α=${fmt(s.priors.alpha, 3)} β=${fmt(s.priors.beta, 3)} π=${fmt(s.priors.pi, 3)}`
+    : '';
+  app.append(h('div', { style: { marginTop:'16px', padding:'8px 0', borderTop:'1px solid #0d0d14', display:'flex', justifyContent:'space-between', fontSize:'7px', color:'#1a1a2e' }},
+    h('span', {}, `LIVE PAPER · HAWKES + GLOSTEN-MILGROM · POLYGON CLOB · PRIORS ${priorsStr}`),
+    h('span', {}, `TICK: ${s.tickCount} · SEEN: ${s.markets_seen||0} · RESOLVED: ${s.markets_resolved||0}`),
+  ));
+}
+</script>
+</body>
+</html>
