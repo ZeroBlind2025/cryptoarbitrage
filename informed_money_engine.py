@@ -95,19 +95,24 @@ class InformedMoneyEngine(MomentumEngine):
         lot_sizes = ", ".join(
             f"{c.upper()}=${a}" for c, a in sorted(self.coin_bet_amounts.items())
         )
-        print("\n" + "=" * 60)
-        print("  INFORMED MONEY ENGINE")
-        print(f"  Class: {type(self).__name__} "
+        print("\n" + "#" * 70)
+        print("#" + " " * 68 + "#")
+        print("#" + "  INFORMED MONEY ENGINE  —  STARTING".center(68) + "#")
+        print("#" + " " * 68 + "#")
+        print("#" * 70)
+        print(f"  Class:  {type(self).__name__} "
               f"(scan_and_trade={type(self).scan_and_trade.__qualname__})")
         print("  Theory: smart money enters early at good liquidity")
-        print(f"  Entry: price >= {self.min_entry_price * 100:.0f}¢ "
+        print(f"  Entry:  price >= {self.min_entry_price * 100:.0f}¢ "
               f"on EITHER side (Up AND Down, market order, FOK)")
+        print(f"  Sanity cap: price < {self.max_entry_price * 100:.0f}¢")
         print("  Both-sides betting: DISABLED (one entry per market total)")
+        print("  Stop loss: DISABLED (ride each bet to resolution)")
         print(f"  Lot sizes: {lot_sizes} (default: ${self.bet_amount})")
         print(f"  Balance: ${balance:.2f}")
-        print(f"  Mode: {'DRY RUN' if self.dry_run else 'LIVE'}")
-        print(f"  Poll interval: {POLL_INTERVAL}s")
-        print("=" * 60 + "\n", flush=True)
+        print(f"  Mode:    {'DRY RUN' if self.dry_run else 'LIVE'}")
+        print(f"  Poll:    {POLL_INTERVAL}s")
+        print("#" * 70 + "\n", flush=True)
 
         if not self.dry_run:
             self.client = get_clob_client()
@@ -274,14 +279,30 @@ class InformedMoneyEngine(MomentumEngine):
                 live_price = self.get_live_price(token_id)
                 price = live_price if live_price is not None else gamma_price
                 if price is None:
+                    if _near_threshold:
+                        print(f"[INFORMED] SKIP  {_mkt_label} {outcome}: "
+                              f"no price available", flush=True)
                     continue
 
                 # --- GUARD: price must be >= 60¢ ---
                 if price < self.min_entry_price:
+                    if _near_threshold:
+                        print(
+                            f"[INFORMED] SKIP  {_mkt_label} {outcome} "
+                            f"@ {price * 100:.1f}¢: below "
+                            f"{self.min_entry_price * 100:.0f}¢ threshold",
+                            flush=True,
+                        )
                     continue
 
                 # Sanity cap — don't buy effectively-resolved outcomes
                 if price >= self.max_entry_price:
+                    print(
+                        f"[INFORMED] SKIP  {_mkt_label} {outcome} "
+                        f"@ {price * 100:.1f}¢: above sanity cap "
+                        f"{self.max_entry_price * 100:.0f}¢",
+                        flush=True,
+                    )
                     continue
 
                 market_key = (condition_id, token_id)
