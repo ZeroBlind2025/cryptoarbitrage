@@ -1528,19 +1528,39 @@ class MomentumEngine:
 
                 # Key by (condition_id, token_id) — stable across API ordering changes
                 market_key = (condition_id, token_id)
-
-                # --- GUARD: No opposite side ---
-                # Check if we already hold the OTHER token on this condition_id
                 opposite_key = (condition_id, other_token_id)
-                if opposite_key in self.entered_markets:
+
+                # --- MARKET-LEVEL GATE: subsequent entries need confirmation ---
+                # Once any side of this market has been entered (same or
+                # opposite), every further entry — same-side re-entry OR
+                # first entry on the opposite side — has to wait for price
+                # on the candidate side to reach REENTRY_MIN_PRICE (80¢ by
+                # default).  This lets us recoup partial losses on a losing
+                # side when the market reverses and the other side confirms
+                # momentum.  First entry into the market still uses the
+                # normal MIN_ENTRY_PRICE gate above.
+                market_has_prior_entry = (
+                    market_key in self.entered_markets
+                    or opposite_key in self.entered_markets
+                )
+                if market_has_prior_entry and price < REENTRY_MIN_PRICE:
+                    if self.scans_completed % 30 == 1:
+                        print(
+                            f"  SUBSEQUENT GATED {_mkt_label} {outcome} "
+                            f"@ {price*100:.1f}¢: subsequent entry needs "
+                            f">= {REENTRY_MIN_PRICE*100:.0f}¢",
+                            flush=True,
+                        )
                     self.trades_skipped += 1
-                    print(f"  REJECT opposite_held: already hold other side of {_mkt_label}", flush=True)
                     continue
 
                 # --- HEDGE TRIGGER: Price risen 5¢+ above probe → hedge opposite side ---
                 # This runs BEFORE the max-entries / cooldown guards because
                 # it's not a re-entry on primary — it's a hedge on the opposite side.
                 is_first_entry = market_key not in self.entered_markets
+                is_opposite_first_entry = (
+                    is_first_entry and opposite_key in self.entered_markets
+                )
                 if market_key in self.entered_markets:
                     last_buy_price = self.entered_markets[market_key]
                     price_rise = round(price - last_buy_price, 4)
@@ -1688,31 +1708,22 @@ class MomentumEngine:
                         if elapsed < cooldown:
                             continue  # still in cooldown
 
-                    # --- RE-ENTRY CONFIRMATION FLOOR: only re-enter once
-                    # momentum has been confirmed by price reaching the
-                    # REENTRY_MIN_PRICE threshold (default 80¢).  This stops
-                    # rapid-fire probes at 60-79¢ where momentum is still
-                    # unconfirmed and lets the engine stack entries once the
-                    # market has decisively trended in our direction.
-                    if price < REENTRY_MIN_PRICE:
-                        if self.scans_completed % 30 == 1:
-                            _re_label = f"{coin.upper()}_{market['interval']} {slug[:30]}"
-                            print(
-                                f"  RE-ENTRY GATED {_re_label} {outcome} "
-                                f"@ {price*100:.1f}¢: below confirmation "
-                                f"{REENTRY_MIN_PRICE*100:.0f}¢",
-                                flush=True,
-                            )
-                        continue
+                    # NOTE: REENTRY_MIN_PRICE (80¢) gate now handled by the
+                    # market-level SUBSEQUENT GATED check above, which also
+                    # covers opposite-side first entries.  Same-side
+                    # re-entries still require upward movement from last
+                    # buy price (enforced above).
 
-                    # Update last buy price for upward-only tracking
-                    # (fall through to ENTER THE TRADE block below)
-
-                # --- ENTER THE TRADE (probe / re-entry) ---
+                # --- ENTER THE TRADE (probe / re-entry / opposite-side) ---
                 full_lot = self.coin_bet_amounts.get(coin, self.bet_amount)
                 trade_amount = PROBE_AMOUNT if not getattr(self, '_dry_run_no_probe', False) else full_lot
                 title = (question or slug)[:50]
-                entry_type = "RE-ENTRY" if not is_first_entry else "PROBE"
+                if is_opposite_first_entry:
+                    entry_type = "OPP-ENTRY"
+                elif is_first_entry:
+                    entry_type = "PROBE"
+                else:
+                    entry_type = "RE-ENTRY"
 
                 print(f"\n[MOMENTUM] ENTERING {coin.upper()} {outcome} @ {price*100:.1f}¢ ({entry_type})", flush=True)
                 print(f"           Market: {title}", flush=True)
