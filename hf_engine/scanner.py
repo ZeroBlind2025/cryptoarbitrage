@@ -141,60 +141,149 @@ class MarketScanner:
     # Fetch
     # ------------------------------------------------------------------ #
 
-    # Polymarket has used several different slug conventions for the
-    # same style of market over time. We query each candidate pattern
-    # and dedupe on market id so a rename never silently kills the feed.
-    _SLUG_QUERIES = ("updown", "up-or-down", "higher-or-lower")
+    # Coin-name mapping used to compute canonical Polymarket slugs for
+    # the time-bucketed event lookups. This mirrors the table used by
+    # ``momentum_engine.discover_active_markets`` so we inherit the same
+    # discovery reliability, without importing from that module.
+    _COIN_SLUG_NAMES = {
+        "btc": "bitcoin",
+        "eth": "ethereum",
+        "sol": "solana",
+        "xrp": "xrp",
+    }
+    # (label, window-seconds)
+    _INTERVALS = (("5m", 300), ("15m", 900))
+    # ``slug_contains`` fallback queries when the direct event-slug
+    # lookups miss (Polymarket occasionally ships off-grid slugs for
+    # edge-of-interval markets).
+    _SLUG_CONTAINS_TERMS = (
+        "updown-5m",
+        "updown-15m",
+        "btc-updown",
+        "eth-updown",
+        "sol-updown",
+        "xrp-updown",
+        "bitcoin-updown",
+        "ethereum-updown",
+        "solana-updown",
+    )
 
     def _fetch_candidate_markets(self) -> List[dict]:
-        """Hit the Gamma markets endpoint for active crypto short-duration
-        up/down markets.
+        """Multi-strategy parallel fetch for crypto short-duration markets.
 
-        We issue one query per known slug convention and merge the
-        results, deduped by condition id. The response is paginated via
-        ``offset`` but in practice the active set is small enough that
-        a single page per pattern is sufficient.
+        Polymarket's ``/markets?slug_contains=updown`` alone is unreliable
+        because:
+        - the API sometimes returns partial pages for broad slug queries,
+        - and the canonical way to find each coin's current 5m / 15m
+          market is to hit ``/events?slug={coin}-updown-{interval}-{ts}``
+          with the time-bucketed unix timestamp.
+
+        We therefore fire a batch of direct event-slug lookups **plus**
+        a handful of ``slug_contains`` fallback queries in parallel, via
+        a ``ThreadPoolExecutor``, and merge all results dedupe'd by
+        ``conditionId``. Per-scan wall time is typically ~1.5 seconds on
+        the Railway network.
+
+        Every fetch failure is counted; a periodic summary log prints
+        the top rejection reasons so a Gamma-side change cannot silently
+        kill discovery.
         """
-        url = f"{self.cfg.gamma_api_base}/markets"
-        seen_ids: set = set()
-        merged: List[dict] = []
+        from concurrent.futures import ThreadPoolExecutor, as_completed
 
-        for pattern in self._SLUG_QUERIES:
-            params = {
-                "active": "true",
-                "closed": "false",
-                "slug_contains": pattern,
-                "limit": 200,
-            }
+        now_ts = int(time.time())
+        event_slugs: List[str] = []
+        for coin_abbr, coin_full in self._COIN_SLUG_NAMES.items():
+            for tag, window_secs in self._INTERVALS:
+                base_ts = (now_ts // window_secs) * window_secs
+                for offset in (window_secs, 0, -window_secs, -2 * window_secs):
+                    ts = base_ts + offset
+                    event_slugs.append(f"{coin_abbr}-updown-{tag}-{ts}")
+                    if coin_full != coin_abbr:
+                        event_slugs.append(f"{coin_full}-updown-{tag}-{ts}")
+
+        merged_by_id: Dict[str, dict] = {}
+        errors_this_scan = 0
+
+        gamma_base = self.cfg.gamma_api_base
+
+        def _fetch_event_slug(slug: str):
+            """Return a list of market dicts (possibly empty) for an
+            event slug, or None on error."""
             try:
-                resp = self._session.get(url, params=params, timeout=6)
-                resp.raise_for_status()
-                data = resp.json()
-            except Exception as e:
-                self._fetch_errors += 1
-                if self._fetch_errors % 10 == 1:
-                    print(
-                        f"{self.cfg.log_prefix} scanner fetch error "
-                        f"(pattern={pattern!r}): {e}",
-                        flush=True,
-                    )
-                continue
+                r = self._session.get(
+                    f"{gamma_base}/events",
+                    params={"slug": slug},
+                    timeout=6,
+                )
+                if r.status_code != 200:
+                    return []
+                data = r.json()
+            except Exception:
+                return None
 
+            events = data if isinstance(data, list) else ([data] if isinstance(data, dict) else [])
+            markets: List[dict] = []
+            for event in events:
+                if not isinstance(event, dict):
+                    continue
+                nested = event.get("markets") or []
+                for m in nested:
+                    if isinstance(m, dict):
+                        markets.append(m)
+                # Some events put the market fields at the top level.
+                if "conditionId" in event or "clobTokenIds" in event:
+                    markets.append(event)
+            return markets
+
+        def _fetch_contains(term: str):
+            try:
+                r = self._session.get(
+                    f"{gamma_base}/markets",
+                    params={
+                        "slug_contains": term,
+                        "active": "true",
+                        "closed": "false",
+                        "limit": 100,
+                    },
+                    timeout=6,
+                )
+                if r.status_code != 200:
+                    return []
+                data = r.json()
+            except Exception:
+                return None
             if isinstance(data, dict):
                 data = data.get("data", data.get("markets", []))
-            if not isinstance(data, list):
-                continue
+            return data if isinstance(data, list) else []
 
-            for m in data:
-                if not isinstance(m, dict):
-                    continue
-                mid = m.get("conditionId") or m.get("id") or m.get("slug")
-                if not mid or mid in seen_ids:
-                    continue
-                seen_ids.add(mid)
-                merged.append(m)
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            futures = []
+            for slug in event_slugs:
+                futures.append(pool.submit(_fetch_event_slug, slug))
+            for term in self._SLUG_CONTAINS_TERMS:
+                futures.append(pool.submit(_fetch_contains, term))
 
-        return merged
+            for fut in as_completed(futures):
+                try:
+                    result = fut.result()
+                except Exception:
+                    errors_this_scan += 1
+                    continue
+                if result is None:
+                    errors_this_scan += 1
+                    continue
+                for m in result:
+                    if not isinstance(m, dict):
+                        continue
+                    mid = m.get("conditionId") or m.get("id") or m.get("slug")
+                    if not mid or mid in merged_by_id:
+                        continue
+                    merged_by_id[mid] = m
+
+        if errors_this_scan:
+            self._fetch_errors += errors_this_scan
+
+        return list(merged_by_id.values())
 
     # ------------------------------------------------------------------ #
     # Normalization

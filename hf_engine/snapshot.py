@@ -104,6 +104,10 @@ def snapshot(engine) -> Dict[str, Any]:
             "beta": priors[1] if len(priors) > 1 else None,
             "pi": priors[2] if len(priors) > 2 else None,
         },
+        "signals_accepted_total": engine.executor.signals_accepted_total,
+        "signals_rejected_total": engine.executor.signals_rejected_total,
+        "reject_histogram": engine.executor.reject_reason_histogram(),
+        "recent_signals": engine.executor.recent_signals(limit=20),
         "mode": "live-paper",
     }
 

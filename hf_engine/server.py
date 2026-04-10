@@ -132,6 +132,24 @@ def create_app(engine: HFEngine) -> Flask:
     def api_trades() -> Response:
         return jsonify(export_resolved_trades_json(engine))
 
+    @app.route("/api/signals")
+    def api_signals() -> Response:
+        from flask import request
+
+        try:
+            limit = int(request.args.get("limit", "50"))
+        except ValueError:
+            limit = 50
+        limit = max(1, min(limit, 200))
+        return jsonify(
+            {
+                "recent": engine.executor.recent_signals(limit=limit),
+                "accepted_total": engine.executor.signals_accepted_total,
+                "rejected_total": engine.executor.signals_rejected_total,
+                "reject_histogram": engine.executor.reject_reason_histogram(),
+            }
+        )
+
     # ------------------------------------------------------------------ #
     # CSV exports
     # ------------------------------------------------------------------ #

@@ -22,11 +22,15 @@ import json
 import os
 import threading
 import time
+from collections import deque
 from dataclasses import asdict
-from typing import Dict, List, Optional
+from typing import Deque, Dict, List, Optional
 
 from .config import HFEConfig
 from .market_state import MarketState, PaperPosition, position_dollars
+
+
+SIGNAL_BUFFER_SIZE = 400
 
 
 class PaperExecutor:
@@ -44,6 +48,19 @@ class PaperExecutor:
         os.makedirs(cfg.log_dir, exist_ok=True)
         self.trade_log_path = os.path.join(cfg.log_dir, cfg.trade_log_file)
         self.signal_log_path = os.path.join(cfg.log_dir, cfg.signal_log_file)
+
+        # In-memory ring buffer of the last N signal evaluations
+        # (accepted + rejected) so the dashboard can surface gate
+        # diagnostics without tailing the JSONL file. Dedup on
+        # (market_id, reason) so a cascade of identical rejections
+        # doesn't flood the panel — only the most recent entry for
+        # each distinct reason-per-market is retained.
+        self._signal_buffer: Deque[dict] = deque(maxlen=SIGNAL_BUFFER_SIZE)
+        self._signal_buffer_lock = threading.Lock()
+        self._last_reason_by_market: Dict[str, str] = {}
+        self.signals_accepted_total = 0
+        self.signals_rejected_total = 0
+        self._reject_reason_counts: Dict[str, int] = {}
 
     # ------------------------------------------------------------------ #
     # Exposure bookkeeping
@@ -75,11 +92,15 @@ class PaperExecutor:
 
     def log_signal(self, market: MarketState, signal_reason: str, accepted: bool) -> None:
         """Log every signal evaluation (accepted or rejected) so gate
-        thresholds can be retuned from real paper data."""
+        thresholds can be retuned from real paper data.
+
+        Also updates the in-memory ring buffer used by the dashboard.
+        """
         entry = {
             "ts": time.time(),
             "market_id": market.market_id,
             "interval": market.interval_label,
+            "question": (market.description or "")[:80],
             "accepted": accepted,
             "reason": signal_reason,
             "posterior": market.posterior,
@@ -92,7 +113,39 @@ class PaperExecutor:
             "time_remaining_sec": market.time_remaining_sec,
             "book_depth": market.book_depth_yes,
         }
+
+        # Persist every evaluation to the JSONL log for offline analysis.
         self._append(self.signal_log_path, entry)
+
+        # Update the in-memory ring buffer. Dedup so an identical
+        # rejection reason on the same market on consecutive trades
+        # does not flood the panel — we only store transitions.
+        with self._signal_buffer_lock:
+            if accepted:
+                self.signals_accepted_total += 1
+            else:
+                self.signals_rejected_total += 1
+                # Bucketized gate name for the rejects histogram.
+                bucket = signal_reason.split("(")[0].strip() or "unknown"
+                self._reject_reason_counts[bucket] = (
+                    self._reject_reason_counts.get(bucket, 0) + 1
+                )
+
+            last_reason = self._last_reason_by_market.get(market.market_id)
+            if last_reason != signal_reason or accepted:
+                self._last_reason_by_market[market.market_id] = signal_reason
+                self._signal_buffer.append(entry)
+
+    def recent_signals(self, limit: int = 50) -> List[dict]:
+        """Return the ``limit`` most recent signal entries (newest first)."""
+        with self._signal_buffer_lock:
+            items = list(self._signal_buffer)
+        items.reverse()
+        return items[:limit]
+
+    def reject_reason_histogram(self) -> Dict[str, int]:
+        with self._signal_buffer_lock:
+            return dict(self._reject_reason_counts)
 
     # ------------------------------------------------------------------ #
     # Open / close

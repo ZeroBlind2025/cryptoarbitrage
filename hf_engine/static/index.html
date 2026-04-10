@@ -300,6 +300,64 @@ function render() {
     app.append(resSection);
   }
 
+  // Signal diagnostics — accepted + rejected gate decisions
+  const sig = s.recent_signals || [];
+  const rh = s.reject_histogram || {};
+  const sigAccepted = s.signals_accepted_total || 0;
+  const sigRejected = s.signals_rejected_total || 0;
+  if (sig.length > 0 || sigAccepted > 0 || sigRejected > 0) {
+    const sigCard = h('div', { class:'card', style: { marginTop:'12px' }});
+    const sigHeader = h('div', { style: { display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:'8px' }});
+    sigHeader.append(h('div', { style: { display:'flex', alignItems:'center', gap:'6px' }},
+      h('span', { style: { fontSize:'10px', color:'#666', fontWeight:700, letterSpacing:'1px' }}, 'SIGNAL GATES'),
+      h('span', { style: { background:'#0a1e14', color:'#10b981', padding:'0 5px', borderRadius:'8px', fontSize:'9px', fontWeight:700 }}, `${sigAccepted} PASS`),
+      h('span', { style: { background:'#4a1d1d', color:'#ef4444', padding:'0 5px', borderRadius:'8px', fontSize:'9px', fontWeight:700 }}, `${sigRejected} REJECT`),
+    ));
+
+    // Top-5 reject reasons as a histogram strip.
+    const topRejects = Object.entries(rh).sort((a,b) => b[1]-a[1]).slice(0, 5);
+    if (topRejects.length > 0) {
+      const histRow = h('div', { style: { display:'flex', gap:'4px', flexWrap:'wrap' }});
+      topRejects.forEach(([reason, count]) => {
+        histRow.append(h('span', { style: { fontSize:'8px', padding:'2px 5px', background:'#1a0a0a', border:'1px solid #3a1a1a', borderRadius:'3px', color:'#ef4444' }},
+          `${reason} ${count}`
+        ));
+      });
+      sigHeader.append(histRow);
+    }
+    sigCard.append(sigHeader);
+
+    // Recent decisions table (newest first).
+    const cols = '54px 60px 48px 1fr 46px 46px 44px';
+    const tHead = h('div', { style: { display:'grid', gridTemplateColumns:cols, gap:'2px', fontSize:'7px', color:'#333', fontWeight:700, paddingBottom:'3px', borderBottom:'1px solid #111' }});
+    ['TIME','MARKET','VERDICT','REASON','POST','CLOB','IMB'].forEach(l => tHead.append(h('div', {}, l)));
+    sigCard.append(tHead);
+
+    const sigBody = h('div', { style: { maxHeight:'260px', overflowY:'auto', fontFamily:"'JetBrains Mono',monospace" }});
+    sig.forEach((e) => {
+      const row = h('div', { style: { display:'grid', gridTemplateColumns:cols, gap:'2px', fontSize:'9px', padding:'3px 0', borderBottom:'1px solid #0a0a14' }});
+      const t = new Date(e.ts * 1000);
+      const hh = String(t.getHours()).padStart(2,'0');
+      const mm = String(t.getMinutes()).padStart(2,'0');
+      const ss = String(t.getSeconds()).padStart(2,'0');
+      row.append(h('div', { class:'dim' }, `${hh}:${mm}:${ss}`));
+      const shortId = (e.market_id || '').slice(2, 8).toUpperCase() || '????';
+      row.append(h('div', { style: { color:'#555' }}, shortId));
+      row.append(h('div', { style: { color: e.accepted ? '#10b981' : '#ef4444', fontWeight:700 }}, e.accepted ? 'PASS' : 'REJECT'));
+      row.append(h('div', { style: { color: e.accepted ? '#94a3b8' : '#64748b', overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}, e.reason || '-'));
+      row.append(h('div', { class:'dim' }, fmt(e.posterior, 3)));
+      row.append(h('div', { class:'dim' }, e.clob_mid != null ? fmt(e.clob_mid, 3) : '-'));
+      const imbColor = Math.abs(e.flow_imbalance || 0) > 0.15 ? (e.flow_imbalance > 0 ? '#10b981' : '#ef4444') : '#555';
+      row.append(h('div', { style: { color: imbColor }}, `${ps(e.flow_imbalance || 0)}${fmt(e.flow_imbalance || 0, 2)}`));
+      sigBody.append(row);
+    });
+    if (sig.length === 0) {
+      sigBody.append(h('div', { style: { padding:'8px 0', color:'#333', fontSize:'9px', textAlign:'center' }}, 'no gate evaluations yet — scanner warming up'));
+    }
+    sigCard.append(sigBody);
+    app.append(sigCard);
+  }
+
   // Export buttons
   const exportRow = h('div', { style: { marginTop:'10px', display:'flex', gap:'6px' }});
   exportRow.append(h('button', { class:'btn', style: { borderColor:'#3b82f6', color:'#3b82f6' }, onClick: () => window.open('/api/export/trades') }, 'EXPORT RESULTS CSV'));
