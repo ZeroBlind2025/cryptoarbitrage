@@ -54,9 +54,17 @@ class HFEngine:
 
         self._running = False
         self._scan_thread: Optional[threading.Thread] = None
+        self._main_thread: Optional[threading.Thread] = None
         self._last_report_at = 0
         self._markets_seen_total = 0
         self._markets_resolved_total = 0
+        self._tick_count = 0
+        self._started_at: Optional[float] = None
+        # Rate limiter for the "recreate the feed when stale" path so
+        # we cannot spiral into a tight recreate loop while waiting on
+        # the first WS message.
+        self._last_feed_reset_at = 0.0
+        self._feed_reset_min_interval = 60.0
 
     # ------------------------------------------------------------------ #
     # Lifecycle
@@ -64,25 +72,80 @@ class HFEngine:
 
     def run(self) -> None:
         """Start the engine and block until interrupted."""
-        self._log(self.cfg.summary())
-        self._log("paper trading mode — NO live orders will be placed")
-
-        self.feed.start()
-        self._running = True
-        self._scan_thread = threading.Thread(target=self._scan_loop, daemon=True)
-        self._scan_thread.start()
-
+        self.start_background()
         try:
-            self._main_loop()
+            # The main-loop thread is doing the work; this call just
+            # waits on it so ``run()`` keeps its blocking semantics.
+            while self._running:
+                time.sleep(0.5)
         except KeyboardInterrupt:
             self._log("shutdown requested")
         finally:
             self.stop()
 
+    def start_background(self) -> None:
+        """Start the engine in background threads and return immediately.
+
+        This is the entry point used by the Flask dashboard server: the
+        Flask process owns the main thread and hosts HTTP handlers,
+        while the engine runs the scanner, feed, and main-loop threads
+        underneath it.
+        """
+        if self._running:
+            return
+        self._log(self.cfg.summary())
+        self._log("paper trading mode — NO live orders will be placed")
+
+        self.feed.start()
+        self._running = True
+        self._started_at = time.time()
+        self._scan_thread = threading.Thread(
+            target=self._scan_loop, daemon=True, name="hfe-scanner"
+        )
+        self._scan_thread.start()
+        self._main_thread = threading.Thread(
+            target=self._main_loop, daemon=True, name="hfe-main"
+        )
+        self._main_thread.start()
+
     def stop(self) -> None:
         self._running = False
         self.feed.stop()
         self._log(f"final stats: {self.executor.stats()}")
+
+    # ------------------------------------------------------------------ #
+    # Accessors (used by hf_engine.server and hf_engine.snapshot)
+    # ------------------------------------------------------------------ #
+
+    @property
+    def is_running(self) -> bool:
+        return self._running
+
+    @property
+    def tick_count(self) -> int:
+        return self._tick_count
+
+    @property
+    def uptime_seconds(self) -> float:
+        if self._started_at is None:
+            return 0.0
+        return time.time() - self._started_at
+
+    def list_markets(self) -> list:
+        with self._markets_lock:
+            return list(self.markets.values())
+
+    def stats(self) -> dict:
+        return {
+            "markets_seen_total": self._markets_seen_total,
+            "markets_resolved_total": self._markets_resolved_total,
+            "tick_count": self._tick_count,
+            "uptime_sec": self.uptime_seconds,
+            "running": self._running,
+            "feed": self.feed.stats(),
+            "executor": self.executor.stats(),
+            "priors": list(self.calibrator.current_priors()),
+        }
 
     # ------------------------------------------------------------------ #
     # Scanner thread
@@ -232,6 +295,7 @@ class HFEngine:
 
     def _main_loop(self) -> None:
         while self._running:
+            self._tick_count += 1
             now = time.time()
             if (
                 self._markets_resolved_total > 0
@@ -241,8 +305,12 @@ class HFEngine:
                 self._report()
                 self._last_report_at = now
 
-            if self.feed.is_stale():
+            if (
+                self.feed.is_stale()
+                and (now - self._last_feed_reset_at) > self._feed_reset_min_interval
+            ):
                 self._log("feed appears stale — forcing reconnect")
+                self._last_feed_reset_at = now
                 try:
                     self.feed.stop()
                 except Exception:

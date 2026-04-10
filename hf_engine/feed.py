@@ -101,6 +101,11 @@ class HFETradeFeed:
         self.trades_received = 0
         self.book_updates = 0
         self.last_message_time: Optional[float] = None
+        # Tracks when ``start()`` was called so the stale-feed guard in
+        # the main loop respects a grace period before declaring the
+        # feed dead. Without this the main loop would keep tearing the
+        # feed down on every tick while waiting for the first message.
+        self._started_at: Optional[float] = None
 
     # ------------------------------------------------------------------ #
     # Public API
@@ -110,6 +115,7 @@ class HFETradeFeed:
         if self.running:
             return
         self.running = True
+        self._started_at = time.time()
         self.ws_thread = threading.Thread(target=self._run_forever, daemon=True)
         self.ws_thread.start()
         print(f"{self.log_prefix} starting WS connection to {self.ws_url}", flush=True)
@@ -150,9 +156,19 @@ class HFETradeFeed:
                 self._registry.pop(t, None)
 
     def is_stale(self) -> bool:
-        if self.last_message_time is None:
-            return True
-        return (time.time() - self.last_message_time) > self.STALE_TIMEOUT_SEC
+        """Return True if no messages have flowed for ``STALE_TIMEOUT_SEC``.
+
+        A feed that has never received a message is only considered
+        stale once ``STALE_TIMEOUT_SEC`` has elapsed since it was
+        started, so the main loop cannot flail reconnecting before the
+        initial handshake has had a chance to complete.
+        """
+        reference = self.last_message_time
+        if reference is None:
+            reference = self._started_at
+        if reference is None:
+            return False
+        return (time.time() - reference) > self.STALE_TIMEOUT_SEC
 
     # ------------------------------------------------------------------ #
     # WebSocket lifecycle

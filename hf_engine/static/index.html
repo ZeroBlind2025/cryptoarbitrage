@@ -53,21 +53,32 @@ const ps = v => v >= 0 ? '+' : '';
 
 let state = null;
 let paused = false;
+let lastPollOk = 0;
+const POLL_MS = 1500;
 
-// ── WebSocket ──
-function connectWS() {
-  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const ws = new WebSocket(`${proto}//${location.host}/ws`);
-  ws.onmessage = (e) => {
-    const msg = JSON.parse(e.data);
-    if (msg.type === 'state' && !paused) {
-      state = msg.data;
-      render();
+// ── HTTP polling against the live Python HF engine ──
+async function pollState() {
+  if (paused) return;
+  try {
+    const r = await fetch('/api/state', { cache: 'no-store' });
+    if (!r.ok) throw new Error('status ' + r.status);
+    const d = await r.json();
+    state = d;
+    lastPollOk = Date.now();
+    render();
+  } catch (e) {
+    // Surface the error in the dashboard instead of silently freezing.
+    const app = document.getElementById('app');
+    if (app && !state) {
+      app.innerHTML =
+        '<div style="text-align:center;padding:40px;color:#ef4444;font-family:monospace">' +
+        'Cannot reach HF engine: ' + e.message +
+        '<br><span style="color:#555;font-size:10px">retrying in ' + (POLL_MS/1000) + 's...</span></div>';
     }
-  };
-  ws.onclose = () => setTimeout(connectWS, 2000);
-  ws.onerror = () => ws.close();
+  }
 }
+setInterval(pollState, POLL_MS);
+pollState();
 
 // ── Render ──
 function render() {
@@ -89,7 +100,8 @@ function render() {
     ),
     h('div', { style: { display:'flex', alignItems:'center', gap:'6px' }},
       h('span', { class:'badge', style: { background:'#0f0a1e', border:'1px solid #8b5cf6', color:'#8b5cf6' }}, '5m/15m'),
-      h('button', { class:'btn', style: { borderColor: paused ? '#ef4444' : '#10b981', color: paused ? '#ef4444' : '#10b981' }, onClick: () => { paused = !paused; render(); }},
+      h('span', { class:'badge', style: { background:'#0a1e14', border:'1px solid #10b981', color:'#10b981' }}, 'LIVE PAPER'),
+      h('button', { class:'btn', style: { borderColor: paused ? '#ef4444' : '#10b981', color: paused ? '#ef4444' : '#10b981' }, onClick: () => { paused = !paused; if (!paused) pollState(); render(); }},
         paused ? '■ PAUSED' : '● SCANNING'
       ),
     ),
@@ -295,20 +307,14 @@ function render() {
   app.append(exportRow);
 
   // Footer
+  const priorsStr = s.priors
+    ? `α=${fmt(s.priors.alpha, 3)} β=${fmt(s.priors.beta, 3)} π=${fmt(s.priors.pi, 3)}`
+    : '';
   app.append(h('div', { style: { marginTop:'16px', padding:'8px 0', borderTop:'1px solid #0d0d14', display:'flex', justifyContent:'space-between', fontSize:'7px', color:'#1a1a2e' }},
-    h('span', {}, 'SIMULATION · HAWKES + GLOSTEN-MILGROM · POLYGON CLOB'),
-    h('span', {}, `TICK: ${s.tickCount} · WS LIVE`),
+    h('span', {}, `LIVE PAPER · HAWKES + GLOSTEN-MILGROM · POLYGON CLOB · PRIORS ${priorsStr}`),
+    h('span', {}, `TICK: ${s.tickCount} · SEEN: ${s.markets_seen||0} · RESOLVED: ${s.markets_resolved||0}`),
   ));
 }
-
-// ── Init ──
-connectWS();
-// Fallback: poll if WS fails
-setInterval(() => {
-  if (!state) {
-    fetch('/api/state').then(r => r.json()).then(d => { state = d; render(); }).catch(() => {});
-  }
-}, 3000);
 </script>
 </body>
 </html>

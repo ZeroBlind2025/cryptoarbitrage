@@ -17,11 +17,26 @@ engine will fire a paper signal.
 
 ## Running
 
+Headless engine (logs + JSONL only, no HTTP):
+
 ```
 python -m hf_engine.main
 ```
 
-No flags. Everything is tuned through environment variables.
+Engine + live dashboard (the Railway entry point):
+
+```
+python -m hf_engine.server --port $PORT
+```
+
+The server hosts a vanilla-JS dashboard at `/` which polls `/api/state`
+every 1.5 s and renders live Hawkes intensities, GM posteriors, cascade
+badges, signal firings, and paper P&L. All state comes from the same
+``HFEngine`` instance that is scanning Polymarket + consuming the CLOB
+WebSocket feed underneath it — no simulation, no mocks.
+
+Tuning happens through environment variables. All variables are
+prefixed `HFE_*` and are documented below.
 
 ## Configuration (`HFE_*` only)
 
@@ -76,9 +91,25 @@ hf_engine/
 ├── paper_executor.py     # paper P&L ledger and JSONL logger
 ├── calibration.py        # post-resolution alpha/beta/pi refit
 ├── engine.py             # orchestrator / main loop
-├── main.py               # CLI entry (`python -m hf_engine.main`)
+├── main.py               # headless CLI (`python -m hf_engine.main`)
+├── server.py             # Flask HTTP + dashboard (`python -m hf_engine.server`)
+├── snapshot.py           # Python -> dashboard JSON + CSV exporters
+├── static/
+│   └── index.html        # vanilla-JS dashboard (no build step)
 └── README.md             # this file
 ```
+
+## Dashboard endpoints
+
+| Endpoint               | Method | Description                                             |
+|------------------------|--------|---------------------------------------------------------|
+| `/`                    | GET    | Dashboard UI (polls `/api/state` every 1500ms)          |
+| `/health`              | GET    | `{status, uptime, markets, tick, feed_connected, ...}`  |
+| `/api/state`           | GET    | Full engine snapshot as JSON                            |
+| `/api/trades`          | GET    | All resolved paper trades as JSON                       |
+| `/api/stats`           | GET    | Engine + feed + executor + calibrator stats             |
+| `/api/export/trades`   | GET    | Download resolved trades as CSV                         |
+| `/api/export/snapshot` | GET    | Download current market snapshot as CSV                 |
 
 ## Calibration strategy
 
