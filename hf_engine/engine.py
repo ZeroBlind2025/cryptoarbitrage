@@ -294,9 +294,17 @@ class HFEngine:
     # ------------------------------------------------------------------ #
 
     def _main_loop(self) -> None:
+        # Heartbeat: print a one-line status every HEARTBEAT_SEC so we
+        # can see what the scanner + feed are doing even before the
+        # first market resolves.
+        HEARTBEAT_SEC = 30.0
+        last_heartbeat = 0.0
+
         while self._running:
             self._tick_count += 1
             now = time.time()
+
+            # Post-resolution report (fires every N resolved markets).
             if (
                 self._markets_resolved_total > 0
                 and (self._markets_resolved_total % self.cfg.report_every_n_markets == 0)
@@ -305,11 +313,26 @@ class HFEngine:
                 self._report()
                 self._last_report_at = now
 
+            # Heartbeat (unconditional, regardless of market activity).
+            if (now - last_heartbeat) > HEARTBEAT_SEC:
+                self._heartbeat()
+                last_heartbeat = now
+
+            # The ``websocket-client`` library runs its own keepalive
+            # (ping_interval=30s, ping_timeout=10s) and reconnects with
+            # exponential backoff on real TCP failures, so there is no
+            # need for the main loop to tear down a healthy feed just
+            # because a quiet market has produced no trade messages for
+            # a while. We only intervene if the feed reports that it is
+            # disconnected *and* has been silent for longer than the
+            # stale timeout, which indicates the internal reconnect
+            # loop itself is stuck.
             if (
-                self.feed.is_stale()
+                not self.feed.connected
+                and self.feed.is_stale()
                 and (now - self._last_feed_reset_at) > self._feed_reset_min_interval
             ):
-                self._log("feed appears stale — forcing reconnect")
+                self._log("feed disconnected + stale — issuing a hard reset")
                 self._last_feed_reset_at = now
                 try:
                     self.feed.stop()
@@ -322,13 +345,35 @@ class HFEngine:
                     log_prefix=f"{self.cfg.log_prefix}-FEED",
                 )
                 self.feed.start()
-                # Re-register everything we are tracking.
                 with self._markets_lock:
                     to_reg = list(self.markets.values())
                 for m in to_reg:
                     self.feed.register_market(m.market_id, m.yes_token_id, m.no_token_id)
 
             time.sleep(max(self.cfg.loop_sleep_sec, 0.05))
+
+    def _heartbeat(self) -> None:
+        feed_stats = self.feed.stats()
+        ex_stats = self.executor.stats()
+        priors = self.calibrator.current_priors()
+        with self._markets_lock:
+            active = len(self.markets)
+        self._log(
+            f"heartbeat "
+            f"uptime={self.uptime_seconds:.0f}s "
+            f"tick={self._tick_count} "
+            f"active={active} "
+            f"seen={self._markets_seen_total} "
+            f"resolved={self._markets_resolved_total} "
+            f"feed(connected={feed_stats['connected']}, "
+            f"subs={feed_stats['subscribed_tokens']}, "
+            f"reg={feed_stats['registered_tokens']}, "
+            f"msgs={feed_stats['messages_received']}, "
+            f"trades={feed_stats['trades_received']}) "
+            f"pnl=${ex_stats['realized_pnl']:+.3f} "
+            f"W/L={ex_stats['wins']}/{ex_stats['losses']} "
+            f"priors(α={priors[0]:.3f} β={priors[1]:.3f} π={priors[2]:.3f})"
+        )
 
     def _report(self) -> None:
         stats = self.executor.stats()

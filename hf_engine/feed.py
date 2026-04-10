@@ -106,6 +106,11 @@ class HFETradeFeed:
         # feed dead. Without this the main loop would keep tearing the
         # feed down on every tick while waiting for the first message.
         self._started_at: Optional[float] = None
+        # Per-market flags used to fire a one-shot "first trade" / "first
+        # book" log so we can see on Railway when real data starts flowing
+        # for each discovered market.
+        self._first_trade_logged: Set[str] = set()
+        self._first_book_logged: Set[str] = set()
 
     # ------------------------------------------------------------------ #
     # Public API
@@ -358,6 +363,13 @@ class HFETradeFeed:
             size=size,
         )
         self.trades_received += 1
+        if reg.market_id not in self._first_trade_logged:
+            self._first_trade_logged.add(reg.market_id)
+            print(
+                f"{self.log_prefix} first trade on {reg.market_id[:16]}: "
+                f"{normalized_side} {size:.0f} @ {normalized_price:.3f}",
+                flush=True,
+            )
         try:
             self.on_trade(reg.market_id, trade)
         except Exception as e:
@@ -400,6 +412,15 @@ class HFETradeFeed:
             last_update_ms=int(time.time() * 1000),
         )
         self.book_updates += 1
+        if reg.market_id not in self._first_book_logged:
+            self._first_book_logged.add(reg.market_id)
+            bid_s = f"{best_bid:.3f}" if best_bid is not None else "?"
+            ask_s = f"{best_ask:.3f}" if best_ask is not None else "?"
+            print(
+                f"{self.log_prefix} first book on {reg.market_id[:16]}: "
+                f"bid={bid_s} ask={ask_s} depth={depth:.0f}",
+                flush=True,
+            )
         try:
             self.on_book(reg.market_id, update)
         except Exception as e:

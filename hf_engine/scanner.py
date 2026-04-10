@@ -29,7 +29,18 @@ import requests
 from .config import HFEConfig
 
 
-INTERVAL_REGEX = re.compile(r"updown-(\d+)\s*([mh])\b", re.IGNORECASE)
+# Polymarket short-duration markets have used several slug shapes:
+#   bitcoin-updown-5m-1772397000
+#   ethereum-up-or-down-5m-1772397000
+#   sol-higher-or-lower-15m-1772397000
+# The regex accepts any of those and extracts the interval (e.g. "5m").
+INTERVAL_REGEX = re.compile(
+    r"(?:updown|up-or-down|higher-or-lower|above-or-below)-(\d+)\s*([mh])\b",
+    re.IGNORECASE,
+)
+# Cheap membership test used to short-circuit slugs that obviously
+# aren't short-duration up/down markets.
+KNOWN_SLUG_FRAGMENTS = ("updown", "up-or-down", "higher-or-lower", "above-or-below")
 
 
 @dataclass
@@ -56,6 +67,11 @@ class MarketScanner:
         self._seen: Dict[str, float] = {}   # market_id -> first-seen epoch
         self._fetch_errors = 0
         self._last_scan = 0.0
+        # Scan count so we can log a summary every N scans.
+        self._scan_count = 0
+        # Running totals of why raw markets were rejected; handy for
+        # diagnosing an empty scanner on Railway.
+        self._reject_reasons: Dict[str, int] = {}
 
     # ------------------------------------------------------------------ #
     # Public API
@@ -70,15 +86,21 @@ class MarketScanner:
         """
         now = time.time()
         self._last_scan = now
+        self._scan_count += 1
 
         raw_markets = self._fetch_candidate_markets()
+        raw_count = len(raw_markets)
+        kept_count = 0
+        new_count = 0
         out: List[MarketMeta] = []
         for raw in raw_markets:
             meta = self._normalize(raw, now)
             if meta is None:
                 continue
+            kept_count += 1
             if meta.market_id in self._seen:
                 continue
+            new_count += 1
             self._seen[meta.market_id] = now
             out.append(meta)
 
@@ -89,7 +111,28 @@ class MarketScanner:
             if self._seen[k] < cutoff:
                 del self._seen[k]
 
+        # Log the first scan (so we know the scanner ran at all) and
+        # then a short summary every 6 scans (~1 minute at default
+        # cadence) so the Railway log doesn't get too noisy but still
+        # tells us what the filters are doing.
+        if self._scan_count == 1 or self._scan_count % 6 == 0:
+            top_rejects = sorted(
+                self._reject_reasons.items(), key=lambda kv: -kv[1]
+            )[:3]
+            reject_str = ", ".join(f"{k}={v}" for k, v in top_rejects) or "-"
+            print(
+                f"{self.cfg.log_prefix} scan#{self._scan_count} "
+                f"raw={raw_count} kept={kept_count} new={new_count} "
+                f"total_seen={len(self._seen)} "
+                f"top_rejects={reject_str} "
+                f"errors={self._fetch_errors}",
+                flush=True,
+            )
+
         return out
+
+    def _reject(self, reason: str) -> None:
+        self._reject_reasons[reason] = self._reject_reasons.get(reason, 0) + 1
 
     def mark_processed(self, market_id: str) -> None:
         self._seen[market_id] = time.time()
@@ -98,36 +141,60 @@ class MarketScanner:
     # Fetch
     # ------------------------------------------------------------------ #
 
-    def _fetch_candidate_markets(self) -> List[dict]:
-        """Hit the Gamma markets endpoint for active crypto updown markets.
+    # Polymarket has used several different slug conventions for the
+    # same style of market over time. We query each candidate pattern
+    # and dedupe on market id so a rename never silently kills the feed.
+    _SLUG_QUERIES = ("updown", "up-or-down", "higher-or-lower")
 
-        We use a broad ``slug_contains=updown`` query so we pick up every
-        interval variant in a single call. The response is paginated
-        via ``offset`` but in practice the active set is small enough
-        that a single page is sufficient.
+    def _fetch_candidate_markets(self) -> List[dict]:
+        """Hit the Gamma markets endpoint for active crypto short-duration
+        up/down markets.
+
+        We issue one query per known slug convention and merge the
+        results, deduped by condition id. The response is paginated via
+        ``offset`` but in practice the active set is small enough that
+        a single page per pattern is sufficient.
         """
         url = f"{self.cfg.gamma_api_base}/markets"
-        params = {
-            "active": "true",
-            "closed": "false",
-            "slug_contains": "updown",
-            "limit": 200,
-        }
-        try:
-            resp = self._session.get(url, params=params, timeout=6)
-            resp.raise_for_status()
-            data = resp.json()
-        except Exception as e:
-            self._fetch_errors += 1
-            if self._fetch_errors % 10 == 1:
-                print(f"{self.cfg.log_prefix} scanner fetch error: {e}", flush=True)
-            return []
+        seen_ids: set = set()
+        merged: List[dict] = []
 
-        if isinstance(data, dict):
-            data = data.get("data", data.get("markets", []))
-        if not isinstance(data, list):
-            return []
-        return data
+        for pattern in self._SLUG_QUERIES:
+            params = {
+                "active": "true",
+                "closed": "false",
+                "slug_contains": pattern,
+                "limit": 200,
+            }
+            try:
+                resp = self._session.get(url, params=params, timeout=6)
+                resp.raise_for_status()
+                data = resp.json()
+            except Exception as e:
+                self._fetch_errors += 1
+                if self._fetch_errors % 10 == 1:
+                    print(
+                        f"{self.cfg.log_prefix} scanner fetch error "
+                        f"(pattern={pattern!r}): {e}",
+                        flush=True,
+                    )
+                continue
+
+            if isinstance(data, dict):
+                data = data.get("data", data.get("markets", []))
+            if not isinstance(data, list):
+                continue
+
+            for m in data:
+                if not isinstance(m, dict):
+                    continue
+                mid = m.get("conditionId") or m.get("id") or m.get("slug")
+                if not mid or mid in seen_ids:
+                    continue
+                seen_ids.add(mid)
+                merged.append(m)
+
+        return merged
 
     # ------------------------------------------------------------------ #
     # Normalization
@@ -135,11 +202,16 @@ class MarketScanner:
 
     def _normalize(self, raw: dict, now: float) -> Optional[MarketMeta]:
         slug = (raw.get("slug") or "").lower()
-        if not slug or "updown" not in slug:
+        if not slug:
+            self._reject("no-slug")
+            return None
+        if not any(frag in slug for frag in KNOWN_SLUG_FRAGMENTS):
+            self._reject("not-updown-family")
             return None
 
         interval_match = INTERVAL_REGEX.search(slug)
         if not interval_match:
+            self._reject("no-interval-regex")
             return None
 
         interval_n = int(interval_match.group(1))
@@ -153,18 +225,22 @@ class MarketScanner:
 
         duration_min = duration_sec / 60.0
         if duration_min < self.cfg.min_market_duration_min:
+            self._reject(f"duration<{self.cfg.min_market_duration_min:.0f}m")
             return None
         if duration_min > self.cfg.max_market_duration_min:
+            self._reject(f"duration>{self.cfg.max_market_duration_min:.0f}m")
             return None
 
         # Optional coin filter.
         if self.cfg.tracked_coin_slugs:
             if not any(coin in slug for coin in self.cfg.tracked_coin_slugs):
+                self._reject("coin-filter")
                 return None
 
         # End date
         end_raw = raw.get("endDate") or raw.get("end_date_iso") or raw.get("end_date")
         if not end_raw:
+            self._reject("no-end-date")
             return None
         try:
             end_dt = datetime.fromisoformat(str(end_raw).replace("Z", "+00:00"))
@@ -172,16 +248,18 @@ class MarketScanner:
                 end_dt = end_dt.replace(tzinfo=timezone.utc)
             resolves_at = end_dt.timestamp()
         except Exception:
+            self._reject("bad-end-date")
             return None
 
         if resolves_at <= now + self.cfg.min_time_remaining_sec:
-            # Already too late to enter anything useful here.
+            self._reject("too-late")
             return None
 
         # Token IDs
         clob_token_ids_raw = raw.get("clobTokenIds")
         token_ids = _parse_token_ids(clob_token_ids_raw)
         if len(token_ids) != 2:
+            self._reject("missing-token-ids")
             return None
         outcomes = raw.get("outcomes")
         outcomes = _parse_outcomes(outcomes)
