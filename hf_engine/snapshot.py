@@ -84,6 +84,38 @@ def snapshot(engine) -> Dict[str, Any]:
 
     priors = list(engine.calibrator.current_priors())
 
+    # Top-level collections for the dashboard's PAPER POSITIONS panel.
+    # Open positions are collected from the still-tracked markets, with
+    # a live P&L computed against the current CLOB mid so the dashboard
+    # does not have to rewrite the formula. Closed positions come from
+    # the executor's history buffer, which survives market eviction.
+    open_positions: List[Dict[str, Any]] = []
+    for m_json in markets_json:
+        if m_json.get("resolved"):
+            continue
+        pos = m_json.get("position")
+        if pos is None:
+            continue
+        open_positions.append(
+            {
+                "market_id": m_json["marketIdFull"],
+                "market_short": m_json["id"],
+                "description": m_json["question"],
+                "interval": m_json["interval"],
+                "side": pos["side"],
+                "entry": pos["entry"],
+                "size_dollars": pos["size"],
+                "entry_time": pos["entryTime"],
+                "edge": pos["edge"],
+                "clob_price": m_json["clobPrice"],
+                "live_pnl": pos.get("live_pnl", 0.0),
+                "posterior": m_json["posterior"],
+                "time_remaining_sec": int(round(m_json["remaining"] / 1000)),
+            }
+        )
+
+    closed_positions = engine.executor.recent_closed_positions(limit=100)
+
     return {
         "markets": markets_json,
         "totalPnl": total_pnl,
@@ -108,6 +140,8 @@ def snapshot(engine) -> Dict[str, Any]:
         "signals_rejected_total": engine.executor.signals_rejected_total,
         "reject_histogram": engine.executor.reject_reason_histogram(),
         "recent_signals": engine.executor.recent_signals(limit=20),
+        "open_positions": open_positions,
+        "closed_positions": closed_positions,
         "mode": "live-paper",
     }
 
@@ -126,10 +160,10 @@ def market_snapshot(m: MarketState) -> Dict[str, Any]:
     resolved = m.resolved_outcome is not None or m.time_remaining_sec <= 0
     outcome: Optional[str] = None
     if m.resolved_outcome is not None:
-        outcome = "YES" if m.resolved_outcome == 1 else "NO"
+        outcome = "UP" if m.resolved_outcome == 1 else "DOWN"
 
     signal = _current_signal(m)
-    position = _position_json(m.open_position)
+    position = _position_json(m.open_position, clob_mid)
 
     # Last 10 trades in dashboard shape.
     recent: List[Dict[str, Any]] = []
@@ -202,29 +236,26 @@ def export_trades_csv(engine) -> str:
     ]
     rows = [",".join(headers)]
 
-    # Iterate the paper executor's trade log via its in-memory list. We
-    # build it by walking through every market and its closed positions.
-    markets = engine.list_markets()
-    for m in markets:
-        for pos in m.closed_positions:
-            edge = pos.posterior_at_entry - pos.entry_price
-            if pos.side == "no":
-                edge = -edge
-            won = (pos.realized_pnl or 0.0) > 0
-            row = [
-                _short_id(m.market_id),
-                f'"{(m.description or "").replace(chr(34), chr(39))}"',
-                str(_parse_interval_minutes(m.interval_label)),
-                pos.side.upper(),
-                f"{pos.entry_price:.4f}",
-                "YES" if m.resolved_outcome == 1 else ("NO" if m.resolved_outcome == 0 else ""),
-                "Y" if won else "N",
-                f"{(pos.realized_pnl or 0.0):.4f}",
-                f"{abs(edge) * 100:.1f}",
-                str(m.trade_count),
-                _iso(pos.exit_time),
-            ]
-            rows.append(",".join(row))
+    # Pull from the executor's history buffer, not the live markets
+    # dict — resolved markets are evicted immediately so iterating
+    # ``list_markets()`` would only return still-active markets with
+    # any still-uncleared closed positions, which is almost never the
+    # data the user actually wants.
+    for entry in engine.executor.recent_closed_positions(limit=400):
+        row = [
+            _short_id(entry.get("market_id", "")),
+            f'"{(entry.get("description") or "").replace(chr(34), chr(39))}"',
+            str(_parse_interval_minutes(entry.get("interval", ""))),
+            entry.get("side", ""),
+            f"{(entry.get('entry') or 0.0):.4f}",
+            entry.get("outcome") or "",
+            "Y" if entry.get("won") else "N",
+            f"{(entry.get('realized_pnl') or 0.0):.4f}",
+            f"{abs(entry.get('posterior_at_entry', 0.5) - (entry.get('entry') or 0.0)) * 100:.1f}",
+            "",  # trade_count no longer available post-eviction
+            _iso(entry.get("ts")),
+        ]
+        rows.append(",".join(row))
     return "\n".join(rows)
 
 
@@ -269,27 +300,29 @@ def export_snapshot_csv(engine) -> str:
 
 
 def export_resolved_trades_json(engine) -> List[Dict[str, Any]]:
+    """Return a flat list of resolved / closed positions for the
+    ``/api/trades`` endpoint. Sourced from the executor's history
+    buffer so the data survives market eviction."""
     out: List[Dict[str, Any]] = []
-    for m in engine.list_markets():
-        for pos in m.closed_positions:
-            won = (pos.realized_pnl or 0.0) > 0
-            out.append(
-                {
-                    "id": _short_id(m.market_id),
-                    "question": m.description or m.market_id,
-                    "duration": _parse_interval_minutes(m.interval_label),
-                    "side": pos.side.upper(),
-                    "entry": pos.entry_price,
-                    "outcome": "YES"
-                    if m.resolved_outcome == 1
-                    else ("NO" if m.resolved_outcome == 0 else None),
-                    "won": won,
-                    "pnl": pos.realized_pnl,
-                    "edge": abs(pos.posterior_at_entry - pos.entry_price),
-                    "tradeCount": m.trade_count,
-                    "resolvedAt": int((pos.exit_time or time.time()) * 1000),
-                }
-            )
+    for entry in engine.executor.recent_closed_positions(limit=400):
+        out.append(
+            {
+                "id": _short_id(entry.get("market_id", "")),
+                "question": entry.get("description") or entry.get("market_id", ""),
+                "duration": _parse_interval_minutes(entry.get("interval", "")),
+                "side": entry.get("side", ""),
+                "entry": entry.get("entry"),
+                "exit": entry.get("exit"),
+                "outcome": entry.get("outcome"),
+                "won": bool(entry.get("won")),
+                "pnl": entry.get("realized_pnl"),
+                "size_dollars": entry.get("size_dollars"),
+                "posterior_at_entry": entry.get("posterior_at_entry"),
+                "entry_reason": entry.get("entry_reason"),
+                "exit_reason": entry.get("exit_reason"),
+                "resolvedAt": int((entry.get("ts") or time.time()) * 1000),
+            }
+        )
     return out
 
 
@@ -313,35 +346,76 @@ def _parse_interval_minutes(label: str) -> int:
 
 
 def _current_signal(m: MarketState) -> Optional[str]:
-    """Return a BUY_YES / BUY_NO badge for the dashboard.
+    """Return a BUY_UP / BUY_DOWN badge for the dashboard.
 
     When a paper position is already open we report that position's
     side (so the badge stays visible throughout the hold period);
     otherwise we evaluate the entry gates and report whatever the
-    engine would fire on the next trade."""
+    engine would fire on the next trade. Labels are translated from
+    the internal ``yes/no`` representation to the domain-friendly
+    ``UP/DOWN`` shown on the dashboard.
+    """
     if m.open_position is not None:
-        return "BUY_YES" if m.open_position.side == "yes" else "BUY_NO"
+        return "BUY_UP" if m.open_position.side == "yes" else "BUY_DOWN"
 
     try:
         sig = m.evaluate_entry_signal()
     except Exception:
         return None
     if sig.action == "buy_yes":
-        return "BUY_YES"
+        return "BUY_UP"
     if sig.action == "buy_no":
-        return "BUY_NO"
+        return "BUY_DOWN"
     return None
 
 
-def _position_json(pos: Optional[PaperPosition]) -> Optional[Dict[str, Any]]:
+def _position_json(
+    pos: Optional[PaperPosition],
+    clob_mid_yes: Optional[float] = None,
+) -> Optional[Dict[str, Any]]:
+    """Serialize an open position for the dashboard.
+
+    * ``side`` is translated from ``yes/no`` to ``UP/DOWN``.
+    * ``edge`` is computed in the **position's own frame**. For a
+      NO/DOWN position, ``entry_price = 1 - ask_yes`` and the relevant
+      posterior is ``1 - posterior_yes``, so ``edge = (1 - posterior) -
+      entry`` — comparing ``posterior_yes`` against ``entry_no``
+      directly produces a number in a totally different frame and
+      wildly understates the edge. (This used to display "8.5¢" for a
+      position whose real entry edge was 94¢.)
+    * ``live_pnl`` is computed here so the dashboard does not have to
+      replicate the dollars-at-risk formula and risk the same bug the
+      old JS ``(clobPrice - entry) * size * sign`` version had.
+    """
     if pos is None:
         return None
+
+    if pos.side == "yes":
+        side_label = "UP"
+        effective_posterior = pos.posterior_at_entry
+    else:
+        side_label = "DOWN"
+        effective_posterior = 1.0 - pos.posterior_at_entry
+
+    entry_edge = max(0.0, effective_posterior - pos.entry_price)
+
+    live_pnl = 0.0
+    if clob_mid_yes is not None and pos.entry_price > 0:
+        if pos.side == "yes":
+            current_price = clob_mid_yes
+        else:
+            current_price = 1.0 - clob_mid_yes
+        pnl_frac = (current_price - pos.entry_price) / pos.entry_price
+        live_pnl = pos.size_dollars * pnl_frac
+
     return {
-        "side": pos.side.upper(),
+        "side": side_label,
         "entry": pos.entry_price,
         "size": pos.size_dollars,
         "entryTime": int(pos.entry_time * 1000),
-        "edge": abs(pos.posterior_at_entry - pos.entry_price),
+        "edge": entry_edge,
+        "live_pnl": live_pnl,
+        "reason": pos.reason,
     }
 
 

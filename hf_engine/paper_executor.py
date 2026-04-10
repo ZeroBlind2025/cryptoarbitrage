@@ -62,6 +62,14 @@ class PaperExecutor:
         self.signals_rejected_total = 0
         self._reject_reason_counts: Dict[str, int] = {}
 
+        # Ring buffer of resolved / closed positions so the dashboard
+        # can render the trade history. The engine evicts each market
+        # from its ``markets`` dict the moment it resolves, so the
+        # ``MarketState.closed_positions`` list is garbage-collected
+        # with the market — we must capture the history here instead.
+        self._closed_positions_lock = threading.Lock()
+        self._closed_positions_history: Deque[dict] = deque(maxlen=400)
+
     # ------------------------------------------------------------------ #
     # Exposure bookkeeping
     # ------------------------------------------------------------------ #
@@ -175,7 +183,10 @@ class PaperExecutor:
         else:
             return None
 
-        if not 0.01 < entry_price < 0.99:
+        # Safety net mirroring the ``extreme-ask`` signal gate: refuse
+        # to open any position priced at the tail of the book, where
+        # liquidity is unreliable and the P/L shape is 99-to-1.
+        if not 0.05 <= entry_price <= 0.95:
             return None
 
         prob_for_side = market.posterior if side == "yes" else (1.0 - market.posterior)
@@ -269,6 +280,7 @@ class PaperExecutor:
 
         market.open_position = None
         market.closed_positions.append(pos)
+        self._record_closed(market, pos, event="close", outcome_yes=None)
 
         self._append(
             self.trade_log_path,
@@ -325,6 +337,7 @@ class PaperExecutor:
 
         market.open_position = None
         market.closed_positions.append(pos)
+        self._record_closed(market, pos, event="resolve", outcome_yes=yes_wins)
 
         self._append(
             self.trade_log_path,
@@ -358,3 +371,60 @@ class PaperExecutor:
                 f.write(json.dumps(entry, default=str) + "\n")
         except Exception as e:
             print(f"{self.cfg.log_prefix} log write error ({path}): {e}", flush=True)
+
+    # ------------------------------------------------------------------ #
+    # Closed-position history (survives market eviction)
+    # ------------------------------------------------------------------ #
+
+    def _record_closed(
+        self,
+        market: MarketState,
+        pos: PaperPosition,
+        event: str,
+        outcome_yes: Optional[bool],
+    ) -> None:
+        """Capture a self-contained record of a closed position before
+        the market gets evicted from ``engine.markets``. Format mirrors
+        the JS dashboard's expectations so ``hf_engine.snapshot`` can
+        drop it straight into the state payload with minimal massaging.
+        """
+        # Translate the internal yes/no frame into the domain-specific
+        # up/down labels the dashboard renders. The engine stays a
+        # generic binary-market engine under the hood; only the
+        # presentation layer cares about the crypto-updown naming.
+        side_label = "UP" if pos.side == "yes" else "DOWN"
+        if outcome_yes is None:
+            outcome_label: Optional[str] = None
+        else:
+            outcome_label = "UP" if outcome_yes else "DOWN"
+
+        won = (pos.realized_pnl or 0.0) > 0
+
+        entry = {
+            "ts": pos.exit_time or time.time(),
+            "event": event,
+            "market_id": market.market_id,
+            "interval": market.interval_label,
+            "description": (market.description or "")[:96],
+            "side": side_label,
+            "entry": pos.entry_price,
+            "exit": pos.exit_price,
+            "size_dollars": pos.size_dollars,
+            "realized_pnl": pos.realized_pnl or 0.0,
+            "won": won,
+            "outcome": outcome_label,
+            "posterior_at_entry": pos.posterior_at_entry,
+            "excitation_at_entry": pos.branching_ratio_at_entry,
+            "flow_imbalance_at_entry": pos.flow_imbalance_at_entry,
+            "entry_reason": pos.reason,
+            "exit_reason": pos.exit_reason,
+        }
+        with self._closed_positions_lock:
+            self._closed_positions_history.append(entry)
+
+    def recent_closed_positions(self, limit: int = 100) -> List[dict]:
+        """Return the most recent ``limit`` closed positions, newest first."""
+        with self._closed_positions_lock:
+            items = list(self._closed_positions_history)
+        items.reverse()
+        return items[:limit]

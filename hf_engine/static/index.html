@@ -50,6 +50,11 @@ const h = (tag, attrs, ...ch) => {
 const fmt = (n, d=2) => Number(n).toFixed(d);
 const pc = v => v >= 0 ? '#10b981' : '#ef4444';
 const ps = v => v >= 0 ? '+' : '';
+const _shortMarketId = (id) => {
+  if (!id) return 'MKT-????';
+  if (id.startsWith('0x') && id.length > 10) return 'MKT-' + id.slice(2, 8).toUpperCase();
+  return 'MKT-' + id.slice(0, 8);
+};
 
 let state = null;
 let paused = false;
@@ -88,7 +93,10 @@ function render() {
 
   const s = state;
   const active = s.markets.filter(m => !m.resolved);
-  const resolved = s.markets.filter(m => m.resolved && m.position);
+  // Resolved / closed positions now live in ``s.closed_positions``
+  // (sourced from the executor's persistent history buffer) — the
+  // old filter on ``s.markets`` would miss everything that had been
+  // evicted from ``engine.markets``.
   const wr = s.totalTrades > 0 ? ((s.totalWins / s.totalTrades) * 100).toFixed(1) : '—';
 
   // Header
@@ -157,7 +165,13 @@ function render() {
     badges.append(h('span', { style: { fontSize:'9px', color:'#555' }}, m.id));
     badges.append(h('span', { style: { fontSize:'8px', color:'#333' }}, `${m.duration}m`));
     if (m.cascadeActive) badges.append(h('span', { class:'badge', style: { background:'#1a1400', border:'1px solid #f59e0b', color:'#f59e0b', animation:'badgePulse 1.5s infinite' }}, 'CASCADE'));
-    if (m.signal) badges.append(h('span', { class:'badge', style: { background: m.signal==='BUY_YES'?'#064e3b':'#4a1d1d', border:`1px solid ${m.signal==='BUY_YES'?'#10b981':'#ef4444'}`, color: m.signal==='BUY_YES'?'#10b981':'#ef4444' }}, m.signal));
+    if (m.signal) {
+      const isUp = m.signal === 'BUY_UP';
+      const badgeColor = isUp ? '#10b981' : '#ef4444';
+      const badgeBg = isUp ? '#064e3b' : '#4a1d1d';
+      const badgeLabel = isUp ? 'BUY UP' : 'BUY DOWN';
+      badges.append(h('span', { class:'badge', style: { background: badgeBg, border:`1px solid ${badgeColor}`, color: badgeColor }}, badgeLabel));
+    }
     left.append(badges);
     left.append(h('div', { style: { fontSize:'11px', color:'#94a3b8', lineHeight:'1.3' }}, m.question));
     header.append(left);
@@ -242,16 +256,25 @@ function render() {
 
     card.append(metrics);
 
-    // Position
+    // Position (inline on the market card).
+    // All three of these numbers had bugs in the previous version:
+    //   - size was rendered as a raw float (e.g. "1.9918567534971947")
+    //   - entry was rendered as ".01¢" when it's actually 1.0¢
+    //   - the live P/L formula was wrong for NO/DOWN and double-
+    //     counted the contracts↔dollars conversion
+    // We now read ``m.position.live_pnl`` straight from the Python
+    // snapshot where ``_position_json`` computes it with the correct
+    // dollars-at-risk formula.
     if (hasPos) {
       const posDiv = h('div', { style: { marginTop:'8px', background:'#0d1a2e', border:'1px solid #1e3a5f', borderRadius:'4px', padding:'8px', display:'flex', justifyContent:'space-between', alignItems:'center' }});
       const posLeft = h('span', { style: { fontSize:'9px' }});
       posLeft.append(h('span', { class:'dim' }, 'POS: '));
-      posLeft.append(h('span', { style: { color: m.position.side==='YES'?'#10b981':'#ef4444', fontWeight:700 }}, m.position.side));
-      posLeft.append(h('span', { class:'dim' }, ` · ${m.position.size} @ ${fmt(m.position.entry)}¢ · edge ${fmt(m.position.edge*100,1)}¢`));
+      const sideColor = m.position.side === 'UP' ? '#10b981' : '#ef4444';
+      posLeft.append(h('span', { style: { color: sideColor, fontWeight:700 }}, m.position.side));
+      posLeft.append(h('span', { class:'dim' }, ` · $${fmt(m.position.size, 2)} @ ${fmt(m.position.entry * 100, 1)}¢ · edge ${fmt(m.position.edge * 100, 1)}¢`));
       posDiv.append(posLeft);
 
-      const livePnl = (m.clobPrice - m.position.entry) * m.position.size * (m.position.side==='YES'?1:-1);
+      const livePnl = m.position.live_pnl || 0;
       posDiv.append(h('div', { style: { fontSize:'12px', fontWeight:700, color: pc(livePnl) }}, `${ps(livePnl)}$${fmt(Math.abs(livePnl),3)}`));
       card.append(posDiv);
     }
@@ -259,46 +282,95 @@ function render() {
     app.append(card);
   });
 
-  // Resolved positions
-  if (resolved.length > 0) {
-    const resSection = h('div', { style: { marginTop:'12px' }});
-    const resCard = h('div', { class:'card' });
+  // ────────────────────────────────────────────────────────────────
+  // PAPER POSITIONS (always visible)
+  //
+  // Two subsections: OPEN (live positions currently held, across all
+  // active markets) and RESOLVED (everything the engine has closed so
+  // far, from the executor's history buffer — this survives market
+  // eviction). When neither has any rows we render a placeholder row
+  // so the user can see the section is alive and the engine is
+  // waiting on a signal, rather than wondering if it exists at all.
+  // ────────────────────────────────────────────────────────────────
+  const openPositions = s.open_positions || [];
+  const closedPositions = s.closed_positions || [];
+  const netRealized = s.totalPnl || 0;
+  const netUnrealized = openPositions.reduce((sum, p) => sum + (p.live_pnl || 0), 0);
 
-    const netPnl = resolved.reduce((s, m) => s + ((m.position.side===m.outcome?1:0) - m.position.entry) * m.position.size, 0);
-    const resHeader = h('div', { style: { display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:'8px' }});
-    const resLeft = h('div', { style: { display:'flex', alignItems:'center', gap:'6px' }});
-    resLeft.append(h('span', { style: { fontSize:'10px', color:'#666', fontWeight:700, letterSpacing:'1px' }}, 'RESOLVED POSITIONS'));
-    resLeft.append(h('span', { style: { background:'#1a1a2e', color:'#555', padding:'0 5px', borderRadius:'8px', fontSize:'9px', fontWeight:700 }}, String(resolved.length)));
-    resHeader.append(resLeft);
-    resHeader.append(h('div', { style: { fontSize:'9px', color:'#64748b' }}, [
-      'NET: ', h('span', { style: { color: pc(netPnl), fontWeight:700 }}, `${ps(netPnl)}$${fmt(Math.abs(netPnl),3)}`)
-    ]));
-    resCard.append(resHeader);
+  const ppSection = h('div', { style: { marginTop:'12px' }});
+  const ppCard = h('div', { class:'card' });
 
-    // Table header
-    const cols = '64px 1fr 40px 44px 40px 52px 52px';
-    const tHead = h('div', { style: { display:'grid', gridTemplateColumns:cols, gap:'2px', fontSize:'7px', color:'#333', fontWeight:700, paddingBottom:'3px', borderBottom:'1px solid #111' }});
-    ['MARKET','QUESTION','SIDE','ENTRY','RESULT','P/L $','EDGE'].forEach(l => tHead.append(h('div', {}, l)));
-    resCard.append(tHead);
+  const ppHeader = h('div', { style: { display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:'8px' }});
+  const ppLeft = h('div', { style: { display:'flex', alignItems:'center', gap:'6px' }});
+  ppLeft.append(h('span', { style: { fontSize:'10px', color:'#666', fontWeight:700, letterSpacing:'1px' }}, 'PAPER POSITIONS'));
+  ppLeft.append(h('span', { style: { background:'#0a1e14', color:'#10b981', padding:'0 5px', borderRadius:'8px', fontSize:'9px', fontWeight:700 }}, `${openPositions.length} OPEN`));
+  ppLeft.append(h('span', { style: { background:'#1a1a2e', color:'#94a3b8', padding:'0 5px', borderRadius:'8px', fontSize:'9px', fontWeight:700 }}, `${closedPositions.length} RESOLVED`));
+  ppHeader.append(ppLeft);
+  ppHeader.append(h('div', { style: { fontSize:'9px', color:'#64748b' }},
+    'REALIZED ', h('span', { style: { color: pc(netRealized), fontWeight:700 }}, `${ps(netRealized)}$${fmt(Math.abs(netRealized),3)}`),
+    '  ·  UNREALIZED ', h('span', { style: { color: pc(netUnrealized), fontWeight:700 }}, `${ps(netUnrealized)}$${fmt(Math.abs(netUnrealized),3)}`)
+  ));
+  ppCard.append(ppHeader);
+
+  // ----- OPEN subsection -----
+  if (openPositions.length > 0) {
+    ppCard.append(h('div', { style: { fontSize:'8px', color:'#10b981', letterSpacing:'1px', marginTop:'6px', marginBottom:'3px' }}, `● OPEN (${openPositions.length})`));
+    const openCols = '64px 1fr 46px 54px 52px 52px 52px 52px';
+    const openHead = h('div', { style: { display:'grid', gridTemplateColumns:openCols, gap:'2px', fontSize:'7px', color:'#333', fontWeight:700, paddingBottom:'3px', borderBottom:'1px solid #111' }});
+    ['MARKET','QUESTION','SIDE','SIZE','ENTRY','CLOB','EDGE','LIVE P/L'].forEach(l => openHead.append(h('div', {}, l)));
+    ppCard.append(openHead);
+    openPositions.forEach(p => {
+      const sideColor = p.side === 'UP' ? '#10b981' : '#ef4444';
+      const row = h('div', { style: { display:'grid', gridTemplateColumns:openCols, gap:'2px', fontSize:'9px', padding:'4px 0', borderBottom:'1px solid #0a0a14' }});
+      row.append(h('div', { class:'dim' }, p.market_short));
+      row.append(h('div', { style: { color:'#94a3b8', overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}, p.description));
+      row.append(h('div', { style: { color: sideColor, fontWeight:700 }}, p.side));
+      row.append(h('div', { class:'dim' }, `$${fmt(p.size_dollars, 2)}`));
+      row.append(h('div', { class:'dim' }, `${fmt(p.entry * 100, 1)}¢`));
+      row.append(h('div', { class:'dim' }, `${fmt((p.side === 'UP' ? p.clob_price : 1 - p.clob_price) * 100, 1)}¢`));
+      row.append(h('div', { class:'dim' }, `${fmt(p.edge * 100, 1)}¢`));
+      row.append(h('div', { style: { color: pc(p.live_pnl || 0), fontWeight:700 }}, `${ps(p.live_pnl || 0)}$${fmt(Math.abs(p.live_pnl || 0), 3)}`));
+      ppCard.append(row);
+    });
+  }
+
+  // ----- RESOLVED subsection -----
+  if (closedPositions.length > 0) {
+    ppCard.append(h('div', { style: { fontSize:'8px', color:'#8b5cf6', letterSpacing:'1px', marginTop:'10px', marginBottom:'3px' }}, `■ RESOLVED (${closedPositions.length})`));
+    const resCols = '64px 1fr 44px 50px 48px 48px 58px 44px';
+    const resHead = h('div', { style: { display:'grid', gridTemplateColumns:resCols, gap:'2px', fontSize:'7px', color:'#333', fontWeight:700, paddingBottom:'3px', borderBottom:'1px solid #111' }});
+    ['MARKET','QUESTION','SIDE','SIZE','ENTRY','EXIT','P/L $','RESULT'].forEach(l => resHead.append(h('div', {}, l)));
+    ppCard.append(resHead);
 
     const tbody = h('div', { class:'resolved-table' });
-    resolved.slice().reverse().forEach(m => {
-      const won = m.position.side === m.outcome;
-      const pnl = (won ? 1-m.position.entry : -m.position.entry) * m.position.size;
-      const row = h('div', { class:'resolved-row', style: { gridTemplateColumns: cols }});
-      row.append(h('div', { class:'dim' }, m.id));
-      row.append(h('div', { style: { color:'#555', overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}, m.question));
-      row.append(h('div', { style: { color: m.position.side==='YES'?'#10b981':'#ef4444', fontWeight:700 }}, m.position.side));
-      row.append(h('div', { class:'dim' }, `${fmt(m.position.entry)}¢`));
-      row.append(h('div', { style: { color: won?'#10b981':'#ef4444', fontWeight:700 }}, won?'WIN':'LOSS'));
-      row.append(h('div', { style: { color: pc(pnl), fontWeight:700 }}, `${ps(pnl)}$${fmt(Math.abs(pnl),3)}`));
-      row.append(h('div', { class:'dim' }, `${fmt(m.position.edge*100,1)}¢`));
+    closedPositions.forEach(e => {
+      const sideColor = e.side === 'UP' ? '#10b981' : '#ef4444';
+      const won = e.won;
+      const row = h('div', { class:'resolved-row', style: { gridTemplateColumns: resCols }});
+      row.append(h('div', { class:'dim' }, _shortMarketId(e.market_id)));
+      row.append(h('div', { style: { color:'#94a3b8', overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}, e.description || e.market_id));
+      row.append(h('div', { style: { color: sideColor, fontWeight:700 }}, e.side));
+      row.append(h('div', { class:'dim' }, `$${fmt(e.size_dollars || 0, 2)}`));
+      row.append(h('div', { class:'dim' }, `${fmt((e.entry || 0) * 100, 1)}¢`));
+      row.append(h('div', { class:'dim' }, e.exit != null ? `${fmt(e.exit * 100, 1)}¢` : '—'));
+      row.append(h('div', { style: { color: pc(e.realized_pnl || 0), fontWeight:700 }}, `${ps(e.realized_pnl || 0)}$${fmt(Math.abs(e.realized_pnl || 0), 3)}`));
+      row.append(h('div', { style: { color: won?'#10b981':'#ef4444', fontWeight:700 }}, won ? 'WIN' : 'LOSS'));
       tbody.append(row);
     });
-    resCard.append(tbody);
-    resSection.append(resCard);
-    app.append(resSection);
+    ppCard.append(tbody);
   }
+
+  // Empty-state placeholder so the user always sees that the section
+  // exists even before any trade has been entered.
+  if (openPositions.length === 0 && closedPositions.length === 0) {
+    ppCard.append(h('div', { style: { padding:'14px 0', textAlign:'center', fontSize:'9px', color:'#444' }},
+      'no paper positions yet — the engine is waiting for a cascade + directional edge to fire',
+      h('div', { style: { fontSize:'7px', color:'#333', marginTop:'3px' }}, 'check the SIGNAL GATES panel below to see which gate is rejecting candidates')
+    ));
+  }
+
+  ppSection.append(ppCard);
+  app.append(ppSection);
 
   // Signal diagnostics — accepted + rejected gate decisions
   const sig = s.recent_signals || [];
