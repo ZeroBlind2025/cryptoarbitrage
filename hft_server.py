@@ -127,6 +127,24 @@ stop_momentum = threading.Event()
 momentum_paused = threading.Event()  # When set, skip new scans but keep resolution running
 momentum_trades: deque = deque(maxlen=500)
 
+# Informed money engine (smart-money-enters-early theory test)
+try:
+    from informed_money_engine import (
+        InformedMoneyEngine,
+        POLL_INTERVAL as INFORMED_POLL_INTERVAL,
+    )
+    HAS_INFORMED_ENGINE = True
+except Exception as e:
+    print(f"[SERVER] Failed to import informed_money_engine: {e}")
+    HAS_INFORMED_ENGINE = False
+    INFORMED_POLL_INTERVAL = 1
+
+informed_engine: Optional["InformedMoneyEngine"] = None
+informed_thread: Optional[threading.Thread] = None
+stop_informed = threading.Event()
+informed_paused = threading.Event()
+informed_trades: deque = deque(maxlen=500)
+
 
 def on_copy_trade(trade_record: dict):
     """Callback when copy trader executes a trade"""
@@ -138,6 +156,12 @@ def on_momentum_trade(trade_record: dict):
     """Callback when momentum engine executes a trade"""
     momentum_trades.append(trade_record)
     print(f"[MOMENTUM] Trade recorded: {trade_record.get('market', '?')[:30]} - {trade_record.get('status', '?')}", flush=True)
+
+
+def on_informed_trade(trade_record: dict):
+    """Callback when informed money engine executes a trade"""
+    informed_trades.append(trade_record)
+    print(f"[INFORMED] Trade recorded: {trade_record.get('market', '?')[:30]} - {trade_record.get('status', '?')}", flush=True)
 
 
 # Sports data (no longer using WebSocket)
@@ -2262,6 +2286,256 @@ def api_momentum_trades():
     """Get momentum engine trade history"""
     limit = int(request.args.get('limit', 50))
     trades = list(momentum_trades)[-limit:]
+    trades.reverse()
+    return jsonify(trades)
+
+
+# =============================================================================
+# INFORMED MONEY ENGINE ENDPOINTS
+# =============================================================================
+
+def informed_loop():
+    """Background loop for informed money engine"""
+    global informed_engine
+    if not informed_engine:
+        print("[INFORMED] Loop abort: engine is None", flush=True)
+        return
+
+    poll_s = INFORMED_POLL_INTERVAL
+    print(f"[INFORMED] Background scanning started (every {poll_s}s)...", flush=True)
+    loop_count = 0
+
+    while not stop_informed.is_set():
+        try:
+            loop_count += 1
+
+            if not informed_paused.is_set():
+                entered = informed_engine.scan_and_trade()
+                if entered > 0:
+                    print(f"[INFORMED] Entered {entered} trade(s)", flush=True)
+
+            informed_engine.check_resolutions()
+
+            heartbeat_every = max(1, 300 // poll_s)
+            if loop_count % heartbeat_every == 0:
+                stats = informed_engine.get_stats()
+                paused_label = "PAUSED" if informed_paused.is_set() else "ACTIVE"
+                print(f"[INFORMED] Heartbeat #{loop_count}: {paused_label} | "
+                      f"{stats['open_positions']} open | "
+                      f"{stats['trades_entered']} entered | "
+                      f"{stats['scans_completed']} scans", flush=True)
+        except Exception as e:
+            print(f"[INFORMED] Error in loop: {e}", flush=True)
+            import traceback; traceback.print_exc()
+
+        stop_informed.wait(timeout=poll_s)
+
+    print("[INFORMED] Background scanning stopped", flush=True)
+
+
+@app.route('/api/informed/start', methods=['POST'])
+def api_informed_start():
+    """Start the informed money engine."""
+    global informed_engine, informed_thread, stop_informed
+
+    if not HAS_INFORMED_ENGINE:
+        return jsonify({"error": "Informed money engine module not available"}), 400
+
+    if informed_thread and informed_thread.is_alive():
+        return jsonify({"error": "Informed money engine already running"}), 400
+
+    data = request.get_json() or {}
+    live_mode = data.get('live', False)
+    bet_amount = data.get('bet_amount')
+    coin_bet_amounts = data.get('coin_bet_amounts')
+    min_entry = data.get('min_entry_price')
+
+    if live_mode and not data.get('confirm_live'):
+        return jsonify({
+            "error": "Live mode requires confirmation",
+            "message": "Set confirm_live=true to enable live trading"
+        }), 403
+
+    # Share lot sizes from copy trader or momentum engine if not supplied
+    if not coin_bet_amounts and copy_trader:
+        coin_bet_amounts = dict(copy_trader.coin_bet_amounts)
+    if not coin_bet_amounts and momentum_engine:
+        coin_bet_amounts = dict(momentum_engine.coin_bet_amounts)
+    if not bet_amount and copy_trader:
+        bet_amount = copy_trader.bet_amount
+    if not bet_amount and momentum_engine:
+        bet_amount = momentum_engine.bet_amount
+
+    try:
+        # Share positions dict so all engines write to the same P&L / balance
+        shared_pos = (
+            copy_trader.positions if copy_trader
+            else momentum_engine.positions if momentum_engine
+            else None
+        )
+        informed_engine = InformedMoneyEngine(
+            dry_run=not live_mode,
+            on_trade=on_informed_trade,
+            bet_amount=bet_amount,
+            coin_bet_amounts=coin_bet_amounts,
+            shared_positions=shared_pos,
+        )
+        if min_entry is not None:
+            informed_engine.min_entry_price = float(min_entry)
+        informed_engine.start()
+    except Exception as e:
+        print(f"[SERVER] Failed to start informed engine: {e}")
+        import traceback; traceback.print_exc()
+        informed_engine = None
+        return jsonify({"error": f"Failed to start: {e}"}), 500
+
+    stop_informed.clear()
+    informed_paused.clear()
+    informed_thread = threading.Thread(target=informed_loop, daemon=True)
+    informed_thread.start()
+
+    mode_str = "LIVE" if live_mode else "DRY RUN"
+    return jsonify({
+        "success": True,
+        "message": f"Informed money engine started in {mode_str} mode",
+        "min_entry_price": informed_engine.min_entry_price,
+    })
+
+
+@app.route('/api/informed/stop', methods=['POST'])
+def api_informed_stop():
+    """Stop the informed money engine."""
+    global informed_engine, informed_thread, stop_informed
+
+    if not informed_thread or not informed_thread.is_alive():
+        return jsonify({"error": "Informed money engine not running"}), 400
+
+    stop_informed.set()
+    informed_thread.join(timeout=5)
+
+    stats = informed_engine.get_stats() if informed_engine else {}
+
+    if informed_engine:
+        informed_engine.stop()
+    informed_engine = None
+
+    return jsonify({
+        "success": True,
+        "message": "Informed money engine stopped",
+        "stats": stats,
+    })
+
+
+@app.route('/api/informed/pause', methods=['POST'])
+def api_informed_pause():
+    """Pause the informed money engine — stop new scans, keep resolution."""
+    if not informed_thread or not informed_thread.is_alive():
+        return jsonify({"error": "Informed money engine not running"}), 400
+
+    if informed_paused.is_set():
+        return jsonify({"error": "Already paused"}), 400
+
+    informed_paused.set()
+    open_count = len(informed_engine.positions.get("open", [])) if informed_engine else 0
+    print(f"[INFORMED] PAUSED - No new scans. Resolution still running for "
+          f"{open_count} open positions.", flush=True)
+
+    return jsonify({
+        "success": True,
+        "message": f"Paused. Resolution running for {open_count} open position(s).",
+        "open_positions": open_count,
+    })
+
+
+@app.route('/api/informed/resume', methods=['POST'])
+def api_informed_resume():
+    """Resume informed money engine scanning."""
+    if not informed_thread or not informed_thread.is_alive():
+        return jsonify({"error": "Informed money engine not running"}), 400
+
+    if not informed_paused.is_set():
+        return jsonify({"error": "Not paused"}), 400
+
+    informed_paused.clear()
+    print("[INFORMED] RESUMED - Scanning for new trades again.", flush=True)
+    return jsonify({"success": True, "message": "Informed money engine resumed"})
+
+
+@app.route('/api/informed/status')
+def api_informed_status():
+    """Get informed money engine status."""
+    if not HAS_INFORMED_ENGINE:
+        return jsonify({
+            "available": False, "running": False,
+            "error": "Module not available",
+        })
+
+    running = informed_thread and informed_thread.is_alive()
+    status = {
+        "available": True,
+        "running": running,
+        "paused": informed_paused.is_set() if running else False,
+    }
+
+    if informed_engine:
+        status.update(informed_engine.get_stats())
+
+    return jsonify(status)
+
+
+@app.route('/api/informed/settings', methods=['POST'])
+def api_informed_settings():
+    """Update informed money engine settings at runtime."""
+    if not informed_engine:
+        return jsonify({"error": "Informed money engine not running"}), 400
+
+    data = request.get_json() or {}
+    changes = []
+
+    if 'min_entry_price' in data:
+        old = informed_engine.min_entry_price
+        informed_engine.min_entry_price = float(data['min_entry_price'])
+        changes.append(
+            f"min_entry: {old * 100:.0f}¢ -> "
+            f"{informed_engine.min_entry_price * 100:.0f}¢"
+        )
+
+    if 'max_entry_price' in data:
+        old = informed_engine.max_entry_price
+        informed_engine.max_entry_price = float(data['max_entry_price'])
+        changes.append(
+            f"max_entry: {old * 100:.0f}¢ -> "
+            f"{informed_engine.max_entry_price * 100:.0f}¢"
+        )
+
+    if 'bet_amount' in data:
+        old = informed_engine.bet_amount
+        informed_engine.bet_amount = float(data['bet_amount'])
+        changes.append(
+            f"bet_amount: ${old:.2f} -> ${informed_engine.bet_amount:.2f}"
+        )
+
+    if 'coin_bet_amounts' in data:
+        for coin, amt in data['coin_bet_amounts'].items():
+            old = informed_engine.coin_bet_amounts.get(coin, informed_engine.bet_amount)
+            informed_engine.coin_bet_amounts[coin] = float(amt)
+            changes.append(f"{coin.upper()} lot: ${old:.2f} -> ${float(amt):.2f}")
+
+    if not changes:
+        return jsonify({"error": "No settings provided"}), 400
+
+    return jsonify({
+        "success": True,
+        "changes": changes,
+        "current": informed_engine.get_stats(),
+    })
+
+
+@app.route('/api/informed/trades')
+def api_informed_trades():
+    """Get informed money engine trade history."""
+    limit = int(request.args.get('limit', 50))
+    trades = list(informed_trades)[-limit:]
     trades.reverse()
     return jsonify(trades)
 
