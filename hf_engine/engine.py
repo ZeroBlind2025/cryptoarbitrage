@@ -155,8 +155,19 @@ class HFEngine:
         while self._running:
             try:
                 found = self.scanner.scan()
+                ingested_any = False
                 for meta in found:
-                    self._ingest_new_market(meta)
+                    if self._ingest_new_market(meta):
+                        ingested_any = True
+
+                # One consolidated subscribe covering every registered
+                # token (old + newly added). Polymarket's CLOB WS drops
+                # most of its attention when tiny subscribe messages
+                # arrive in rapid succession, so we deliberately avoid
+                # sending a subscribe per market and instead flush the
+                # full registry once per scan cycle.
+                if ingested_any:
+                    self.feed.flush_subscriptions()
 
                 # Check for resolved markets and settle them.
                 with self._markets_lock:
@@ -168,10 +179,16 @@ class HFEngine:
                 self._log(f"scan loop error: {e}")
             time.sleep(self.cfg.scan_interval_sec)
 
-    def _ingest_new_market(self, meta: MarketMeta) -> None:
+    def _ingest_new_market(self, meta: MarketMeta) -> bool:
+        """Ingest a newly-discovered market into the engine state.
+
+        Returns ``True`` if the market was added (so the caller knows
+        to flush subscriptions at the end of the batch), ``False`` if
+        the market was already known and nothing changed.
+        """
         with self._markets_lock:
             if meta.market_id in self.markets:
-                return
+                return False
 
             market = MarketState(
                 cfg=self.cfg,
@@ -200,10 +217,15 @@ class HFEngine:
             self.markets[meta.market_id] = market
 
         # Register with the feed (outside the lock to avoid contention).
+        # ``flush=False`` — the scan loop will call
+        # ``feed.flush_subscriptions()`` once after ingesting every
+        # newly-discovered market so Polymarket's CLOB WS only sees
+        # one consolidated subscribe message per scan cycle.
         self.feed.register_market(
             market_id=meta.market_id,
             yes_token_id=meta.yes_token_id,
             no_token_id=meta.no_token_id,
+            flush=False,
         )
 
         self._markets_seen_total += 1
@@ -212,6 +234,7 @@ class HFEngine:
             f"(id={meta.market_id[:12]}... "
             f"resolves_in={meta.resolves_at - time.time():.0f}s)"
         )
+        return True
 
     def _maybe_resolve_market(self, market_id: str) -> None:
         with self._markets_lock:
@@ -272,7 +295,18 @@ class HFEngine:
             self.executor.log_signal(market, sig.reason, accepted=(sig.action != "none"))
             if sig.action in ("buy_yes", "buy_no"):
                 self.executor.open_position(market, action=sig.action, reason=sig.reason)
-        else:
+        elif self.cfg.early_exit_enabled:
+            # Early-exit path — off by default. Paper positions can
+            # only be honestly settled against a real counterparty,
+            # and there is none: closing via
+            # ``(clob_mid_yes - entry) / entry`` produces
+            # mark-to-market "profit" or "loss" against a phantom
+            # trade that never actually executed, which is what made
+            # the v1 stats export show both UP and DOWN positions
+            # "winning" on the same market. When this flag is false
+            # positions hold until ``settle_at_resolution`` fires at
+            # the market's end time, so there is exactly one
+            # realized P/L per market based on the true outcome.
             exit_sig = market.evaluate_exit_signal()
             if exit_sig.action == "exit":
                 self.executor.close_position(market, reason=exit_sig.reason)
@@ -348,7 +382,11 @@ class HFEngine:
                 with self._markets_lock:
                     to_reg = list(self.markets.values())
                 for m in to_reg:
-                    self.feed.register_market(m.market_id, m.yes_token_id, m.no_token_id)
+                    self.feed.register_market(
+                        m.market_id, m.yes_token_id, m.no_token_id, flush=False
+                    )
+                # One consolidated subscribe at the end of the batch.
+                self.feed.flush_subscriptions()
 
             time.sleep(max(self.cfg.loop_sleep_sec, 0.05))
 

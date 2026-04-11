@@ -148,8 +148,22 @@ class HFETradeFeed:
         market_id: str,
         yes_token_id: str,
         no_token_id: str,
+        flush: bool = False,
     ) -> None:
-        """Register both outcome tokens and subscribe to them."""
+        """Register both outcome tokens in the local registry.
+
+        Does **not** send a subscribe message on its own (unless
+        ``flush=True``). Polymarket's CLOB WS has trouble handling a
+        rapid burst of tiny subscribe messages — only one of them
+        tends to take effect server-side — which produced the bug
+        where 7 of 8 registered markets received no book or trade
+        events while the 8th worked fine.
+
+        Callers should register all markets they discovered in a
+        single scan cycle and then call :meth:`flush_subscriptions`
+        exactly once at the end of the batch. The engine's scan loop
+        does this automatically.
+        """
         with self._lock:
             self._registry[yes_token_id] = TokenRegistration(
                 market_id=market_id, token_id=yes_token_id, is_yes=True
@@ -157,7 +171,39 @@ class HFETradeFeed:
             self._registry[no_token_id] = TokenRegistration(
                 market_id=market_id, token_id=no_token_id, is_yes=False
             )
-        self._subscribe([yes_token_id, no_token_id])
+        if flush:
+            self.flush_subscriptions()
+
+    def flush_subscriptions(self) -> None:
+        """Re-send a subscribe covering every currently-registered token.
+
+        This mirrors ``momentum_engine``'s subscribe-all-at-once
+        pattern: build the full list of tokens of interest and send
+        it in a single subscribe message (chunked internally at 20
+        per chunk). Sending one big subscribe is reliable; sending
+        many tiny ones is not.
+        """
+        with self._lock:
+            all_tokens = list(self._registry.keys())
+        if not all_tokens:
+            return
+        if self.connected and self.ws is not None:
+            # Reset the ``_subscribed`` cache so ``_send_subscribe``
+            # actually retransmits every token — otherwise the
+            # "already subscribed" filter inside it would make the
+            # re-sync a no-op.
+            with self._lock:
+                self._subscribed.clear()
+            self._send_subscribe(all_tokens)
+            print(
+                f"{self.log_prefix} flush_subscriptions sent {len(all_tokens)} tokens",
+                flush=True,
+            )
+        else:
+            with self._lock:
+                # Merge into the pending queue without duplicates.
+                merged = list(dict.fromkeys(self._pending + all_tokens))
+                self._pending = merged
 
     def _note_unknown_asset(self, asset_id: str, kind: str) -> None:
         """Rate-limited log of events received for asset ids we didn't

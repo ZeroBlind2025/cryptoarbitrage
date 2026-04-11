@@ -40,10 +40,21 @@ class PaperExecutor:
         self.cfg = cfg
         self._lock = threading.Lock()
         self._open_exposure_dollars = 0.0
+        # Separate accounting for the two ways a position can close:
+        #   - ``settle_at_resolution`` -> realized_* (the only honest
+        #     P/L in paper mode, computed against the true outcome)
+        #   - ``close_position`` -> mark_* (pre-resolution mark-to-
+        #     market against the current CLOB mid; fictional unless
+        #     there's a real counterparty, which there isn't in v1)
+        # The dashboard shows both but labels MARK closes distinctly.
         self._realized_pnl = 0.0
+        self._mark_pnl = 0.0
         self._trade_count = 0
         self._wins = 0
         self._losses = 0
+        self._resolved_wins = 0
+        self._resolved_losses = 0
+        self._resolved_count = 0
 
         os.makedirs(cfg.log_dir, exist_ok=True)
         self.trade_log_path = os.path.join(cfg.log_dir, cfg.trade_log_file)
@@ -88,10 +99,24 @@ class PaperExecutor:
         with self._lock:
             return {
                 "open_exposure": self._open_exposure_dollars,
+                # Only resolution-based P/L is honest paper P/L.
                 "realized_pnl": self._realized_pnl,
+                # Mark-to-market P/L from early-exit closes. 0 in v1
+                # (early exits disabled by default) but tracked
+                # separately so it can never contaminate the
+                # ``realized_pnl`` the dashboard and calibrator read.
+                "mark_pnl": self._mark_pnl,
                 "trade_count": self._trade_count,
+                # Resolved-only win/loss counts — this is what WIN
+                # RATE on the dashboard should use. ``wins`` and
+                # ``losses`` still include mark-close counts for
+                # backwards compatibility but the dashboard prefers
+                # the resolved_* numbers.
                 "wins": self._wins,
                 "losses": self._losses,
+                "resolved_count": self._resolved_count,
+                "resolved_wins": self._resolved_wins,
+                "resolved_losses": self._resolved_losses,
             }
 
     # ------------------------------------------------------------------ #
@@ -185,8 +210,10 @@ class PaperExecutor:
 
         # Safety net mirroring the ``extreme-ask`` signal gate: refuse
         # to open any position priced at the tail of the book, where
-        # liquidity is unreliable and the P/L shape is 99-to-1.
-        if not 0.05 <= entry_price <= 0.95:
+        # liquidity is unreliable and mark-to-market swings are
+        # dominated by the tiny entry price rather than any real
+        # signal.
+        if not 0.10 <= entry_price <= 0.90:
             return None
 
         prob_for_side = market.posterior if side == "yes" else (1.0 - market.posterior)
@@ -271,7 +298,13 @@ class PaperExecutor:
 
         with self._lock:
             self._open_exposure_dollars = max(0.0, self._open_exposure_dollars - pos.size_dollars)
-            self._realized_pnl += realized
+            # Mark-to-market close: tracked in ``_mark_pnl`` and the
+            # legacy ``_wins``/``_losses`` counters (which the
+            # dashboard no longer uses for WIN RATE) but never in
+            # ``_realized_pnl`` or ``_resolved_*``. This way the
+            # dashboard's BALANCE / SESSION P/L numbers only reflect
+            # settlements against actual outcomes.
+            self._mark_pnl += realized
             self._trade_count += 1
             if realized > 0:
                 self._wins += 1
@@ -329,12 +362,16 @@ class PaperExecutor:
 
         with self._lock:
             self._open_exposure_dollars = max(0.0, self._open_exposure_dollars - pos.size_dollars)
+            # True resolution P/L — the only honest paper P/L in v1.
             self._realized_pnl += realized
             self._trade_count += 1
+            self._resolved_count += 1
             if realized > 0:
                 self._wins += 1
+                self._resolved_wins += 1
             elif realized < 0:
                 self._losses += 1
+                self._resolved_losses += 1
 
         market.open_position = None
         market.closed_positions.append(pos)

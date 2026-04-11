@@ -78,9 +78,14 @@ def snapshot(engine) -> Dict[str, Any]:
     signal_count = sum(1 for m in active if m["signal"] is not None)
     position_count = sum(1 for m in active if m["position"] is not None)
 
+    # Dashboard stats use **resolved-only** numbers. Mark-to-market
+    # closes from the optional early-exit path are tracked separately
+    # in ``mark_pnl`` and ``wins`` / ``losses``, and never contaminate
+    # BALANCE / WIN RATE on the dashboard — because in paper mode
+    # there's no counterparty and mark P/L is fictional.
     total_pnl = float(ex_stats.get("realized_pnl", 0.0))
-    total_trades = int(ex_stats.get("trade_count", 0))
-    total_wins = int(ex_stats.get("wins", 0))
+    total_trades = int(ex_stats.get("resolved_count", 0))
+    total_wins = int(ex_stats.get("resolved_wins", 0))
 
     priors = list(engine.calibrator.current_priors())
 
@@ -121,7 +126,10 @@ def snapshot(engine) -> Dict[str, Any]:
         "totalPnl": total_pnl,
         "totalTrades": total_trades,
         "totalWins": total_wins,
+        "totalLosses": int(ex_stats.get("resolved_losses", 0)),
+        "mark_pnl": float(ex_stats.get("mark_pnl", 0.0)),
         "balance": PAPER_STARTING_BALANCE + total_pnl,
+        "early_exit_enabled": engine.cfg.early_exit_enabled,
         "activeCount": len(active),
         "cascadeCount": cascade_count,
         "signalCount": signal_count,

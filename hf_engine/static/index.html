@@ -345,7 +345,23 @@ function render() {
     const tbody = h('div', { class:'resolved-table' });
     closedPositions.forEach(e => {
       const sideColor = e.side === 'UP' ? '#10b981' : '#ef4444';
-      const won = e.won;
+      // A position is a REAL win only when the market resolved and
+      // the side matches the outcome. Mark-to-market closes
+      // (event === 'close', outcome null) are shown as MARK in
+      // grey so they cannot be mistaken for realized wins.
+      const isResolved = e.event === 'resolve' && e.outcome != null;
+      let resultLabel, resultColor;
+      if (!isResolved) {
+        resultLabel = 'MARK';
+        resultColor = '#64748b';
+      } else if (e.side === e.outcome) {
+        resultLabel = 'WIN';
+        resultColor = '#10b981';
+      } else {
+        resultLabel = 'LOSS';
+        resultColor = '#ef4444';
+      }
+
       const row = h('div', { class:'resolved-row', style: { gridTemplateColumns: resCols }});
       row.append(h('div', { class:'dim' }, _shortMarketId(e.market_id)));
       row.append(h('div', { style: { color:'#94a3b8', overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}, e.description || e.market_id));
@@ -354,7 +370,7 @@ function render() {
       row.append(h('div', { class:'dim' }, `${fmt((e.entry || 0) * 100, 1)}¢`));
       row.append(h('div', { class:'dim' }, e.exit != null ? `${fmt(e.exit * 100, 1)}¢` : '—'));
       row.append(h('div', { style: { color: pc(e.realized_pnl || 0), fontWeight:700 }}, `${ps(e.realized_pnl || 0)}$${fmt(Math.abs(e.realized_pnl || 0), 3)}`));
-      row.append(h('div', { style: { color: won?'#10b981':'#ef4444', fontWeight:700 }}, won ? 'WIN' : 'LOSS'));
+      row.append(h('div', { style: { color: resultColor, fontWeight:700 }}, resultLabel));
       tbody.append(row);
     });
     ppCard.append(tbody);

@@ -127,6 +127,22 @@ class HFEConfig:
     contrary_flow_threshold: float = 0.20
     exit_time_buffer_sec: float = 15.0
 
+    # Enable the early-exit signal path (``edge-collapse``,
+    # ``contrary-flow``, ``time-buffer-losing``). Off by default in
+    # paper-trading v1: for paper positions the only honest P/L
+    # comes from settlement against the real market outcome, because
+    # there is no counterparty willing to buy the position off us
+    # at the current CLOB mid. Closing early against the mid simulates
+    # a trade that did not happen and can make **both sides** of the
+    # same market look like winners in the stats export — a tell-tale
+    # sign that the exit-time P/L is fictitious. With this flag off,
+    # every open position is held until ``settle_at_resolution``
+    # fires, producing exactly one realized P/L entry per market.
+    # Turn back on via ``HFE_EARLY_EXIT_ENABLED=true`` once there is
+    # a real execution layer that can close positions against a
+    # real counterparty.
+    early_exit_enabled: bool = False
+
     # Minimum time between closing a position and being allowed to
     # open a new one on the same market. Without this the engine
     # cycles through cascade -> enter -> contrary-flow -> exit ->
@@ -233,6 +249,9 @@ class HFEConfig:
         )
         cfg.exit_time_buffer_sec = _getenv_float(
             "HFE_EXIT_TIME_BUFFER_SEC", cfg.exit_time_buffer_sec
+        )
+        cfg.early_exit_enabled = _getenv_bool(
+            "HFE_EARLY_EXIT_ENABLED", cfg.early_exit_enabled
         )
         cfg.reentry_cooldown_sec = _getenv_float(
             "HFE_REENTRY_COOLDOWN_SEC", cfg.reentry_cooldown_sec

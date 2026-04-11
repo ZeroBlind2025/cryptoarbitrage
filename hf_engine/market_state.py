@@ -426,11 +426,15 @@ class MarketState:
         #
         # The earlier "BUY_NO @ 0.01¢ on a pre-active 15m market"
         # incident came from a phantom/empty book where best_ask_yes
-        # was effectively 0.99 (so entry_no = 0.01). At those extremes
-        # slippage and liquidity are unreliable regardless of what the
-        # GM posterior says. Reject any ask < 0.05 or > 0.95.
+        # was effectively 0.99 (so entry_no = 0.01). Even a more
+        # modest 0.05 / 0.95 can produce 20x-to-1 mark-to-market
+        # swings against thin book depth, so we clamp the acceptable
+        # ask range to [0.10, 0.90] — any ask outside that window
+        # reflects a market that is either not really interesting
+        # from an information standpoint or has unreliable depth on
+        # one side.
         ask_yes = self.best_ask_yes
-        if ask_yes is not None and (ask_yes < 0.05 or ask_yes > 0.95):
+        if ask_yes is not None and (ask_yes < 0.10 or ask_yes > 0.90):
             return Signal(
                 action="none",
                 reason=f"extreme-ask({ask_yes:.3f})",
