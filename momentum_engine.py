@@ -121,6 +121,12 @@ FOLLOW_UP_COOLDOWN = int(os.getenv("MOMENTUM_FOLLOW_UP_COOLDOWN", "30"))
 FOLLOW_UP_COOLDOWN_15M = int(os.getenv("MOMENTUM_15m_COOLDOWN", "240"))  # 4 minutes for 15m markets
 REENTRY_MIN_PRICE = float(os.getenv("MOMENTUM_REENTRY_MIN_PRICE", "0.80"))  # only re-enter once momentum is confirmed (price >= 80¢)
 
+# Take-profit floor: when an open position's live ask reaches this price,
+# sell at market and lock in the gain.  Avoids riding a winning position
+# all the way to resolution and risking a last-second reversal.
+# 0 disables take-profit entirely.
+TAKE_PROFIT_PRICE = float(os.getenv("MOMENTUM_TAKE_PROFIT", "0.80"))
+
 # Minimum minutes before market close to allow entry.
 # Prevents placing trades after (or right at) the close time.
 MIN_MINUTES_BEFORE_CLOSE = float(os.getenv("MOMENTUM_MIN_MINUTES_BEFORE_CLOSE", "1.0"))
@@ -940,6 +946,10 @@ class MomentumEngine:
         print(f"  Re-entry: upward only, max {self.max_entries_per_market} entries/market")
         print(f"  Re-entry confirmation floor: {REENTRY_MIN_PRICE*100:.0f}¢ (MOMENTUM_REENTRY_MIN_PRICE)")
         print(f"  Cooldown: {FOLLOW_UP_COOLDOWN}s (5m) / {FOLLOW_UP_COOLDOWN_15M}s (15m) — one-shot, gates 2nd market entry only")
+        if 0 < TAKE_PROFIT_PRICE < 1:
+            print(f"  Take profit: ENABLED @ {TAKE_PROFIT_PRICE*100:.0f}¢ (MOMENTUM_TAKE_PROFIT)")
+        else:
+            print(f"  Take profit: DISABLED (MOMENTUM_TAKE_PROFIT={TAKE_PROFIT_PRICE})")
         _delay_status = "DISABLED" if getattr(self, '_dry_run_no_delays', False) else "ENABLED"
         _delay_info = ", ".join(f"{k}={int(v*60)}s" for k, v in MARKET_ENTRY_DELAY.items()) if _delay_status == "ENABLED" else ""
         print(f"  Delays/cooldowns: {_delay_status}" + (f" ({_delay_info})" if _delay_info else ""))
@@ -1875,6 +1885,202 @@ class MomentumEngine:
                             print(f"[MOMENTUM] Callback error: {e}", flush=True)
 
         return entered
+
+    def check_take_profits(self) -> int:
+        """Auto-sell momentum positions whose live ask reached TAKE_PROFIT_PRICE.
+
+        Locks in the gain at market price the moment a position's live ask
+        crosses the take-profit floor (default 80¢ via MOMENTUM_TAKE_PROFIT
+        env var).  No partial closes — sells the entire share count at once.
+        Returns the number of positions closed via take-profit.
+        """
+        if TAKE_PROFIT_PRICE <= 0 or TAKE_PROFIT_PRICE >= 1:
+            return 0
+        if not self.ws:
+            return 0
+
+        open_positions = self.positions.get("open", [])
+        momentum_open = [p for p in open_positions if p.get("source") == "momentum"]
+        if not momentum_open:
+            return 0
+
+        sold = 0
+
+        for position in momentum_open[:]:  # copy — list mutated during iteration
+            entry_price = position.get("entry_price", 0)
+            token_id = position.get("token_id", "")
+            if entry_price <= 0 or not token_id:
+                continue
+
+            # Skip already-resolved positions (defensive)
+            if position.get("result"):
+                continue
+
+            # Skip arb-hedged markets — both sides locked in, TP would
+            # break the locked-in arb.
+            cid = position.get("condition_id", "")
+            if cid and cid in self.hedged_markets:
+                continue
+
+            live_price = self.get_live_price(token_id)
+            if live_price is None or live_price <= 0:
+                continue
+
+            if live_price < TAKE_PROFIT_PRICE:
+                continue  # not yet at the take-profit threshold
+
+            # --- TAKE PROFIT TRIGGERED ---
+            condition_id = cid
+            shares = position.get("potential_payout", 0)
+            title = position.get("market", "Unknown")[:50]
+            outcome = position.get("outcome", "?")
+            amount_spent = position.get("amount", 0)
+            coin = detect_coin(position.get("slug", ""), title)
+            gain_pct = (
+                (live_price - entry_price) / entry_price * 100
+                if entry_price > 0 else 0
+            )
+
+            print(f"\n[MOMENTUM] *** TAKE PROFIT TRIGGERED ***", flush=True)
+            print(f"       Market: {title}", flush=True)
+            print(
+                f"       {outcome} | Entry: {entry_price*100:.1f}¢ | "
+                f"Now: {live_price*100:.1f}¢ (+{gain_pct:.1f}% from entry)",
+                flush=True,
+            )
+            print(f"       TP level: {TAKE_PROFIT_PRICE*100:.0f}¢", flush=True)
+            print(f"       Selling {shares:.2f} shares at market", flush=True)
+
+            trade_record = {
+                "id": f"momentum_tp_{position.get('id', '')}_{int(time.time())}",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "market": title,
+                "slug": position.get("slug", ""),
+                "outcome": outcome,
+                "side": "SELL",
+                "reason": "take_profit",
+                "shares": shares,
+                "entry_price": entry_price,
+                "trigger_price": live_price,
+                "tp_level": TAKE_PROFIT_PRICE,
+                "coin": coin,
+                "source": "momentum",
+            }
+
+            if self.dry_run:
+                trade_record["price"] = live_price
+                trade_record["status"] = "dry_run"
+            else:
+                if token_id and self.client and shares > 0:
+                    # Sell with a small buffer below the live ask so the
+                    # order fills against the current bid stack.  Floor at
+                    # 50¢ as a sanity rail — if the bid has collapsed below
+                    # 50¢ we'd rather wait for resolution than dump.
+                    buffer = PRICE_BUFFER_BPS / 10000
+                    min_price = max(live_price * (1 - buffer), 0.50)
+                    fill = place_sell(
+                        self.client, token_id, shares, min_price=min_price
+                    )
+                    if fill.get("success"):
+                        trade_record["status"] = "filled"
+                        fill_price = fill.get("fill_price") or live_price
+                        trade_record["price"] = fill_price
+                        print(
+                            f"       TAKE PROFIT SELL EXECUTED! "
+                            f"Fill: {fill_price*100:.1f}¢",
+                            flush=True,
+                        )
+                    else:
+                        print(f"       TAKE PROFIT SELL FAILED!", flush=True)
+                        trade_record["status"] = "failed"
+                else:
+                    trade_record["status"] = "error"
+
+            if trade_record["status"] in ("filled", "dry_run"):
+                sell_price = trade_record.get("price", 0)
+                if sell_price > 0 and shares > 0:
+                    proceeds = sell_price * shares
+                    pnl = proceeds - amount_spent
+                else:
+                    proceeds = 0
+                    pnl = -amount_spent
+
+                position["result"] = "TAKE_PROFIT"
+                position["won"] = pnl > 0
+                position["pnl"] = pnl
+                position["proceeds"] = proceeds
+                position["sold_at"] = trade_record["timestamp"]
+                position["sell_price"] = sell_price
+
+                try:
+                    stats = self.positions["stats"]
+                    stats["total_pnl"] = stats.get("total_pnl", 0.0) + pnl
+                    stats["balance"] = (
+                        stats.get("balance", ALGO_STARTING_BALANCE) + proceeds
+                    )
+                    if pnl > 0:
+                        stats["wins"] = stats.get("wins", 0) + 1
+                    else:
+                        stats["losses"] = stats.get("losses", 0) + 1
+                    open_staked = sum(
+                        p.get("amount", 0)
+                        for p in self.positions.get("open", [])
+                        if p is not position
+                    )
+                    stats.setdefault("balance_history", []).append({
+                        "timestamp": trade_record["timestamp"],
+                        "balance": stats["balance"],
+                        "pnl": stats["total_pnl"],
+                        "equity": stats["balance"] + open_staked,
+                        "event": "momentum_take_profit",
+                        "detail": (
+                            f"TP {outcome} {title[:30]} +${pnl:.2f} "
+                            f"@ {sell_price*100:.1f}¢ (entry {entry_price*100:.1f}¢)"
+                        ),
+                    })
+                except Exception:
+                    pass
+
+                if position in self.positions.get("open", []):
+                    self.positions["open"].remove(position)
+                self.positions.setdefault("resolved", []).append(position)
+                save_positions(self.positions)
+                trade_record["pnl"] = pnl
+                _log_trade("resolved", {
+                    "id": position.get("id", ""),
+                    "coin": coin,
+                    "interval": position.get("interval", ""),
+                    "outcome": outcome,
+                    "entry_price": entry_price,
+                    "amount": amount_spent,
+                    "result": "TAKE_PROFIT",
+                    "pnl": pnl,
+                    "won": pnl > 0,
+                    "slug": position.get("slug", ""),
+                    "market": position.get("market", ""),
+                    "condition_id": condition_id,
+                    "entered_at": position.get("timestamp", ""),
+                    "sell_price": sell_price,
+                    "trigger_price": live_price,
+                })
+                print(
+                    f"       Position closed via take-profit. "
+                    f"PnL: ${pnl:+.2f} | Proceeds: ${proceeds:.2f}",
+                    flush=True,
+                )
+                sold += 1
+
+            if self.on_trade:
+                try:
+                    self.on_trade(trade_record)
+                except Exception as e:
+                    print(f"[MOMENTUM] Take profit callback error: {e}", flush=True)
+
+        if sold > 0:
+            print(f"[MOMENTUM] {sold} position(s) closed via take-profit",
+                  flush=True)
+
+        return sold
 
     def check_stop_losses(self) -> int:
         """Auto-sell momentum positions that dropped STOP_LOSS_PCT% from peak.
