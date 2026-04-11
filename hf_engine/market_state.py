@@ -124,6 +124,11 @@ class MarketState:
     # Paper position (at most one open at a time per market)
     open_position: Optional[PaperPosition] = None
     closed_positions: List[PaperPosition] = field(default_factory=list)
+    # Timestamp (epoch seconds) when the last position on this market
+    # was closed. Used to enforce ``reentry_cooldown_sec`` so the
+    # engine cannot flap cascade -> enter -> contrary-flow -> exit ->
+    # enter every few seconds on the same market.
+    last_close_time: Optional[float] = None
 
     # Baseline-rate observation window
     first_trade_time: Optional[float] = None
@@ -166,7 +171,29 @@ class MarketState:
 
     @property
     def branching_ratio_max(self) -> float:
+        """Static model parameter max(alpha_buy/beta_buy, alpha_sell/beta_sell).
+
+        Kept for compatibility with the snapshot / calibration code.
+        Cascade detection no longer uses this value — see
+        ``excitation_ratio_max`` for the live cascade signal.
+        """
         return max(self.hawkes_buy.branching_ratio, self.hawkes_sell.branching_ratio)
+
+    @property
+    def excitation_ratio_max(self) -> float:
+        """Live cascade signal across both sides.
+
+        This is ``max(intensity_buy / mu_buy, intensity_sell / mu_sell)``.
+        Unlike the branching ratio (which is a static parameter of the
+        model), this responds to trade clustering in real time — each
+        trade bumps the corresponding side's intensity by ``alpha`` and
+        the bump decays exponentially between events. When a burst of
+        informed trades hits the book the ratio climbs well above its
+        steady-state value, which is the signature of a cascade.
+        """
+        return max(
+            self.hawkes_buy.excitation_ratio, self.hawkes_sell.excitation_ratio
+        )
 
     @property
     def time_remaining_sec(self) -> float:
@@ -174,7 +201,29 @@ class MarketState:
 
     @property
     def total_duration_sec(self) -> float:
+        """The span between when we first saw the market and its
+        resolution time. Used for sqrt-time position sizing."""
         return max(1.0, self.resolves_at - self.created_at)
+
+    @property
+    def declared_duration_sec(self) -> float:
+        """The nominal trading-window length of the market, parsed
+        from ``interval_label`` (e.g. ``5m`` -> 300s). Unlike
+        ``total_duration_sec`` this is independent of when we first
+        discovered the market and is the correct value to compare
+        against ``time_remaining_sec`` when deciding whether the
+        trading window has opened yet."""
+        label = (self.interval_label or "").strip().lower()
+        if not label:
+            return 300.0
+        try:
+            if label.endswith("m"):
+                return float(int(label[:-1])) * 60.0
+            if label.endswith("h"):
+                return float(int(label[:-1])) * 3600.0
+        except ValueError:
+            return 300.0
+        return 300.0
 
     def clob_mid_yes(self) -> Optional[float]:
         if self.best_bid_yes is not None and self.best_ask_yes is not None:
@@ -288,15 +337,30 @@ class MarketState:
         total = lam_buy + lam_sell
         self.flow_imbalance = (lam_buy / total - 0.5) if total > 0 else 0.0
 
-        # 3. Branching ratio / cascade flag.
-        n_max = self.branching_ratio_max
-        self.cascade_active = n_max > self.cfg.cascade_threshold
+        # 3. Cascade detection.
+        #
+        # Use the live excitation ratio (intensity / mu) rather than
+        # the static branching ratio (alpha / beta). The branching
+        # ratio is a parameter of the model, fixed by the priors, and
+        # therefore never changes during a market's life — it cannot
+        # serve as a "cascade is happening right now" signal. The
+        # excitation ratio responds directly to trade clustering: each
+        # trade bumps the corresponding side's intensity by alpha, the
+        # bump decays exponentially between events, and the ratio
+        # climbs well above its steady-state value during a burst.
+        exc_max = self.excitation_ratio_max
+        self.cascade_active = exc_max > self.cfg.cascade_threshold
 
         # 4. Hawkes-adaptive pi (Section 4.5 Method 3).
-        if self.cascade_active and self.cfg.cascade_threshold < 1.0:
-            boost = self.cfg.pi_hawkes_boost * max(0.0, n_max - self.cfg.cascade_threshold) / (
-                1.0 - self.cfg.cascade_threshold
-            )
+        #
+        # When a cascade is active, scale the informed-fraction upwards
+        # by how far the excitation ratio exceeds the cascade threshold.
+        # At the threshold the boost is 0; at 2x the threshold the boost
+        # reaches its configured maximum.
+        if self.cascade_active and self.cfg.cascade_threshold > 0.0:
+            excess = exc_max - self.cfg.cascade_threshold
+            boost_frac = min(1.0, max(0.0, excess / self.cfg.cascade_threshold))
+            boost = self.cfg.pi_hawkes_boost * boost_frac
             self.pi_effective = min(self.cfg.pi_base + boost, self.cfg.pi_cap)
         else:
             self.pi_effective = self.cfg.pi_base
@@ -329,6 +393,52 @@ class MarketState:
 
         if self.open_position is not None:
             return Signal(action="none", reason="position-already-open")
+
+        # Re-entry cooldown: after closing a position on this market
+        # we impose a quiet period before a new entry is allowed,
+        # otherwise the cascade/contrary-flow alternation can open and
+        # close several positions per second on the same market.
+        if self.last_close_time is not None:
+            elapsed = time.time() - self.last_close_time
+            if elapsed < self.cfg.reentry_cooldown_sec:
+                return Signal(
+                    action="none",
+                    reason=f"reentry-cooldown({elapsed:.0f}s)",
+                )
+
+        # Gate 0a: the trading window must have opened.
+        #
+        # Polymarket often creates short-duration markets several
+        # minutes before the start of their trading window. During
+        # that lead-in period the book is typically thin / phantom
+        # and any ask on the Yes side can be far off its steady-state
+        # value, so an entry against that book is taking on a weird
+        # unmodeled risk. Refuse to enter until the market has
+        # actually started: time_remaining_sec must be <= the
+        # **declared** interval duration (5m → 300s) rather than the
+        # ``total_duration_sec`` which is measured from when we first
+        # ingested the market.
+        declared = self.declared_duration_sec
+        if self.time_remaining_sec > declared + 5.0:
+            return Signal(action="none", reason="pre-active")
+
+        # Gate 0b: the best Yes-ask must be within a sane interval.
+        #
+        # The earlier "BUY_NO @ 0.01¢ on a pre-active 15m market"
+        # incident came from a phantom/empty book where best_ask_yes
+        # was effectively 0.99 (so entry_no = 0.01). Even a more
+        # modest 0.05 / 0.95 can produce 20x-to-1 mark-to-market
+        # swings against thin book depth, so we clamp the acceptable
+        # ask range to [0.10, 0.90] — any ask outside that window
+        # reflects a market that is either not really interesting
+        # from an information standpoint or has unreliable depth on
+        # one side.
+        ask_yes = self.best_ask_yes
+        if ask_yes is not None and (ask_yes < 0.10 or ask_yes > 0.90):
+            return Signal(
+                action="none",
+                reason=f"extreme-ask({ask_yes:.3f})",
+            )
 
         # Gate 1: cascade active
         if not self.cascade_active:
@@ -373,7 +483,7 @@ class MarketState:
         # Confidence is the scaled absolute imbalance, bounded to [0,1].
         confidence = min(1.0, abs(self.flow_imbalance) * 2.0)
         reason = (
-            f"cascade n={self.branching_ratio_max:.2f} "
+            f"cascade exc={self.excitation_ratio_max:.2f} "
             f"imbalance={self.flow_imbalance:+.3f} "
             f"posterior={self.posterior:.3f} "
             f"clob={clob_price:.3f} "

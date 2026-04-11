@@ -74,11 +74,17 @@ class HFEConfig:
     hawkes_mu_fallback: float = 0.2
 
     # Duration of the early-observation window used to estimate mu fresh
-    # for each market before signal gating is enabled.
-    mu_observation_window_sec: float = 15.0
+    # for each market before signal gating is enabled. 5m markets are
+    # only 300s long, so 15s is 5% of the whole market life; 5s keeps
+    # gates active for 98% of the market.
+    mu_observation_window_sec: float = 5.0
 
-    # Cascade threshold on the branching ratio n = alpha / beta.
-    cascade_threshold: float = 0.5
+    # Cascade threshold on the **live excitation ratio** intensity/mu
+    # (not the static branching ratio alpha/beta — that is a model
+    # parameter, not an observable). Steady-state intensity on a
+    # subcritical Hawkes process with n=0.5 sits around 2.0 * mu, so
+    # ``cascade_threshold=2.0`` flags any above-steady-state burst.
+    cascade_threshold: float = 2.0
 
     # Hard cap on the per-side intensity to keep the recursion stable if
     # a pathological burst of trades arrives.
@@ -101,7 +107,11 @@ class HFEConfig:
     min_flow_imbalance: float = 0.15
     min_edge: float = 0.05                 # dollars (posterior vs CLOB)
     min_time_remaining_sec: float = 30.0
-    min_book_depth: float = 50.0           # contracts
+    # Top-of-book depth in contracts. Polymarket 5m updown markets often
+    # have thin books — the old default of 50 was rejecting essentially
+    # every candidate. 10 is a safer floor while still guarding against
+    # single-lot markets where slippage would dominate.
+    min_book_depth: float = 10.0
 
     # ------------------------------------------------------------------
     # 10.4 — Position sizing
@@ -116,6 +126,31 @@ class HFEConfig:
     edge_collapse_threshold: float = 0.10
     contrary_flow_threshold: float = 0.20
     exit_time_buffer_sec: float = 15.0
+
+    # Enable the early-exit signal path (``edge-collapse``,
+    # ``contrary-flow``, ``time-buffer-losing``). Off by default in
+    # paper-trading v1: for paper positions the only honest P/L
+    # comes from settlement against the real market outcome, because
+    # there is no counterparty willing to buy the position off us
+    # at the current CLOB mid. Closing early against the mid simulates
+    # a trade that did not happen and can make **both sides** of the
+    # same market look like winners in the stats export — a tell-tale
+    # sign that the exit-time P/L is fictitious. With this flag off,
+    # every open position is held until ``settle_at_resolution``
+    # fires, producing exactly one realized P/L entry per market.
+    # Turn back on via ``HFE_EARLY_EXIT_ENABLED=true`` once there is
+    # a real execution layer that can close positions against a
+    # real counterparty.
+    early_exit_enabled: bool = False
+
+    # Minimum time between closing a position and being allowed to
+    # open a new one on the same market. Without this the engine
+    # cycles through cascade -> enter -> contrary-flow -> exit ->
+    # cascade -> enter on the same market every few seconds, which
+    # inflates trade counts and (in a real market) would burn the
+    # entire risk budget on friction alone. 30 seconds is a
+    # conservative starting point; tune via HFE_REENTRY_COOLDOWN_SEC.
+    reentry_cooldown_sec: float = 30.0
 
     # ------------------------------------------------------------------
     # Scanner / market selection (Section 9)
@@ -214,6 +249,12 @@ class HFEConfig:
         )
         cfg.exit_time_buffer_sec = _getenv_float(
             "HFE_EXIT_TIME_BUFFER_SEC", cfg.exit_time_buffer_sec
+        )
+        cfg.early_exit_enabled = _getenv_bool(
+            "HFE_EARLY_EXIT_ENABLED", cfg.early_exit_enabled
+        )
+        cfg.reentry_cooldown_sec = _getenv_float(
+            "HFE_REENTRY_COOLDOWN_SEC", cfg.reentry_cooldown_sec
         )
 
         # Scanner

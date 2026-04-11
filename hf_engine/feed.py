@@ -106,6 +106,18 @@ class HFETradeFeed:
         # feed dead. Without this the main loop would keep tearing the
         # feed down on every tick while waiting for the first message.
         self._started_at: Optional[float] = None
+        # Per-market flags used to fire a one-shot "first trade" / "first
+        # book" log so we can see on Railway when real data starts flowing
+        # for each discovered market.
+        self._first_trade_logged: Set[str] = set()
+        self._first_book_logged: Set[str] = set()
+        # Counter for events whose asset_id wasn't in the registry.
+        # These are silently dropped by ``_handle_book`` / ``_handle_trade``
+        # but if the count is non-zero something is subscribing with
+        # the wrong token id — we log a sample periodically so the
+        # problem is visible rather than invisible.
+        self.unknown_asset_events: int = 0
+        self._unknown_asset_samples: Set[str] = set()
 
     # ------------------------------------------------------------------ #
     # Public API
@@ -136,8 +148,22 @@ class HFETradeFeed:
         market_id: str,
         yes_token_id: str,
         no_token_id: str,
+        flush: bool = False,
     ) -> None:
-        """Register both outcome tokens and subscribe to them."""
+        """Register both outcome tokens in the local registry.
+
+        Does **not** send a subscribe message on its own (unless
+        ``flush=True``). Polymarket's CLOB WS has trouble handling a
+        rapid burst of tiny subscribe messages — only one of them
+        tends to take effect server-side — which produced the bug
+        where 7 of 8 registered markets received no book or trade
+        events while the 8th worked fine.
+
+        Callers should register all markets they discovered in a
+        single scan cycle and then call :meth:`flush_subscriptions`
+        exactly once at the end of the batch. The engine's scan loop
+        does this automatically.
+        """
         with self._lock:
             self._registry[yes_token_id] = TokenRegistration(
                 market_id=market_id, token_id=yes_token_id, is_yes=True
@@ -145,7 +171,62 @@ class HFETradeFeed:
             self._registry[no_token_id] = TokenRegistration(
                 market_id=market_id, token_id=no_token_id, is_yes=False
             )
-        self._subscribe([yes_token_id, no_token_id])
+        if flush:
+            self.flush_subscriptions()
+
+    def flush_subscriptions(self) -> None:
+        """Re-send a subscribe covering every currently-registered token.
+
+        This mirrors ``momentum_engine``'s subscribe-all-at-once
+        pattern: build the full list of tokens of interest and send
+        it in a single subscribe message (chunked internally at 20
+        per chunk). Sending one big subscribe is reliable; sending
+        many tiny ones is not.
+        """
+        with self._lock:
+            all_tokens = list(self._registry.keys())
+        if not all_tokens:
+            return
+        if self.connected and self.ws is not None:
+            # Reset the ``_subscribed`` cache so ``_send_subscribe``
+            # actually retransmits every token — otherwise the
+            # "already subscribed" filter inside it would make the
+            # re-sync a no-op.
+            with self._lock:
+                self._subscribed.clear()
+            self._send_subscribe(all_tokens)
+            print(
+                f"{self.log_prefix} flush_subscriptions sent {len(all_tokens)} tokens",
+                flush=True,
+            )
+        else:
+            with self._lock:
+                # Merge into the pending queue without duplicates.
+                merged = list(dict.fromkeys(self._pending + all_tokens))
+                self._pending = merged
+
+    def _note_unknown_asset(self, asset_id: str, kind: str) -> None:
+        """Rate-limited log of events received for asset ids we didn't
+        register. Seeing a high count here means the subscription token
+        ids do not match what Polymarket's WebSocket is pushing — the
+        classic Gamma-vs-CLOB token-id mismatch.
+        """
+        self.unknown_asset_events += 1
+        if len(self._unknown_asset_samples) < 3:
+            if asset_id not in self._unknown_asset_samples:
+                self._unknown_asset_samples.add(asset_id)
+                print(
+                    f"{self.log_prefix} UNKNOWN asset_id ({kind}) {asset_id[:24]}... "
+                    f"— subscribed tokens do not match WS asset_ids "
+                    f"(count={self.unknown_asset_events})",
+                    flush=True,
+                )
+        elif self.unknown_asset_events % 500 == 0:
+            print(
+                f"{self.log_prefix} UNKNOWN asset_id count now "
+                f"{self.unknown_asset_events}",
+                flush=True,
+            )
 
     def unregister_market(self, market_id: str) -> None:
         """Drop a market from the registry. We cannot unsubscribe on
@@ -315,6 +396,7 @@ class HFETradeFeed:
         with self._lock:
             reg = self._registry.get(asset_id)
         if reg is None:
+            self._note_unknown_asset(asset_id, kind="trade")
             return
 
         try:
@@ -358,6 +440,13 @@ class HFETradeFeed:
             size=size,
         )
         self.trades_received += 1
+        if reg.market_id not in self._first_trade_logged:
+            self._first_trade_logged.add(reg.market_id)
+            print(
+                f"{self.log_prefix} first trade on {reg.market_id[:16]}: "
+                f"{normalized_side} {size:.0f} @ {normalized_price:.3f}",
+                flush=True,
+            )
         try:
             self.on_trade(reg.market_id, trade)
         except Exception as e:
@@ -370,6 +459,7 @@ class HFETradeFeed:
         with self._lock:
             reg = self._registry.get(asset_id)
         if reg is None:
+            self._note_unknown_asset(asset_id, kind="book")
             return
 
         bids = data.get("bids", []) or []
@@ -400,6 +490,15 @@ class HFETradeFeed:
             last_update_ms=int(time.time() * 1000),
         )
         self.book_updates += 1
+        if reg.market_id not in self._first_book_logged:
+            self._first_book_logged.add(reg.market_id)
+            bid_s = f"{best_bid:.3f}" if best_bid is not None else "?"
+            ask_s = f"{best_ask:.3f}" if best_ask is not None else "?"
+            print(
+                f"{self.log_prefix} first book on {reg.market_id[:16]}: "
+                f"bid={bid_s} ask={ask_s} depth={depth:.0f}",
+                flush=True,
+            )
         try:
             self.on_book(reg.market_id, update)
         except Exception as e:
@@ -419,6 +518,7 @@ class HFETradeFeed:
             with self._lock:
                 reg = self._registry.get(asset_id)
             if reg is None:
+                self._note_unknown_asset(asset_id, kind="price_change")
                 continue
 
             best_bid = None
@@ -458,5 +558,6 @@ class HFETradeFeed:
             "messages_received": self.messages_received,
             "trades_received": self.trades_received,
             "book_updates": self.book_updates,
+            "unknown_asset_events": self.unknown_asset_events,
             "last_message": self.last_message_time,
         }

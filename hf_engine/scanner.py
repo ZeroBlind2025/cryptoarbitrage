@@ -29,7 +29,18 @@ import requests
 from .config import HFEConfig
 
 
-INTERVAL_REGEX = re.compile(r"updown-(\d+)\s*([mh])\b", re.IGNORECASE)
+# Polymarket short-duration markets have used several slug shapes:
+#   bitcoin-updown-5m-1772397000
+#   ethereum-up-or-down-5m-1772397000
+#   sol-higher-or-lower-15m-1772397000
+# The regex accepts any of those and extracts the interval (e.g. "5m").
+INTERVAL_REGEX = re.compile(
+    r"(?:updown|up-or-down|higher-or-lower|above-or-below)-(\d+)\s*([mh])\b",
+    re.IGNORECASE,
+)
+# Cheap membership test used to short-circuit slugs that obviously
+# aren't short-duration up/down markets.
+KNOWN_SLUG_FRAGMENTS = ("updown", "up-or-down", "higher-or-lower", "above-or-below")
 
 
 @dataclass
@@ -56,6 +67,11 @@ class MarketScanner:
         self._seen: Dict[str, float] = {}   # market_id -> first-seen epoch
         self._fetch_errors = 0
         self._last_scan = 0.0
+        # Scan count so we can log a summary every N scans.
+        self._scan_count = 0
+        # Running totals of why raw markets were rejected; handy for
+        # diagnosing an empty scanner on Railway.
+        self._reject_reasons: Dict[str, int] = {}
 
     # ------------------------------------------------------------------ #
     # Public API
@@ -70,15 +86,39 @@ class MarketScanner:
         """
         now = time.time()
         self._last_scan = now
+        self._scan_count += 1
 
         raw_markets = self._fetch_candidate_markets()
+        raw_count = len(raw_markets)
+        kept_count = 0
+        new_count = 0
+        fixed_token_ids = 0
         out: List[MarketMeta] = []
         for raw in raw_markets:
             meta = self._normalize(raw, now)
             if meta is None:
                 continue
+            kept_count += 1
             if meta.market_id in self._seen:
                 continue
+
+            # CRITICAL: Polymarket's Gamma ``clobTokenIds`` sometimes
+            # differ in format from the canonical CLOB order-book token
+            # IDs that the WebSocket keys events on. If we subscribe
+            # with the Gamma IDs the feed silently drops every trade
+            # and every book update. Re-query the CLOB API to get the
+            # exact IDs the WS uses.
+            canonical = self._fetch_canonical_token_ids(meta.market_id)
+            if canonical and len(canonical) == 2:
+                gamma_ids = (meta.yes_token_id, meta.no_token_id)
+                if canonical != list(gamma_ids) and canonical != [gamma_ids[1], gamma_ids[0]]:
+                    fixed_token_ids += 1
+                    # The CLOB endpoint returns tokens in the same
+                    # order as ``outcomes`` (usually Up/Yes first).
+                    meta.yes_token_id = canonical[0]
+                    meta.no_token_id = canonical[1]
+
+            new_count += 1
             self._seen[meta.market_id] = now
             out.append(meta)
 
@@ -89,7 +129,25 @@ class MarketScanner:
             if self._seen[k] < cutoff:
                 del self._seen[k]
 
+        if self._scan_count == 1 or self._scan_count % 6 == 0 or new_count > 0:
+            top_rejects = sorted(
+                self._reject_reasons.items(), key=lambda kv: -kv[1]
+            )[:3]
+            reject_str = ", ".join(f"{k}={v}" for k, v in top_rejects) or "-"
+            print(
+                f"{self.cfg.log_prefix} scan#{self._scan_count} "
+                f"raw={raw_count} kept={kept_count} new={new_count} "
+                f"token-id-fixed={fixed_token_ids} "
+                f"total_seen={len(self._seen)} "
+                f"top_rejects={reject_str} "
+                f"errors={self._fetch_errors}",
+                flush=True,
+            )
+
         return out
+
+    def _reject(self, reason: str) -> None:
+        self._reject_reasons[reason] = self._reject_reasons.get(reason, 0) + 1
 
     def mark_processed(self, market_id: str) -> None:
         self._seen[market_id] = time.time()
@@ -98,36 +156,198 @@ class MarketScanner:
     # Fetch
     # ------------------------------------------------------------------ #
 
+    # Coin-name mapping used to compute canonical Polymarket slugs for
+    # the time-bucketed event lookups. This mirrors the table used by
+    # ``momentum_engine.discover_active_markets`` so we inherit the same
+    # discovery reliability, without importing from that module.
+    _COIN_SLUG_NAMES = {
+        "btc": "bitcoin",
+        "eth": "ethereum",
+        "sol": "solana",
+        "xrp": "xrp",
+    }
+    # (label, window-seconds)
+    _INTERVALS = (("5m", 300), ("15m", 900))
+    # ``slug_contains`` fallback queries when the direct event-slug
+    # lookups miss (Polymarket occasionally ships off-grid slugs for
+    # edge-of-interval markets).
+    _SLUG_CONTAINS_TERMS = (
+        "updown-5m",
+        "updown-15m",
+        "btc-updown",
+        "eth-updown",
+        "sol-updown",
+        "xrp-updown",
+        "bitcoin-updown",
+        "ethereum-updown",
+        "solana-updown",
+    )
+
     def _fetch_candidate_markets(self) -> List[dict]:
-        """Hit the Gamma markets endpoint for active crypto updown markets.
+        """Multi-strategy parallel fetch for crypto short-duration markets.
 
-        We use a broad ``slug_contains=updown`` query so we pick up every
-        interval variant in a single call. The response is paginated
-        via ``offset`` but in practice the active set is small enough
-        that a single page is sufficient.
+        Polymarket's ``/markets?slug_contains=updown`` alone is unreliable
+        because:
+        - the API sometimes returns partial pages for broad slug queries,
+        - and the canonical way to find each coin's current 5m / 15m
+          market is to hit ``/events?slug={coin}-updown-{interval}-{ts}``
+          with the time-bucketed unix timestamp.
+
+        We therefore fire a batch of direct event-slug lookups **plus**
+        a handful of ``slug_contains`` fallback queries in parallel, via
+        a ``ThreadPoolExecutor``, and merge all results dedupe'd by
+        ``conditionId``. Per-scan wall time is typically ~1.5 seconds on
+        the Railway network.
+
+        Every fetch failure is counted; a periodic summary log prints
+        the top rejection reasons so a Gamma-side change cannot silently
+        kill discovery.
         """
-        url = f"{self.cfg.gamma_api_base}/markets"
-        params = {
-            "active": "true",
-            "closed": "false",
-            "slug_contains": "updown",
-            "limit": 200,
-        }
-        try:
-            resp = self._session.get(url, params=params, timeout=6)
-            resp.raise_for_status()
-            data = resp.json()
-        except Exception as e:
-            self._fetch_errors += 1
-            if self._fetch_errors % 10 == 1:
-                print(f"{self.cfg.log_prefix} scanner fetch error: {e}", flush=True)
-            return []
+        from concurrent.futures import ThreadPoolExecutor, as_completed
 
-        if isinstance(data, dict):
-            data = data.get("data", data.get("markets", []))
-        if not isinstance(data, list):
-            return []
-        return data
+        now_ts = int(time.time())
+        event_slugs: List[str] = []
+        for coin_abbr, coin_full in self._COIN_SLUG_NAMES.items():
+            for tag, window_secs in self._INTERVALS:
+                base_ts = (now_ts // window_secs) * window_secs
+                for offset in (window_secs, 0, -window_secs, -2 * window_secs):
+                    ts = base_ts + offset
+                    event_slugs.append(f"{coin_abbr}-updown-{tag}-{ts}")
+                    if coin_full != coin_abbr:
+                        event_slugs.append(f"{coin_full}-updown-{tag}-{ts}")
+
+        merged_by_id: Dict[str, dict] = {}
+        errors_this_scan = 0
+
+        gamma_base = self.cfg.gamma_api_base
+
+        def _fetch_event_slug(slug: str):
+            """Return a list of market dicts (possibly empty) for an
+            event slug, or None on error."""
+            try:
+                r = self._session.get(
+                    f"{gamma_base}/events",
+                    params={"slug": slug},
+                    timeout=6,
+                )
+                if r.status_code != 200:
+                    return []
+                data = r.json()
+            except Exception:
+                return None
+
+            events = data if isinstance(data, list) else ([data] if isinstance(data, dict) else [])
+            markets: List[dict] = []
+            for event in events:
+                if not isinstance(event, dict):
+                    continue
+                nested = event.get("markets") or []
+                for m in nested:
+                    if isinstance(m, dict):
+                        markets.append(m)
+                # Some events put the market fields at the top level.
+                if "conditionId" in event or "clobTokenIds" in event:
+                    markets.append(event)
+            return markets
+
+        def _fetch_contains(term: str):
+            try:
+                r = self._session.get(
+                    f"{gamma_base}/markets",
+                    params={
+                        "slug_contains": term,
+                        "active": "true",
+                        "closed": "false",
+                        "limit": 100,
+                    },
+                    timeout=6,
+                )
+                if r.status_code != 200:
+                    return []
+                data = r.json()
+            except Exception:
+                return None
+            if isinstance(data, dict):
+                data = data.get("data", data.get("markets", []))
+            return data if isinstance(data, list) else []
+
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            futures = []
+            for slug in event_slugs:
+                futures.append(pool.submit(_fetch_event_slug, slug))
+            for term in self._SLUG_CONTAINS_TERMS:
+                futures.append(pool.submit(_fetch_contains, term))
+
+            for fut in as_completed(futures):
+                try:
+                    result = fut.result()
+                except Exception:
+                    errors_this_scan += 1
+                    continue
+                if result is None:
+                    errors_this_scan += 1
+                    continue
+                for m in result:
+                    if not isinstance(m, dict):
+                        continue
+                    mid = m.get("conditionId") or m.get("id") or m.get("slug")
+                    if not mid or mid in merged_by_id:
+                        continue
+                    merged_by_id[mid] = m
+
+        if errors_this_scan:
+            self._fetch_errors += errors_this_scan
+
+        return list(merged_by_id.values())
+
+    # ------------------------------------------------------------------ #
+    # Canonical CLOB token IDs
+    # ------------------------------------------------------------------ #
+
+    def _fetch_canonical_token_ids(self, condition_id: str) -> Optional[List[str]]:
+        """Re-fetch the canonical CLOB token IDs for a market.
+
+        The Gamma API's ``clobTokenIds`` field sometimes has a different
+        string format than the token IDs the CLOB WebSocket keys events
+        on. Subscribing with the Gamma IDs then silently drops every
+        incoming trade / book update because ``_handle_book`` can't find
+        the asset id in ``self._registry``.
+
+        This helper hits ``GET /markets/{condition_id}`` on the CLOB
+        REST API which returns the canonical pair. Mirrors
+        ``momentum_engine._fetch_clob_token_ids`` so the HF engine
+        inherits the same fix without importing from that module.
+
+        Returns ``[token_id_0, token_id_1]`` on success, ``None`` on
+        any error. A soft 3-second timeout keeps a slow CLOB API from
+        stalling the scanner.
+        """
+        if not condition_id:
+            return None
+        try:
+            resp = self._session.get(
+                f"{self.cfg.clob_api_base}/markets/{condition_id}",
+                timeout=3,
+            )
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+        except Exception:
+            return None
+
+        tokens = data.get("tokens") if isinstance(data, dict) else None
+        if not isinstance(tokens, list) or len(tokens) < 2:
+            return None
+
+        out = []
+        for t in tokens[:2]:
+            if not isinstance(t, dict):
+                return None
+            tid = t.get("token_id")
+            if not tid:
+                return None
+            out.append(str(tid))
+        return out
 
     # ------------------------------------------------------------------ #
     # Normalization
@@ -135,11 +355,16 @@ class MarketScanner:
 
     def _normalize(self, raw: dict, now: float) -> Optional[MarketMeta]:
         slug = (raw.get("slug") or "").lower()
-        if not slug or "updown" not in slug:
+        if not slug:
+            self._reject("no-slug")
+            return None
+        if not any(frag in slug for frag in KNOWN_SLUG_FRAGMENTS):
+            self._reject("not-updown-family")
             return None
 
         interval_match = INTERVAL_REGEX.search(slug)
         if not interval_match:
+            self._reject("no-interval-regex")
             return None
 
         interval_n = int(interval_match.group(1))
@@ -153,18 +378,22 @@ class MarketScanner:
 
         duration_min = duration_sec / 60.0
         if duration_min < self.cfg.min_market_duration_min:
+            self._reject(f"duration<{self.cfg.min_market_duration_min:.0f}m")
             return None
         if duration_min > self.cfg.max_market_duration_min:
+            self._reject(f"duration>{self.cfg.max_market_duration_min:.0f}m")
             return None
 
         # Optional coin filter.
         if self.cfg.tracked_coin_slugs:
             if not any(coin in slug for coin in self.cfg.tracked_coin_slugs):
+                self._reject("coin-filter")
                 return None
 
         # End date
         end_raw = raw.get("endDate") or raw.get("end_date_iso") or raw.get("end_date")
         if not end_raw:
+            self._reject("no-end-date")
             return None
         try:
             end_dt = datetime.fromisoformat(str(end_raw).replace("Z", "+00:00"))
@@ -172,16 +401,18 @@ class MarketScanner:
                 end_dt = end_dt.replace(tzinfo=timezone.utc)
             resolves_at = end_dt.timestamp()
         except Exception:
+            self._reject("bad-end-date")
             return None
 
         if resolves_at <= now + self.cfg.min_time_remaining_sec:
-            # Already too late to enter anything useful here.
+            self._reject("too-late")
             return None
 
         # Token IDs
         clob_token_ids_raw = raw.get("clobTokenIds")
         token_ids = _parse_token_ids(clob_token_ids_raw)
         if len(token_ids) != 2:
+            self._reject("missing-token-ids")
             return None
         outcomes = raw.get("outcomes")
         outcomes = _parse_outcomes(outcomes)
@@ -228,49 +459,70 @@ class MarketScanner:
     def lookup_resolution(self, market_id: str) -> Optional[int]:
         """Check whether a market has resolved and return the outcome.
 
-        Returns ``1`` for Yes, ``0`` for No, or ``None`` if it has not
-        resolved yet. We poll the Gamma ``/markets/{id}`` endpoint which
-        populates an ``umaResolutionStatus`` / ``closed`` field once the
-        question has settled.
+        Returns ``1`` if the Up/Yes side won, ``0`` if the Down/No side
+        won, or ``None`` if it has not resolved yet.
+
+        Uses the CLOB ``/markets/{condition_id}`` endpoint, which is
+        Polymarket's definitive resolution source — every resolved
+        market has ``closed: true`` plus a per-token ``winner`` boolean.
+        This is the same endpoint ``copy_trader._check_clob_resolution``
+        uses, so the HF engine inherits the same reliability without
+        importing from that module.
+
+        The previous implementation hit
+        ``GET {gamma}/markets?id={condition_id}`` — Gamma ignores the
+        ``id`` query parameter, so the request returned an unfiltered
+        page of markets and the resolution check silently failed for
+        every market. That's what made every position close via
+        ``unresolved-timeout`` (mark-to-market) instead of
+        ``settle_at_resolution``, which is why the dashboard's
+        BALANCE / SESSION P/L / WIN RATE headline stats all sat at
+        zero even though the paper executor was clearly firing.
         """
-        url = f"{self.cfg.gamma_api_base}/markets"
-        params = {"id": market_id}
+        if not market_id:
+            return None
         try:
-            resp = self._session.get(url, params=params, timeout=4)
-            resp.raise_for_status()
+            resp = self._session.get(
+                f"{self.cfg.clob_api_base}/markets/{market_id}",
+                timeout=4,
+            )
+            if resp.status_code != 200:
+                return None
             data = resp.json()
         except Exception:
             return None
 
-        if isinstance(data, dict):
-            data = data.get("data", [data])
-        if not isinstance(data, list) or not data:
-            return None
-        raw = data[0]
-        if not isinstance(raw, dict):
+        if not isinstance(data, dict):
             return None
 
-        if not (raw.get("closed") or raw.get("resolved") or raw.get("archived")):
+        # Must be closed before we can claim resolution.
+        if not data.get("closed"):
             return None
 
-        # Resolved — use the outcomePrices field which becomes [1,0] or
-        # [0,1] after resolution on Polymarket.
-        prices_raw = raw.get("outcomePrices") or raw.get("outcome_prices")
-        try:
-            if isinstance(prices_raw, str):
-                import json as _json
+        tokens = data.get("tokens") or []
+        if not isinstance(tokens, list):
+            return None
 
-                prices = _json.loads(prices_raw)
-            else:
-                prices = prices_raw or []
-            prices = [float(p) for p in prices]
-        except Exception:
-            prices = []
-        if len(prices) == 2:
-            if prices[0] > 0.5:
+        for t in tokens:
+            if not isinstance(t, dict):
+                continue
+            if t.get("winner") is not True:
+                continue
+            outcome = str(t.get("outcome") or "").strip().lower()
+            if outcome in ("up", "yes", "higher", "above", "true"):
                 return 1
-            if prices[1] > 0.5:
+            if outcome in ("down", "no", "lower", "below", "false"):
                 return 0
+            # Unknown label but marked as winner — fall back to
+            # positional matching against ``tokens[0]`` which is
+            # conventionally the Up/Yes side.
+            if tokens and tokens[0] is t:
+                return 1
+            return 0
+
+        # ``closed: true`` with no ``winner: true`` — edge case where
+        # Polymarket marked the market closed but hasn't finalised the
+        # winner. Treat as unresolved so the engine keeps waiting.
         return None
 
 

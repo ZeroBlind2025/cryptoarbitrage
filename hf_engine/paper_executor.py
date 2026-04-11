@@ -22,11 +22,15 @@ import json
 import os
 import threading
 import time
+from collections import deque
 from dataclasses import asdict
-from typing import Dict, List, Optional
+from typing import Deque, Dict, List, Optional
 
 from .config import HFEConfig
 from .market_state import MarketState, PaperPosition, position_dollars
+
+
+SIGNAL_BUFFER_SIZE = 400
 
 
 class PaperExecutor:
@@ -36,14 +40,46 @@ class PaperExecutor:
         self.cfg = cfg
         self._lock = threading.Lock()
         self._open_exposure_dollars = 0.0
+        # Separate accounting for the two ways a position can close:
+        #   - ``settle_at_resolution`` -> realized_* (the only honest
+        #     P/L in paper mode, computed against the true outcome)
+        #   - ``close_position`` -> mark_* (pre-resolution mark-to-
+        #     market against the current CLOB mid; fictional unless
+        #     there's a real counterparty, which there isn't in v1)
+        # The dashboard shows both but labels MARK closes distinctly.
         self._realized_pnl = 0.0
+        self._mark_pnl = 0.0
         self._trade_count = 0
         self._wins = 0
         self._losses = 0
+        self._resolved_wins = 0
+        self._resolved_losses = 0
+        self._resolved_count = 0
 
         os.makedirs(cfg.log_dir, exist_ok=True)
         self.trade_log_path = os.path.join(cfg.log_dir, cfg.trade_log_file)
         self.signal_log_path = os.path.join(cfg.log_dir, cfg.signal_log_file)
+
+        # In-memory ring buffer of the last N signal evaluations
+        # (accepted + rejected) so the dashboard can surface gate
+        # diagnostics without tailing the JSONL file. Dedup on
+        # (market_id, reason) so a cascade of identical rejections
+        # doesn't flood the panel — only the most recent entry for
+        # each distinct reason-per-market is retained.
+        self._signal_buffer: Deque[dict] = deque(maxlen=SIGNAL_BUFFER_SIZE)
+        self._signal_buffer_lock = threading.Lock()
+        self._last_reason_by_market: Dict[str, str] = {}
+        self.signals_accepted_total = 0
+        self.signals_rejected_total = 0
+        self._reject_reason_counts: Dict[str, int] = {}
+
+        # Ring buffer of resolved / closed positions so the dashboard
+        # can render the trade history. The engine evicts each market
+        # from its ``markets`` dict the moment it resolves, so the
+        # ``MarketState.closed_positions`` list is garbage-collected
+        # with the market — we must capture the history here instead.
+        self._closed_positions_lock = threading.Lock()
+        self._closed_positions_history: Deque[dict] = deque(maxlen=400)
 
     # ------------------------------------------------------------------ #
     # Exposure bookkeeping
@@ -63,10 +99,24 @@ class PaperExecutor:
         with self._lock:
             return {
                 "open_exposure": self._open_exposure_dollars,
+                # Only resolution-based P/L is honest paper P/L.
                 "realized_pnl": self._realized_pnl,
+                # Mark-to-market P/L from early-exit closes. 0 in v1
+                # (early exits disabled by default) but tracked
+                # separately so it can never contaminate the
+                # ``realized_pnl`` the dashboard and calibrator read.
+                "mark_pnl": self._mark_pnl,
                 "trade_count": self._trade_count,
+                # Resolved-only win/loss counts — this is what WIN
+                # RATE on the dashboard should use. ``wins`` and
+                # ``losses`` still include mark-close counts for
+                # backwards compatibility but the dashboard prefers
+                # the resolved_* numbers.
                 "wins": self._wins,
                 "losses": self._losses,
+                "resolved_count": self._resolved_count,
+                "resolved_wins": self._resolved_wins,
+                "resolved_losses": self._resolved_losses,
             }
 
     # ------------------------------------------------------------------ #
@@ -75,11 +125,15 @@ class PaperExecutor:
 
     def log_signal(self, market: MarketState, signal_reason: str, accepted: bool) -> None:
         """Log every signal evaluation (accepted or rejected) so gate
-        thresholds can be retuned from real paper data."""
+        thresholds can be retuned from real paper data.
+
+        Also updates the in-memory ring buffer used by the dashboard.
+        """
         entry = {
             "ts": time.time(),
             "market_id": market.market_id,
             "interval": market.interval_label,
+            "question": (market.description or "")[:80],
             "accepted": accepted,
             "reason": signal_reason,
             "posterior": market.posterior,
@@ -92,7 +146,39 @@ class PaperExecutor:
             "time_remaining_sec": market.time_remaining_sec,
             "book_depth": market.book_depth_yes,
         }
+
+        # Persist every evaluation to the JSONL log for offline analysis.
         self._append(self.signal_log_path, entry)
+
+        # Update the in-memory ring buffer. Dedup so an identical
+        # rejection reason on the same market on consecutive trades
+        # does not flood the panel — we only store transitions.
+        with self._signal_buffer_lock:
+            if accepted:
+                self.signals_accepted_total += 1
+            else:
+                self.signals_rejected_total += 1
+                # Bucketized gate name for the rejects histogram.
+                bucket = signal_reason.split("(")[0].strip() or "unknown"
+                self._reject_reason_counts[bucket] = (
+                    self._reject_reason_counts.get(bucket, 0) + 1
+                )
+
+            last_reason = self._last_reason_by_market.get(market.market_id)
+            if last_reason != signal_reason or accepted:
+                self._last_reason_by_market[market.market_id] = signal_reason
+                self._signal_buffer.append(entry)
+
+    def recent_signals(self, limit: int = 50) -> List[dict]:
+        """Return the ``limit`` most recent signal entries (newest first)."""
+        with self._signal_buffer_lock:
+            items = list(self._signal_buffer)
+        items.reverse()
+        return items[:limit]
+
+    def reject_reason_histogram(self) -> Dict[str, int]:
+        with self._signal_buffer_lock:
+            return dict(self._reject_reason_counts)
 
     # ------------------------------------------------------------------ #
     # Open / close
@@ -122,7 +208,12 @@ class PaperExecutor:
         else:
             return None
 
-        if not 0.01 < entry_price < 0.99:
+        # Safety net mirroring the ``extreme-ask`` signal gate: refuse
+        # to open any position priced at the tail of the book, where
+        # liquidity is unreliable and mark-to-market swings are
+        # dominated by the tiny entry price rather than any real
+        # signal.
+        if not 0.10 <= entry_price <= 0.90:
             return None
 
         prob_for_side = market.posterior if side == "yes" else (1.0 - market.posterior)
@@ -207,7 +298,13 @@ class PaperExecutor:
 
         with self._lock:
             self._open_exposure_dollars = max(0.0, self._open_exposure_dollars - pos.size_dollars)
-            self._realized_pnl += realized
+            # Mark-to-market close: tracked in ``_mark_pnl`` and the
+            # legacy ``_wins``/``_losses`` counters (which the
+            # dashboard no longer uses for WIN RATE) but never in
+            # ``_realized_pnl`` or ``_resolved_*``. This way the
+            # dashboard's BALANCE / SESSION P/L numbers only reflect
+            # settlements against actual outcomes.
+            self._mark_pnl += realized
             self._trade_count += 1
             if realized > 0:
                 self._wins += 1
@@ -216,6 +313,8 @@ class PaperExecutor:
 
         market.open_position = None
         market.closed_positions.append(pos)
+        market.last_close_time = pos.exit_time
+        self._record_closed(market, pos, event="close", outcome_yes=None)
 
         self._append(
             self.trade_log_path,
@@ -263,15 +362,21 @@ class PaperExecutor:
 
         with self._lock:
             self._open_exposure_dollars = max(0.0, self._open_exposure_dollars - pos.size_dollars)
+            # True resolution P/L — the only honest paper P/L in v1.
             self._realized_pnl += realized
             self._trade_count += 1
+            self._resolved_count += 1
             if realized > 0:
                 self._wins += 1
+                self._resolved_wins += 1
             elif realized < 0:
                 self._losses += 1
+                self._resolved_losses += 1
 
         market.open_position = None
         market.closed_positions.append(pos)
+        market.last_close_time = pos.exit_time
+        self._record_closed(market, pos, event="resolve", outcome_yes=yes_wins)
 
         self._append(
             self.trade_log_path,
@@ -305,3 +410,60 @@ class PaperExecutor:
                 f.write(json.dumps(entry, default=str) + "\n")
         except Exception as e:
             print(f"{self.cfg.log_prefix} log write error ({path}): {e}", flush=True)
+
+    # ------------------------------------------------------------------ #
+    # Closed-position history (survives market eviction)
+    # ------------------------------------------------------------------ #
+
+    def _record_closed(
+        self,
+        market: MarketState,
+        pos: PaperPosition,
+        event: str,
+        outcome_yes: Optional[bool],
+    ) -> None:
+        """Capture a self-contained record of a closed position before
+        the market gets evicted from ``engine.markets``. Format mirrors
+        the JS dashboard's expectations so ``hf_engine.snapshot`` can
+        drop it straight into the state payload with minimal massaging.
+        """
+        # Translate the internal yes/no frame into the domain-specific
+        # up/down labels the dashboard renders. The engine stays a
+        # generic binary-market engine under the hood; only the
+        # presentation layer cares about the crypto-updown naming.
+        side_label = "UP" if pos.side == "yes" else "DOWN"
+        if outcome_yes is None:
+            outcome_label: Optional[str] = None
+        else:
+            outcome_label = "UP" if outcome_yes else "DOWN"
+
+        won = (pos.realized_pnl or 0.0) > 0
+
+        entry = {
+            "ts": pos.exit_time or time.time(),
+            "event": event,
+            "market_id": market.market_id,
+            "interval": market.interval_label,
+            "description": (market.description or "")[:96],
+            "side": side_label,
+            "entry": pos.entry_price,
+            "exit": pos.exit_price,
+            "size_dollars": pos.size_dollars,
+            "realized_pnl": pos.realized_pnl or 0.0,
+            "won": won,
+            "outcome": outcome_label,
+            "posterior_at_entry": pos.posterior_at_entry,
+            "excitation_at_entry": pos.branching_ratio_at_entry,
+            "flow_imbalance_at_entry": pos.flow_imbalance_at_entry,
+            "entry_reason": pos.reason,
+            "exit_reason": pos.exit_reason,
+        }
+        with self._closed_positions_lock:
+            self._closed_positions_history.append(entry)
+
+    def recent_closed_positions(self, limit: int = 100) -> List[dict]:
+        """Return the most recent ``limit`` closed positions, newest first."""
+        with self._closed_positions_lock:
+            items = list(self._closed_positions_history)
+        items.reverse()
+        return items[:limit]

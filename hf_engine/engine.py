@@ -155,8 +155,19 @@ class HFEngine:
         while self._running:
             try:
                 found = self.scanner.scan()
+                ingested_any = False
                 for meta in found:
-                    self._ingest_new_market(meta)
+                    if self._ingest_new_market(meta):
+                        ingested_any = True
+
+                # One consolidated subscribe covering every registered
+                # token (old + newly added). Polymarket's CLOB WS drops
+                # most of its attention when tiny subscribe messages
+                # arrive in rapid succession, so we deliberately avoid
+                # sending a subscribe per market and instead flush the
+                # full registry once per scan cycle.
+                if ingested_any:
+                    self.feed.flush_subscriptions()
 
                 # Check for resolved markets and settle them.
                 with self._markets_lock:
@@ -168,10 +179,16 @@ class HFEngine:
                 self._log(f"scan loop error: {e}")
             time.sleep(self.cfg.scan_interval_sec)
 
-    def _ingest_new_market(self, meta: MarketMeta) -> None:
+    def _ingest_new_market(self, meta: MarketMeta) -> bool:
+        """Ingest a newly-discovered market into the engine state.
+
+        Returns ``True`` if the market was added (so the caller knows
+        to flush subscriptions at the end of the batch), ``False`` if
+        the market was already known and nothing changed.
+        """
         with self._markets_lock:
             if meta.market_id in self.markets:
-                return
+                return False
 
             market = MarketState(
                 cfg=self.cfg,
@@ -200,10 +217,15 @@ class HFEngine:
             self.markets[meta.market_id] = market
 
         # Register with the feed (outside the lock to avoid contention).
+        # ``flush=False`` — the scan loop will call
+        # ``feed.flush_subscriptions()`` once after ingesting every
+        # newly-discovered market so Polymarket's CLOB WS only sees
+        # one consolidated subscribe message per scan cycle.
         self.feed.register_market(
             market_id=meta.market_id,
             yes_token_id=meta.yes_token_id,
             no_token_id=meta.no_token_id,
+            flush=False,
         )
 
         self._markets_seen_total += 1
@@ -212,6 +234,7 @@ class HFEngine:
             f"(id={meta.market_id[:12]}... "
             f"resolves_in={meta.resolves_at - time.time():.0f}s)"
         )
+        return True
 
     def _maybe_resolve_market(self, market_id: str) -> None:
         with self._markets_lock:
@@ -223,12 +246,16 @@ class HFEngine:
         if market.time_remaining_sec > 0:
             return
 
-        # Give the outcome endpoint a few seconds of grace then look up.
+        # Poll CLOB for the definitive ``closed + winner`` outcome.
         outcome = self.scanner.lookup_resolution(market_id)
         if outcome is None:
-            # Not yet reported; if we are more than 2 minutes past end
-            # time, give up and treat as unresolved (still clean up).
-            if (time.time() - market.resolves_at) < 120:
+            # Not yet reported. Polymarket usually flags the winner
+            # within 30-60s of the end time but sometimes takes
+            # several minutes. Keep the market on the books and retry
+            # on the next scan cycle for up to 10 minutes. Only after
+            # that do we give up and fall back to a mark-to-market
+            # close (tracked under ``mark_pnl``, not ``realized_pnl``).
+            if (time.time() - market.resolves_at) < 600:
                 return
 
         market.resolved_outcome = outcome
@@ -237,7 +264,13 @@ class HFEngine:
         if outcome is not None and market.open_position is not None:
             self.executor.settle_at_resolution(market)
         elif market.open_position is not None:
-            # Fallback: close at the last known mid.
+            # Last-resort fallback for markets whose resolution never
+            # surfaced on CLOB. This goes into ``mark_pnl`` so it
+            # cannot contaminate the resolved-only headline stats.
+            self._log(
+                f"WARN no resolution after 10min for {market_id[:12]}, "
+                f"falling back to mark-to-market"
+            )
             self.executor.close_position(market, reason="unresolved-timeout")
 
         if outcome is not None:
@@ -272,7 +305,18 @@ class HFEngine:
             self.executor.log_signal(market, sig.reason, accepted=(sig.action != "none"))
             if sig.action in ("buy_yes", "buy_no"):
                 self.executor.open_position(market, action=sig.action, reason=sig.reason)
-        else:
+        elif self.cfg.early_exit_enabled:
+            # Early-exit path — off by default. Paper positions can
+            # only be honestly settled against a real counterparty,
+            # and there is none: closing via
+            # ``(clob_mid_yes - entry) / entry`` produces
+            # mark-to-market "profit" or "loss" against a phantom
+            # trade that never actually executed, which is what made
+            # the v1 stats export show both UP and DOWN positions
+            # "winning" on the same market. When this flag is false
+            # positions hold until ``settle_at_resolution`` fires at
+            # the market's end time, so there is exactly one
+            # realized P/L per market based on the true outcome.
             exit_sig = market.evaluate_exit_signal()
             if exit_sig.action == "exit":
                 self.executor.close_position(market, reason=exit_sig.reason)
@@ -294,9 +338,17 @@ class HFEngine:
     # ------------------------------------------------------------------ #
 
     def _main_loop(self) -> None:
+        # Heartbeat: print a one-line status every HEARTBEAT_SEC so we
+        # can see what the scanner + feed are doing even before the
+        # first market resolves.
+        HEARTBEAT_SEC = 30.0
+        last_heartbeat = 0.0
+
         while self._running:
             self._tick_count += 1
             now = time.time()
+
+            # Post-resolution report (fires every N resolved markets).
             if (
                 self._markets_resolved_total > 0
                 and (self._markets_resolved_total % self.cfg.report_every_n_markets == 0)
@@ -305,11 +357,26 @@ class HFEngine:
                 self._report()
                 self._last_report_at = now
 
+            # Heartbeat (unconditional, regardless of market activity).
+            if (now - last_heartbeat) > HEARTBEAT_SEC:
+                self._heartbeat()
+                last_heartbeat = now
+
+            # The ``websocket-client`` library runs its own keepalive
+            # (ping_interval=30s, ping_timeout=10s) and reconnects with
+            # exponential backoff on real TCP failures, so there is no
+            # need for the main loop to tear down a healthy feed just
+            # because a quiet market has produced no trade messages for
+            # a while. We only intervene if the feed reports that it is
+            # disconnected *and* has been silent for longer than the
+            # stale timeout, which indicates the internal reconnect
+            # loop itself is stuck.
             if (
-                self.feed.is_stale()
+                not self.feed.connected
+                and self.feed.is_stale()
                 and (now - self._last_feed_reset_at) > self._feed_reset_min_interval
             ):
-                self._log("feed appears stale — forcing reconnect")
+                self._log("feed disconnected + stale — issuing a hard reset")
                 self._last_feed_reset_at = now
                 try:
                     self.feed.stop()
@@ -322,13 +389,50 @@ class HFEngine:
                     log_prefix=f"{self.cfg.log_prefix}-FEED",
                 )
                 self.feed.start()
-                # Re-register everything we are tracking.
                 with self._markets_lock:
                     to_reg = list(self.markets.values())
                 for m in to_reg:
-                    self.feed.register_market(m.market_id, m.yes_token_id, m.no_token_id)
+                    self.feed.register_market(
+                        m.market_id, m.yes_token_id, m.no_token_id, flush=False
+                    )
+                # One consolidated subscribe at the end of the batch.
+                self.feed.flush_subscriptions()
 
             time.sleep(max(self.cfg.loop_sleep_sec, 0.05))
+
+    def _heartbeat(self) -> None:
+        feed_stats = self.feed.stats()
+        ex_stats = self.executor.stats()
+        priors = self.calibrator.current_priors()
+        with self._markets_lock:
+            active = len(self.markets)
+
+        # Top 3 reject reasons from the signal executor so we can see
+        # at a glance which gate is eating signals.
+        hist = self.executor.reject_reason_histogram()
+        top_rejects = sorted(hist.items(), key=lambda kv: -kv[1])[:3]
+        reject_str = ", ".join(f"{k}={v}" for k, v in top_rejects) or "-"
+
+        self._log(
+            f"heartbeat "
+            f"uptime={self.uptime_seconds:.0f}s "
+            f"tick={self._tick_count} "
+            f"active={active} "
+            f"seen={self._markets_seen_total} "
+            f"resolved={self._markets_resolved_total} "
+            f"feed(connected={feed_stats['connected']}, "
+            f"subs={feed_stats['subscribed_tokens']}, "
+            f"reg={feed_stats['registered_tokens']}, "
+            f"msgs={feed_stats['messages_received']}, "
+            f"books={feed_stats['book_updates']}, "
+            f"trades={feed_stats['trades_received']}, "
+            f"unknown={feed_stats['unknown_asset_events']}) "
+            f"signals(pass={self.executor.signals_accepted_total}, "
+            f"rej={self.executor.signals_rejected_total}, {reject_str}) "
+            f"pnl=${ex_stats['realized_pnl']:+.3f} "
+            f"W/L={ex_stats['wins']}/{ex_stats['losses']} "
+            f"priors(α={priors[0]:.3f} β={priors[1]:.3f} π={priors[2]:.3f})"
+        )
 
     def _report(self) -> None:
         stats = self.executor.stats()
