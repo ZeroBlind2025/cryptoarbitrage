@@ -1049,7 +1049,15 @@ def market_refresh_loop():
 def index():
     """Serve the HFT dashboard"""
     # Serve from static to avoid Jinja2 interpreting React's {{ }} syntax
-    return app.send_static_file('hft_dashboard.html')
+    resp = app.make_response(app.send_static_file('hft_dashboard.html'))
+    # Force browser + Railway CDN to re-fetch every time — we've had
+    # cases where stale cached dashboards kept POSTing old endpoints
+    # after a redeploy.  The dashboard is tiny (~100KB) so no-cache
+    # is cheap.
+    resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    resp.headers["Pragma"] = "no-cache"
+    resp.headers["Expires"] = "0"
+    return resp
 
 
 @app.route('/api/status')
@@ -2072,6 +2080,16 @@ def momentum_loop():
 def api_momentum_start():
     """Start momentum engine. Auto-pauses copy trader polling."""
     global momentum_engine, momentum_thread, stop_momentum, copy_trader_paused
+
+    # --- DIAGNOSTIC: who is calling /api/momentum/start? ---
+    # On the contrarian branch the dashboard button no longer hits this
+    # endpoint, yet we still see POSTs arriving.  Log the User-Agent,
+    # Referer and X-Forwarded-For so we can identify the rogue client.
+    _ua = request.headers.get("User-Agent", "?")
+    _ref = request.headers.get("Referer", "?")
+    _xff = request.headers.get("X-Forwarded-For", request.remote_addr or "?")
+    print(f"[MOMENTUM/START] CALLED BY ua={_ua!r} ref={_ref!r} xff={_xff!r}",
+          flush=True)
 
     if not HAS_MOMENTUM_ENGINE:
         return jsonify({"error": "Momentum engine module not available"}), 400
