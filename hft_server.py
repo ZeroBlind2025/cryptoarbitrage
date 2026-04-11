@@ -2971,6 +2971,36 @@ def _get_momentum_data() -> dict:
     return base
 
 
+def _get_contrarian_data() -> dict:
+    """Get contrarian fade engine data for /api/data, with error isolation"""
+    _defaults = {
+        "running": False,
+        "trades_entered": 0, "trades_skipped": 0,
+        "total_spent": 0, "scans_completed": 0,
+        "open_positions": 0, "resolved_positions": 0,
+        "min_entry_price": 0.60, "max_entry_price": 1.0,
+        "trigger_price": 0.60,
+        "bet_amount": 2.0,
+        "coin_bet_amounts": {"btc": 2.0, "eth": 2.0, "sol": 2.0, "xrp": 2.0},
+        "paused_coins": [], "dry_run": True,
+        "active_entries": {},
+    }
+    running = contrarian_thread and contrarian_thread.is_alive()
+    base = {
+        "running": running,
+        "paused": contrarian_paused.is_set() if running else False,
+    }
+    try:
+        if contrarian_engine:
+            base.update(contrarian_engine.get_stats())
+        else:
+            base.update(_defaults)
+    except Exception as e:
+        print(f"[CONTRARIAN] get_stats error (using defaults): {e}", flush=True)
+        base.update(_defaults)
+    return base
+
+
 @app.route('/api/data')
 def api_data():
     """Get all dashboard data in one call"""
@@ -3013,9 +3043,11 @@ def api_data():
             "live": recent_live,
             "copy": list(copy_trades)[-20:],
             "momentum": list(momentum_trades)[-20:],
+            "contrarian": list(contrarian_trades)[-20:],
         },
         "copy_trader": _get_copy_trader_data(),
         "momentum": _get_momentum_data(),
+        "contrarian": _get_contrarian_data(),
         "pnl": {
             "demo": {
                 "filled": len(demo_filled),
