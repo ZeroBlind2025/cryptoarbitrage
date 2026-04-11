@@ -130,6 +130,14 @@ class MarketState:
     # enter every few seconds on the same market.
     last_close_time: Optional[float] = None
 
+    # Per-market baseline informed-fraction. Defaults to ``cfg.pi_base``
+    # in ``__post_init__`` but ``HFEngine._ingest_new_market`` overrides
+    # it with the calibrator's current EMA value so the online learning
+    # loop actually applies to new markets. Previously only the
+    # calibrator's ``current_alpha`` / ``current_beta`` were being
+    # applied and the learned ``current_pi`` was silently discarded.
+    pi_base: Optional[float] = None
+
     # Baseline-rate observation window
     first_trade_time: Optional[float] = None
     mu_finalized: bool = False
@@ -159,7 +167,9 @@ class MarketState:
             initial_probability=0.5,
             max_log_odds=self.cfg.max_log_odds,
         )
-        self.pi_effective = self.cfg.pi_base
+        if self.pi_base is None:
+            self.pi_base = self.cfg.pi_base
+        self.pi_effective = self.pi_base
 
     # ------------------------------------------------------------------ #
     # Accessors
@@ -361,9 +371,9 @@ class MarketState:
             excess = exc_max - self.cfg.cascade_threshold
             boost_frac = min(1.0, max(0.0, excess / self.cfg.cascade_threshold))
             boost = self.cfg.pi_hawkes_boost * boost_frac
-            self.pi_effective = min(self.cfg.pi_base + boost, self.cfg.pi_cap)
+            self.pi_effective = min(self.pi_base + boost, self.cfg.pi_cap)
         else:
-            self.pi_effective = self.cfg.pi_base
+            self.pi_effective = self.pi_base
 
         # 5. Size-weighted GM update.
         sw = size_weight(trade.size, self.median_size)
