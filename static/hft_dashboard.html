@@ -879,12 +879,8 @@
             const scanner = data?.scanner || {};
             const trades = data?.trades || { demo: [], live: [], copy: [] };
             const copyTrader = data?.copy_trader || {};
-            // NOTE (claude/contrarian-fade-strategy): the "Momentum Engine"
-            // UI card on this branch is repurposed to drive the contrarian
-            // fade engine.  We keep the `momentum` variable name so the
-            // JSX below doesn't need a 40-reference rename — it just reads
-            // contrarian stats instead.  The real momentum engine state
-            // is still accessible via `data.momentum` if needed.
+            // On contrarian-fade-strategy branch the Momentum card is
+            // repurposed to drive the contrarian engine. Keep the var name.
             const momentum = data?.contrarian || {};
             const allTrades = [...(trades.demo || []), ...(trades.live || []), ...(trades.copy || []), ...(trades.momentum || []), ...(trades.contrarian || [])]
                 .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
