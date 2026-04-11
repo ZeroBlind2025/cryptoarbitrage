@@ -246,12 +246,16 @@ class HFEngine:
         if market.time_remaining_sec > 0:
             return
 
-        # Give the outcome endpoint a few seconds of grace then look up.
+        # Poll CLOB for the definitive ``closed + winner`` outcome.
         outcome = self.scanner.lookup_resolution(market_id)
         if outcome is None:
-            # Not yet reported; if we are more than 2 minutes past end
-            # time, give up and treat as unresolved (still clean up).
-            if (time.time() - market.resolves_at) < 120:
+            # Not yet reported. Polymarket usually flags the winner
+            # within 30-60s of the end time but sometimes takes
+            # several minutes. Keep the market on the books and retry
+            # on the next scan cycle for up to 10 minutes. Only after
+            # that do we give up and fall back to a mark-to-market
+            # close (tracked under ``mark_pnl``, not ``realized_pnl``).
+            if (time.time() - market.resolves_at) < 600:
                 return
 
         market.resolved_outcome = outcome
@@ -260,7 +264,13 @@ class HFEngine:
         if outcome is not None and market.open_position is not None:
             self.executor.settle_at_resolution(market)
         elif market.open_position is not None:
-            # Fallback: close at the last known mid.
+            # Last-resort fallback for markets whose resolution never
+            # surfaced on CLOB. This goes into ``mark_pnl`` so it
+            # cannot contaminate the resolved-only headline stats.
+            self._log(
+                f"WARN no resolution after 10min for {market_id[:12]}, "
+                f"falling back to mark-to-market"
+            )
             self.executor.close_position(market, reason="unresolved-timeout")
 
         if outcome is not None:

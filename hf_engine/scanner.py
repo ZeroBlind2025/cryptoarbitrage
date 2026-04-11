@@ -459,49 +459,70 @@ class MarketScanner:
     def lookup_resolution(self, market_id: str) -> Optional[int]:
         """Check whether a market has resolved and return the outcome.
 
-        Returns ``1`` for Yes, ``0`` for No, or ``None`` if it has not
-        resolved yet. We poll the Gamma ``/markets/{id}`` endpoint which
-        populates an ``umaResolutionStatus`` / ``closed`` field once the
-        question has settled.
+        Returns ``1`` if the Up/Yes side won, ``0`` if the Down/No side
+        won, or ``None`` if it has not resolved yet.
+
+        Uses the CLOB ``/markets/{condition_id}`` endpoint, which is
+        Polymarket's definitive resolution source — every resolved
+        market has ``closed: true`` plus a per-token ``winner`` boolean.
+        This is the same endpoint ``copy_trader._check_clob_resolution``
+        uses, so the HF engine inherits the same reliability without
+        importing from that module.
+
+        The previous implementation hit
+        ``GET {gamma}/markets?id={condition_id}`` — Gamma ignores the
+        ``id`` query parameter, so the request returned an unfiltered
+        page of markets and the resolution check silently failed for
+        every market. That's what made every position close via
+        ``unresolved-timeout`` (mark-to-market) instead of
+        ``settle_at_resolution``, which is why the dashboard's
+        BALANCE / SESSION P/L / WIN RATE headline stats all sat at
+        zero even though the paper executor was clearly firing.
         """
-        url = f"{self.cfg.gamma_api_base}/markets"
-        params = {"id": market_id}
+        if not market_id:
+            return None
         try:
-            resp = self._session.get(url, params=params, timeout=4)
-            resp.raise_for_status()
+            resp = self._session.get(
+                f"{self.cfg.clob_api_base}/markets/{market_id}",
+                timeout=4,
+            )
+            if resp.status_code != 200:
+                return None
             data = resp.json()
         except Exception:
             return None
 
-        if isinstance(data, dict):
-            data = data.get("data", [data])
-        if not isinstance(data, list) or not data:
-            return None
-        raw = data[0]
-        if not isinstance(raw, dict):
+        if not isinstance(data, dict):
             return None
 
-        if not (raw.get("closed") or raw.get("resolved") or raw.get("archived")):
+        # Must be closed before we can claim resolution.
+        if not data.get("closed"):
             return None
 
-        # Resolved — use the outcomePrices field which becomes [1,0] or
-        # [0,1] after resolution on Polymarket.
-        prices_raw = raw.get("outcomePrices") or raw.get("outcome_prices")
-        try:
-            if isinstance(prices_raw, str):
-                import json as _json
+        tokens = data.get("tokens") or []
+        if not isinstance(tokens, list):
+            return None
 
-                prices = _json.loads(prices_raw)
-            else:
-                prices = prices_raw or []
-            prices = [float(p) for p in prices]
-        except Exception:
-            prices = []
-        if len(prices) == 2:
-            if prices[0] > 0.5:
+        for t in tokens:
+            if not isinstance(t, dict):
+                continue
+            if t.get("winner") is not True:
+                continue
+            outcome = str(t.get("outcome") or "").strip().lower()
+            if outcome in ("up", "yes", "higher", "above", "true"):
                 return 1
-            if prices[1] > 0.5:
+            if outcome in ("down", "no", "lower", "below", "false"):
                 return 0
+            # Unknown label but marked as winner — fall back to
+            # positional matching against ``tokens[0]`` which is
+            # conventionally the Up/Yes side.
+            if tokens and tokens[0] is t:
+                return 1
+            return 0
+
+        # ``closed: true`` with no ``winner: true`` — edge case where
+        # Polymarket marked the market closed but hasn't finalised the
+        # winner. Treat as unresolved so the engine keeps waiting.
         return None
 
 
