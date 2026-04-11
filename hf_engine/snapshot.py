@@ -73,10 +73,22 @@ def snapshot(engine) -> Dict[str, Any]:
 
     markets_json: List[Dict[str, Any]] = [market_snapshot(m) for m in markets]
 
-    active = [m for m in markets_json if not m["resolved"]]
+    # Three-state partitioning of the engine's market set:
+    #   active   still inside its trading window
+    #   pending  expired, waiting on CLOB to publish the winner flag
+    #   resolved fully settled (kept in markets_json for a few
+    #             seconds between settle and eviction, usually not
+    #             present because _maybe_resolve_market pops them)
+    active = [m for m in markets_json if not m["resolved"] and not m["pending_resolution"]]
+    pending = [m for m in markets_json if m["pending_resolution"]]
     cascade_count = sum(1 for m in active if m["cascadeActive"])
     signal_count = sum(1 for m in active if m["signal"] is not None)
-    position_count = sum(1 for m in active if m["position"] is not None)
+    # Positions currently open across BOTH active and pending — a
+    # pending market still has its open_position attached until
+    # ``settle_at_resolution`` fires.
+    position_count = sum(
+        1 for m in (active + pending) if m["position"] is not None
+    )
 
     # Dashboard stats use **resolved-only** numbers. Mark-to-market
     # closes from the optional early-exit path are tracked separately
@@ -96,6 +108,9 @@ def snapshot(engine) -> Dict[str, Any]:
     # the executor's history buffer, which survives market eviction.
     open_positions: List[Dict[str, Any]] = []
     for m_json in markets_json:
+        # Skip only fully-resolved markets. Pending-resolution
+        # markets still have an open position and deserve to stay
+        # visible until settlement actually happens.
         if m_json.get("resolved"):
             continue
         pos = m_json.get("position")
@@ -116,6 +131,7 @@ def snapshot(engine) -> Dict[str, Any]:
                 "live_pnl": pos.get("live_pnl", 0.0),
                 "posterior": m_json["posterior"],
                 "time_remaining_sec": int(round(m_json["remaining"] / 1000)),
+                "pending_resolution": bool(m_json.get("pending_resolution")),
             }
         )
 
@@ -131,6 +147,7 @@ def snapshot(engine) -> Dict[str, Any]:
         "balance": PAPER_STARTING_BALANCE + total_pnl,
         "early_exit_enabled": engine.cfg.early_exit_enabled,
         "activeCount": len(active),
+        "pendingCount": len(pending),
         "cascadeCount": cascade_count,
         "signalCount": signal_count,
         "positionCount": position_count,
@@ -165,7 +182,21 @@ def market_snapshot(m: MarketState) -> Dict[str, Any]:
     if clob_mid is None:
         clob_mid = 0.5
 
-    resolved = m.resolved_outcome is not None or m.time_remaining_sec <= 0
+    # Three-state lifecycle instead of a boolean:
+    #   active               time_remaining > 0
+    #   pending_resolution   time is up but CLOB hasn't published the
+    #                        winner flag yet (Polymarket on-chain
+    #                        settlement can take up to 5 minutes)
+    #   resolved             resolved_outcome is not None
+    #
+    # Dashboard logic used to treat any expired market as resolved,
+    # which made open positions vanish from the OPEN POSITIONS panel
+    # for the entire ~5 minute wait while the engine's scan loop
+    # kept polling CLOB. We now carry all three states through the
+    # snapshot and let the dashboard render pending markets as a
+    # distinct state so the position stays visible until settlement.
+    resolved = m.resolved_outcome is not None
+    pending_resolution = (not resolved) and m.time_remaining_sec <= 0
     outcome: Optional[str] = None
     if m.resolved_outcome is not None:
         outcome = "UP" if m.resolved_outcome == 1 else "DOWN"
@@ -215,6 +246,7 @@ def market_snapshot(m: MarketState) -> Dict[str, Any]:
         "tradeCount": int(m.trade_count),
         "recentTrades": recent,
         "resolved": bool(resolved),
+        "pending_resolution": bool(pending_resolution),
         "outcome": outcome,
         "signal": signal,
         "position": position,

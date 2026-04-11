@@ -14,6 +14,7 @@
   .card { background: #0d0d14; border: 1px solid #1a1a2e; border-radius: 6px; padding: 12px; margin-bottom: 8px; transition: all .3s; }
   .card.cascade { border-color: #f59e0b33; }
   .card.positioned { background: #0a1628; }
+  .card.pending { border-color: #8b5cf655; background: #0f0a1e; }
   .card.resolved { opacity: .65; background: #08080f; }
   .stat-grid { display: grid; gap: 6px; margin-bottom: 12px; background: #0a0a14; border: 1px solid #1a1a2e; border-radius: 6px; padding: 10px; }
   .stat-label { font-size: 7px; color: #444; letter-spacing: .5px; margin-bottom: 1px; }
@@ -92,6 +93,12 @@ function render() {
   app.innerHTML = '';
 
   const s = state;
+  // Show both active (still counting down) and pending-resolution
+  // (time up, waiting on CLOB) markets in the ACTIVE MARKETS panel.
+  // A pending market's position is still open and can settle any
+  // second once Polymarket publishes the winner flag, so keeping
+  // the card visible prevents a 5-minute "where did my position
+  // go?" gap between end-of-market and on-chain resolution.
   const active = s.markets.filter(m => !m.resolved);
   // Resolved / closed positions now live in ``s.closed_positions``
   // (sourced from the executor's persistent history buffer) — the
@@ -116,13 +123,15 @@ function render() {
   ));
 
   // Stats
-  const statGrid = h('div', { class:'stat-grid', style: { gridTemplateColumns:'repeat(7,1fr)' }});
+  const pendingCount = s.pendingCount || 0;
+  const statGrid = h('div', { class:'stat-grid', style: { gridTemplateColumns:'repeat(8,1fr)' }});
   const stats = [
     ['BALANCE', `$${fmt(s.balance)}`, null, '#f8fafc'],
     ['SESSION P/L', `${ps(s.totalPnl)}$${fmt(Math.abs(s.totalPnl),3)}`, null, pc(s.totalPnl)],
     ['RESOLVED', String(s.totalTrades), `${s.totalWins}W / ${s.totalTrades-s.totalWins}L`, '#f8fafc'],
     ['WIN RATE', wr==='—'?'—':`${wr}%`, null, wr!=='—'&&parseFloat(wr)>=50?'#10b981':'#ef4444'],
     ['ACTIVE', String(s.activeCount), `${s.positionCount} positioned`, '#f8fafc'],
+    ['PENDING', String(pendingCount), pendingCount>0?'≤5m on-chain':null, pendingCount>0?'#8b5cf6':'#333'],
     ['CASCADES', String(s.cascadeCount), null, s.cascadeCount>0?'#f59e0b':'#333'],
     ['SIGNALS', String(s.signalCount), null, s.signalCount>0?'#10b981':'#333'],
   ];
@@ -151,10 +160,12 @@ function render() {
     const maxN = Math.max(m.hawkesBuy.n, m.hawkesSell.n);
     const edge = m.posterior - m.clobPrice;
     const hasPos = !!m.position;
+    const isPending = !!m.pending_resolution;
 
     let classes = 'card';
     if (m.cascadeActive) classes += ' cascade';
     if (hasPos) classes += ' positioned';
+    if (isPending) classes += ' pending';
 
     const card = h('div', { class: classes });
 
@@ -164,8 +175,9 @@ function render() {
     const badges = h('div', { style: { display:'flex', alignItems:'center', gap:'6px', marginBottom:'3px', flexWrap:'wrap' }});
     badges.append(h('span', { style: { fontSize:'9px', color:'#555' }}, m.id));
     badges.append(h('span', { style: { fontSize:'8px', color:'#333' }}, `${m.duration}m`));
-    if (m.cascadeActive) badges.append(h('span', { class:'badge', style: { background:'#1a1400', border:'1px solid #f59e0b', color:'#f59e0b', animation:'badgePulse 1.5s infinite' }}, 'CASCADE'));
-    if (m.signal) {
+    if (isPending) badges.append(h('span', { class:'badge', style: { background:'#0f0a1e', border:'1px solid #8b5cf6', color:'#8b5cf6', animation:'badgePulse 1.5s infinite' }}, 'PENDING RESOLUTION'));
+    if (m.cascadeActive && !isPending) badges.append(h('span', { class:'badge', style: { background:'#1a1400', border:'1px solid #f59e0b', color:'#f59e0b', animation:'badgePulse 1.5s infinite' }}, 'CASCADE'));
+    if (m.signal && !isPending) {
       const isUp = m.signal === 'BUY_UP';
       const badgeColor = isUp ? '#10b981' : '#ef4444';
       const badgeBg = isUp ? '#064e3b' : '#4a1d1d';
@@ -177,8 +189,13 @@ function render() {
     header.append(left);
 
     const right = h('div', { style: { textAlign:'right', minWidth:'70px' }});
-    right.append(h('div', { style: { fontSize:'14px', fontWeight:700, color: remSec<60?'#ef4444':'#e2e8f0', fontFamily:"'Space Mono',monospace" }}, remStr));
-    right.append(h('div', { style: { fontSize:'7px', color:'#444' }}, 'REMAINING'));
+    if (isPending) {
+      right.append(h('div', { style: { fontSize:'11px', fontWeight:700, color:'#8b5cf6', fontFamily:"'Space Mono',monospace" }}, 'WAITING'));
+      right.append(h('div', { style: { fontSize:'7px', color:'#444' }}, 'ON-CHAIN ≤5m'));
+    } else {
+      right.append(h('div', { style: { fontSize:'14px', fontWeight:700, color: remSec<60?'#ef4444':'#e2e8f0', fontFamily:"'Space Mono',monospace" }}, remStr));
+      right.append(h('div', { style: { fontSize:'7px', color:'#444' }}, 'REMAINING'));
+    }
     header.append(right);
     card.append(header);
 
@@ -321,15 +338,29 @@ function render() {
     ppCard.append(openHead);
     openPositions.forEach(p => {
       const sideColor = p.side === 'UP' ? '#10b981' : '#ef4444';
-      const row = h('div', { style: { display:'grid', gridTemplateColumns:openCols, gap:'2px', fontSize:'9px', padding:'4px 0', borderBottom:'1px solid #0a0a14' }});
+      const isPending = !!p.pending_resolution;
+      const row = h('div', { style: { display:'grid', gridTemplateColumns:openCols, gap:'2px', fontSize:'9px', padding:'4px 0', borderBottom:'1px solid #0a0a14', opacity: isPending ? '0.85' : '1' }});
       row.append(h('div', { class:'dim' }, p.market_short));
-      row.append(h('div', { style: { color:'#94a3b8', overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}, p.description));
+      const descCell = h('div', { style: { color:'#94a3b8', overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }});
+      if (isPending) {
+        descCell.append(h('span', { style: { color:'#8b5cf6', fontWeight:700, marginRight:'4px' }}, '◆ PENDING'));
+      }
+      descCell.append(h('span', {}, p.description));
+      row.append(descCell);
       row.append(h('div', { style: { color: sideColor, fontWeight:700 }}, p.side));
       row.append(h('div', { class:'dim' }, `$${fmt(p.size_dollars, 2)}`));
       row.append(h('div', { class:'dim' }, `${fmt(p.entry * 100, 1)}¢`));
-      row.append(h('div', { class:'dim' }, `${fmt((p.side === 'UP' ? p.clob_price : 1 - p.clob_price) * 100, 1)}¢`));
+      if (isPending) {
+        row.append(h('div', { style: { color:'#8b5cf6', fontWeight:700 }}, 'await'));
+      } else {
+        row.append(h('div', { class:'dim' }, `${fmt((p.side === 'UP' ? p.clob_price : 1 - p.clob_price) * 100, 1)}¢`));
+      }
       row.append(h('div', { class:'dim' }, `${fmt(p.edge * 100, 1)}¢`));
-      row.append(h('div', { style: { color: pc(p.live_pnl || 0), fontWeight:700 }}, `${ps(p.live_pnl || 0)}$${fmt(Math.abs(p.live_pnl || 0), 3)}`));
+      if (isPending) {
+        row.append(h('div', { style: { color:'#64748b' }}, '—'));
+      } else {
+        row.append(h('div', { style: { color: pc(p.live_pnl || 0), fontWeight:700 }}, `${ps(p.live_pnl || 0)}$${fmt(Math.abs(p.live_pnl || 0), 3)}`));
+      }
       ppCard.append(row);
     });
   }
