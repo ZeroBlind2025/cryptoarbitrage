@@ -3119,6 +3119,76 @@ def api_events():
 
 
 # =============================================================================
+# CONTRARIAN AUTO-START
+# =============================================================================
+#
+# The claude/contrarian-fade-strategy branch is meant to run the contrarian
+# fade engine as its default mode of operation.  Without this helper the
+# container boots idle and the first thing that POSTs to any /api/*/start
+# endpoint wins — which historically has been stale browser JS hitting
+# /api/momentum/start.  Auto-starting at boot makes the contrarian engine
+# the only thing running by default, with no dashboard click required.
+#
+# Env knobs:
+#   CONTRARIAN_AUTOSTART (default "true") — set to "false" to disable
+#   CONTRARIAN_LIVE      (default "false") — set to "true" to run LIVE
+#
+def _autostart_contrarian_engine():
+    global contrarian_engine, contrarian_thread, stop_contrarian
+
+    if os.getenv("CONTRARIAN_AUTOSTART", "true").lower() != "true":
+        print("[AUTOSTART] CONTRARIAN_AUTOSTART=false — skipping", flush=True)
+        return
+
+    if not HAS_CONTRARIAN_ENGINE:
+        print("[AUTOSTART] contrarian_engine module NOT available — "
+              "this branch is missing contrarian_engine.py.  "
+              "Nothing to auto-start.", flush=True)
+        return
+
+    if contrarian_thread and contrarian_thread.is_alive():
+        print("[AUTOSTART] Contrarian engine already running — skipping",
+              flush=True)
+        return
+
+    live_mode = os.getenv("CONTRARIAN_LIVE", "false").lower() == "true"
+
+    print("\n" + "=" * 70)
+    print("   AUTO-START: CONTRARIAN FADE ENGINE")
+    print("   (claude/contrarian-fade-strategy branch)")
+    print(f"   Mode: {'LIVE (REAL MONEY)' if live_mode else 'DRY RUN'}")
+    print("=" * 70 + "\n", flush=True)
+
+    try:
+        # Share positions dict with whichever engine already owns state,
+        # so the combined balance chart stays consistent across engines.
+        shared_pos = (
+            copy_trader.positions if copy_trader
+            else momentum_engine.positions if momentum_engine
+            else informed_engine.positions if informed_engine
+            else None
+        )
+        contrarian_engine = ContrarianEngine(
+            dry_run=not live_mode,
+            on_trade=on_contrarian_trade,
+            shared_positions=shared_pos,
+        )
+        contrarian_engine.start()
+    except Exception as e:
+        print(f"[AUTOSTART] Failed to init contrarian engine: {e}", flush=True)
+        import traceback; traceback.print_exc()
+        contrarian_engine = None
+        return
+
+    stop_contrarian.clear()
+    contrarian_paused.clear()
+    contrarian_thread = threading.Thread(target=contrarian_loop, daemon=True)
+    contrarian_thread.start()
+    print("[AUTOSTART] Contrarian fade engine is LIVE in the scan loop",
+          flush=True)
+
+
+# =============================================================================
 # MAIN
 # =============================================================================
 
@@ -3167,7 +3237,17 @@ def main():
     print("  GET  /api/trades    - Trade history")
     print("  GET  /api/data      - All dashboard data")
     print("  GET  /api/events    - Real-time SSE stream")
+    print("  POST /api/contrarian/start   - (auto-started by default on this branch)")
     print(f"{'=' * 60}\n")
+
+    # Auto-start the contrarian fade engine on this branch.  See
+    # _autostart_contrarian_engine() for env-var knobs (CONTRARIAN_AUTOSTART,
+    # CONTRARIAN_LIVE).  Logs loudly on success or failure.
+    try:
+        _autostart_contrarian_engine()
+    except Exception as e:
+        print(f"[AUTOSTART] Unexpected error during auto-start: {e}", flush=True)
+        import traceback; traceback.print_exc()
 
     app.run(host=args.host, port=args.port, debug=args.debug, threaded=True)
 
