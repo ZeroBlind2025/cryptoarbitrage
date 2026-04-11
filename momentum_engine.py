@@ -119,7 +119,7 @@ MAX_ENTRIES_PER_MARKET = int(os.getenv("MOMENTUM_MAX_ENTRIES_PER_MARKET", "2"))
 # Prevents rapid-fire follow-ups when price ticks up within the same scan cycle.
 FOLLOW_UP_COOLDOWN = int(os.getenv("MOMENTUM_FOLLOW_UP_COOLDOWN", "30"))
 FOLLOW_UP_COOLDOWN_15M = int(os.getenv("MOMENTUM_15m_COOLDOWN", "240"))  # 4 minutes for 15m markets
-REENTRY_MIN_PRICE = float(os.getenv("MOMENTUM_REENTRY_MIN_PRICE", "0.899"))  # only re-enter above 89.9¢
+REENTRY_MIN_PRICE = float(os.getenv("MOMENTUM_REENTRY_MIN_PRICE", "0.80"))  # only re-enter once momentum is confirmed (price >= 80¢)
 
 # Minimum minutes before market close to allow entry.
 # Prevents placing trades after (or right at) the close time.
@@ -938,6 +938,8 @@ class MomentumEngine:
         print(f"  Markets: {', '.join(INTERVALS) if INTERVALS else 'NONE (all disabled!)'}")
         print(f"  Hedge: {'ENABLED' if MOMENTUM_HEDGE_ENABLE else 'DISABLED'} | gap: {MOMENTUM_HEDGE_PCT:.0f}¢")
         print(f"  Re-entry: upward only, max {self.max_entries_per_market} entries/market")
+        print(f"  Re-entry confirmation floor: {REENTRY_MIN_PRICE*100:.0f}¢ (MOMENTUM_REENTRY_MIN_PRICE)")
+        print(f"  Cooldown: {FOLLOW_UP_COOLDOWN}s (5m) / {FOLLOW_UP_COOLDOWN_15M}s (15m) — one-shot, gates 2nd market entry only")
         _delay_status = "DISABLED" if getattr(self, '_dry_run_no_delays', False) else "ENABLED"
         _delay_info = ", ".join(f"{k}={int(v*60)}s" for k, v in MARKET_ENTRY_DELAY.items()) if _delay_status == "ENABLED" else ""
         print(f"  Delays/cooldowns: {_delay_status}" + (f" ({_delay_info})" if _delay_info else ""))
@@ -1527,19 +1529,85 @@ class MomentumEngine:
 
                 # Key by (condition_id, token_id) — stable across API ordering changes
                 market_key = (condition_id, token_id)
-
-                # --- GUARD: No opposite side ---
-                # Check if we already hold the OTHER token on this condition_id
                 opposite_key = (condition_id, other_token_id)
-                if opposite_key in self.entered_markets:
+
+                # --- MARKET-LEVEL GATE: subsequent entries need confirmation ---
+                # Once any side of this market has been entered (same or
+                # opposite), every further entry — same-side re-entry OR
+                # first entry on the opposite side — has to wait for price
+                # on the candidate side to reach REENTRY_MIN_PRICE (80¢ by
+                # default).  This lets us recoup partial losses on a losing
+                # side when the market reverses and the other side confirms
+                # momentum.  First entry into the market still uses the
+                # normal MIN_ENTRY_PRICE gate above.
+                market_has_prior_entry = (
+                    market_key in self.entered_markets
+                    or opposite_key in self.entered_markets
+                )
+                if market_has_prior_entry and price < REENTRY_MIN_PRICE:
+                    if self.scans_completed % 30 == 1:
+                        print(
+                            f"  SUBSEQUENT GATED {_mkt_label} {outcome} "
+                            f"@ {price*100:.1f}¢: subsequent entry needs "
+                            f">= {REENTRY_MIN_PRICE*100:.0f}¢",
+                            flush=True,
+                        )
                     self.trades_skipped += 1
-                    print(f"  REJECT opposite_held: already hold other side of {_mkt_label}", flush=True)
                     continue
+
+                # --- COOLDOWN GATE: one-shot, only applies to the 2nd
+                # entry in the market ---
+                # The cooldown exists to stop us chasing the initial
+                # surge: probe at 60¢, market spikes to 85¢ inside a few
+                # seconds, we slam in a same-side re-entry, then it
+                # reverts and we eat a double loss.  The 250s wait forces
+                # us to sit on our hands after the probe.
+                #
+                # But once we've committed a 2nd entry, whatever comes
+                # next (a same-side stack at 82¢ or a Down re-entry at
+                # 81¢) is part of the reversal/trend we actually want to
+                # ride — throttling those kills the recoup.  So: the
+                # cooldown gates ONLY the transition from entry #1 → #2
+                # in the market.  #3 → #4 → … fire immediately, bounded
+                # only by max_entries_per_market and the upward-movement
+                # check for same-side re-entries.
+                current_market_entries = sum(
+                    1 for (cid, _) in self.entered_markets
+                    if cid == condition_id
+                )
+                if current_market_entries == 1:
+                    market_last_time = max(
+                        (
+                            t for (cid, _), t in self.last_trade_time.items()
+                            if cid == condition_id
+                        ),
+                        default=0,
+                    )
+                    if market_last_time:
+                        cooldown = (
+                            FOLLOW_UP_COOLDOWN_15M
+                            if market.get("interval") == "15m"
+                            else FOLLOW_UP_COOLDOWN
+                        )
+                        elapsed = time.time() - market_last_time
+                        if elapsed < cooldown:
+                            if self.scans_completed % 30 == 1:
+                                print(
+                                    f"  COOLDOWN GATED {_mkt_label} {outcome} "
+                                    f"@ {price*100:.1f}¢: 2nd-entry cooldown "
+                                    f"{elapsed:.0f}/{cooldown}s",
+                                    flush=True,
+                                )
+                            self.trades_skipped += 1
+                            continue
 
                 # --- HEDGE TRIGGER: Price risen 5¢+ above probe → hedge opposite side ---
                 # This runs BEFORE the max-entries / cooldown guards because
                 # it's not a re-entry on primary — it's a hedge on the opposite side.
                 is_first_entry = market_key not in self.entered_markets
+                is_opposite_first_entry = (
+                    is_first_entry and opposite_key in self.entered_markets
+                )
                 if market_key in self.entered_markets:
                     last_buy_price = self.entered_markets[market_key]
                     price_rise = round(price - last_buy_price, 4)
@@ -1677,24 +1745,25 @@ class MomentumEngine:
                     # --- RE-ENTRY GATE: allow re-entry if under max entries ---
                     entry_count = self.market_entry_count.get(market_key, 0)
                     if entry_count >= self.max_entries_per_market:
-                        continue  # hit max entries for this market
+                        continue  # hit max entries for this side
 
-                    # --- FOLLOW-UP COOLDOWN: prevent rapid-fire re-entries ---
-                    last_t = self.last_trade_time.get(market_key, 0)
-                    if last_t:
-                        cooldown = FOLLOW_UP_COOLDOWN_15M if market.get("interval") == "15m" else FOLLOW_UP_COOLDOWN
-                        elapsed = time.time() - last_t
-                        if elapsed < cooldown:
-                            continue  # still in cooldown
+                    # NOTE: cooldown and REENTRY_MIN_PRICE (80¢) are both
+                    # handled by the market-level gates above — a one-shot
+                    # cooldown on the transition to entry #2, and an 80¢
+                    # floor on any subsequent entry.  Same-side re-entries
+                    # still require upward movement from the last same-side
+                    # buy price (enforced earlier in this block).
 
-                    # Update last buy price for upward-only tracking
-                    # (fall through to ENTER THE TRADE block below)
-
-                # --- ENTER THE TRADE (probe / re-entry) ---
+                # --- ENTER THE TRADE (probe / re-entry / opposite-side) ---
                 full_lot = self.coin_bet_amounts.get(coin, self.bet_amount)
                 trade_amount = PROBE_AMOUNT if not getattr(self, '_dry_run_no_probe', False) else full_lot
                 title = (question or slug)[:50]
-                entry_type = "RE-ENTRY" if not is_first_entry else "PROBE"
+                if is_opposite_first_entry:
+                    entry_type = "OPP-ENTRY"
+                elif is_first_entry:
+                    entry_type = "PROBE"
+                else:
+                    entry_type = "RE-ENTRY"
 
                 print(f"\n[MOMENTUM] ENTERING {coin.upper()} {outcome} @ {price*100:.1f}¢ ({entry_type})", flush=True)
                 print(f"           Market: {title}", flush=True)
@@ -2051,35 +2120,17 @@ class MomentumEngine:
                 _resolution_cache[cache_key] = result
 
             if not result or not result.get("resolved"):
-                # Fallback: use live WebSocket price for resolution
-                # Only trigger in the final 10 seconds of a market to avoid
-                # false wins/losses from mid-window price spikes to 99¢.
-                live_price = self.get_live_price(token_id) if token_id else None
-                _in_final_seconds = False
-                end_date_str = position.get("end_date")
-                if end_date_str:
-                    try:
-                        end_dt = datetime.fromisoformat(end_date_str) if isinstance(end_date_str, str) else end_date_str
-                        secs_left = (end_dt - datetime.now(timezone.utc)).total_seconds()
-                        _in_final_seconds = secs_left <= 10
-                    except Exception:
-                        pass
-                if _in_final_seconds and live_price is not None and (live_price >= 0.98 or live_price <= 0.02):
-                    our_token_won = live_price >= 0.98
-                    print(f"[MOMENTUM] Price-based resolution (final 10s): {position['market'][:30]} "
-                          f"| price={live_price:.4f} → {'WIN' if our_token_won else 'LOSS'}", flush=True)
-                    result = {
-                        "resolved": True,
-                        "our_token_won": our_token_won,
-                        "winning_outcome": our_outcome if our_token_won else None,
-                    }
-                else:
-                    # Track unresolved attempts with timestamps for smarter retry
-                    attempts = position.get("_resolve_attempts", 0) + 1
-                    position["_resolve_attempts"] = attempts
-                    if attempts == 1:
-                        position["_first_resolve_check"] = time.time()
-                    continue
+                # On-chain only — no live-price shortcuts.  If the CLOB
+                # resolution isn't available yet, leave the position
+                # pending and retry next cycle.  We intentionally do NOT
+                # read the live WS price to mark a winner, because
+                # last-second price spikes have caused paper-trading
+                # mismarks in the past.
+                attempts = position.get("_resolve_attempts", 0) + 1
+                position["_resolve_attempts"] = attempts
+                if attempts == 1:
+                    position["_first_resolve_check"] = time.time()
+                continue
 
             entry_price = position.get("entry_price", 0)
             amount = position.get("amount", 0)
@@ -2118,13 +2169,10 @@ class MomentumEngine:
                           f"(ours={our_outcome}, winner={winning_outcome}). Correcting to WIN.", flush=True)
                     won = True
 
-            # Priority 4: Live price fallback when API says resolved but no winner info
-            # This catches the case where Gamma returns resolved=True with no outcome data
-            if won is None and token_id:
-                live_price = self.get_live_price(token_id)
-                if live_price is not None and (live_price >= 0.95 or live_price <= 0.05):
-                    won = live_price >= 0.95
-                    print(f"[MOMENTUM] Resolved-but-no-winner fallback: price={live_price:.4f} → {'WIN' if won else 'LOSS'}", flush=True)
+            # No live-price fallback: if the on-chain CLOB result came back
+            # "resolved" but without a winner (rare Gamma edge case), leave
+            # won=None so the unknown-timeout path below handles it, rather
+            # than guessing from the current WS price.
 
             if won is True:
                 if entry_price > 0:
