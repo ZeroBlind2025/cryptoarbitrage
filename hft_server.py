@@ -145,6 +145,24 @@ stop_informed = threading.Event()
 informed_paused = threading.Event()
 informed_trades: deque = deque(maxlen=500)
 
+# Contrarian fade engine (inverse of informed money)
+try:
+    from contrarian_engine import (
+        ContrarianEngine,
+        POLL_INTERVAL as CONTRARIAN_POLL_INTERVAL,
+    )
+    HAS_CONTRARIAN_ENGINE = True
+except Exception as e:
+    print(f"[SERVER] Failed to import contrarian_engine: {e}")
+    HAS_CONTRARIAN_ENGINE = False
+    CONTRARIAN_POLL_INTERVAL = 1
+
+contrarian_engine: Optional["ContrarianEngine"] = None
+contrarian_thread: Optional[threading.Thread] = None
+stop_contrarian = threading.Event()
+contrarian_paused = threading.Event()
+contrarian_trades: deque = deque(maxlen=500)
+
 
 def on_copy_trade(trade_record: dict):
     """Callback when copy trader executes a trade"""
@@ -162,6 +180,12 @@ def on_informed_trade(trade_record: dict):
     """Callback when informed money engine executes a trade"""
     informed_trades.append(trade_record)
     print(f"[INFORMED] Trade recorded: {trade_record.get('market', '?')[:30]} - {trade_record.get('status', '?')}", flush=True)
+
+
+def on_contrarian_trade(trade_record: dict):
+    """Callback when contrarian fade engine executes a trade"""
+    contrarian_trades.append(trade_record)
+    print(f"[CONTRARIAN] Trade recorded: {trade_record.get('market', '?')[:30]} - {trade_record.get('status', '?')}", flush=True)
 
 
 # Sports data (no longer using WebSocket)
@@ -2536,6 +2560,255 @@ def api_informed_trades():
     """Get informed money engine trade history."""
     limit = int(request.args.get('limit', 50))
     trades = list(informed_trades)[-limit:]
+    trades.reverse()
+    return jsonify(trades)
+
+
+# =============================================================================
+# CONTRARIAN FADE ENGINE ENDPOINTS
+# =============================================================================
+
+def contrarian_loop():
+    """Background loop for contrarian fade engine"""
+    global contrarian_engine
+    if not contrarian_engine:
+        print("[CONTRARIAN] Loop abort: engine is None", flush=True)
+        return
+
+    poll_s = CONTRARIAN_POLL_INTERVAL
+    print(f"[CONTRARIAN] Background scanning started (every {poll_s}s)...", flush=True)
+    loop_count = 0
+
+    while not stop_contrarian.is_set():
+        try:
+            loop_count += 1
+
+            if not contrarian_paused.is_set():
+                entered = contrarian_engine.scan_and_trade()
+                if entered > 0:
+                    print(f"[CONTRARIAN] Entered {entered} trade(s)", flush=True)
+
+            contrarian_engine.check_resolutions()
+
+            heartbeat_every = max(1, 300 // poll_s)
+            if loop_count % heartbeat_every == 0:
+                stats = contrarian_engine.get_stats()
+                paused_label = "PAUSED" if contrarian_paused.is_set() else "ACTIVE"
+                print(f"[CONTRARIAN] Heartbeat #{loop_count}: {paused_label} | "
+                      f"{stats['open_positions']} open | "
+                      f"{stats['trades_entered']} entered | "
+                      f"{stats['scans_completed']} scans", flush=True)
+        except Exception as e:
+            print(f"[CONTRARIAN] Error in loop: {e}", flush=True)
+            import traceback; traceback.print_exc()
+
+        stop_contrarian.wait(timeout=poll_s)
+
+    print("[CONTRARIAN] Background scanning stopped", flush=True)
+
+
+@app.route('/api/contrarian/start', methods=['POST'])
+def api_contrarian_start():
+    """Start the contrarian fade engine."""
+    global contrarian_engine, contrarian_thread, stop_contrarian
+
+    if not HAS_CONTRARIAN_ENGINE:
+        return jsonify({"error": "Contrarian engine module not available"}), 400
+
+    if contrarian_thread and contrarian_thread.is_alive():
+        return jsonify({"error": "Contrarian engine already running"}), 400
+
+    data = request.get_json() or {}
+    live_mode = data.get('live', False)
+    bet_amount = data.get('bet_amount')
+    coin_bet_amounts = data.get('coin_bet_amounts')
+    trigger_price = data.get('trigger_price')
+
+    if live_mode and not data.get('confirm_live'):
+        return jsonify({
+            "error": "Live mode requires confirmation",
+            "message": "Set confirm_live=true to enable live trading"
+        }), 403
+
+    # Share lot sizes if not supplied
+    if not coin_bet_amounts and copy_trader:
+        coin_bet_amounts = dict(copy_trader.coin_bet_amounts)
+    if not coin_bet_amounts and momentum_engine:
+        coin_bet_amounts = dict(momentum_engine.coin_bet_amounts)
+    if not bet_amount and copy_trader:
+        bet_amount = copy_trader.bet_amount
+    if not bet_amount and momentum_engine:
+        bet_amount = momentum_engine.bet_amount
+
+    try:
+        shared_pos = (
+            copy_trader.positions if copy_trader
+            else momentum_engine.positions if momentum_engine
+            else informed_engine.positions if informed_engine
+            else None
+        )
+        contrarian_engine = ContrarianEngine(
+            dry_run=not live_mode,
+            on_trade=on_contrarian_trade,
+            bet_amount=bet_amount,
+            coin_bet_amounts=coin_bet_amounts,
+            shared_positions=shared_pos,
+        )
+        if trigger_price is not None:
+            contrarian_engine.trigger_price = float(trigger_price)
+            contrarian_engine.min_entry_price = float(trigger_price)
+        contrarian_engine.start()
+    except Exception as e:
+        print(f"[SERVER] Failed to start contrarian engine: {e}")
+        import traceback; traceback.print_exc()
+        contrarian_engine = None
+        return jsonify({"error": f"Failed to start: {e}"}), 500
+
+    stop_contrarian.clear()
+    contrarian_paused.clear()
+    contrarian_thread = threading.Thread(target=contrarian_loop, daemon=True)
+    contrarian_thread.start()
+
+    mode_str = "LIVE" if live_mode else "DRY RUN"
+    return jsonify({
+        "success": True,
+        "message": f"Contrarian fade engine started in {mode_str} mode",
+        "trigger_price": contrarian_engine.trigger_price,
+    })
+
+
+@app.route('/api/contrarian/stop', methods=['POST'])
+def api_contrarian_stop():
+    """Stop the contrarian fade engine."""
+    global contrarian_engine, contrarian_thread, stop_contrarian
+
+    if not contrarian_thread or not contrarian_thread.is_alive():
+        return jsonify({"error": "Contrarian engine not running"}), 400
+
+    stop_contrarian.set()
+    contrarian_thread.join(timeout=5)
+
+    stats = contrarian_engine.get_stats() if contrarian_engine else {}
+
+    if contrarian_engine:
+        contrarian_engine.stop()
+    contrarian_engine = None
+
+    return jsonify({
+        "success": True,
+        "message": "Contrarian fade engine stopped",
+        "stats": stats,
+    })
+
+
+@app.route('/api/contrarian/pause', methods=['POST'])
+def api_contrarian_pause():
+    """Pause contrarian engine — stop new scans, keep resolution."""
+    if not contrarian_thread or not contrarian_thread.is_alive():
+        return jsonify({"error": "Contrarian engine not running"}), 400
+
+    if contrarian_paused.is_set():
+        return jsonify({"error": "Already paused"}), 400
+
+    contrarian_paused.set()
+    open_count = (
+        len(contrarian_engine.positions.get("open", []))
+        if contrarian_engine else 0
+    )
+    print(f"[CONTRARIAN] PAUSED - No new scans. Resolution still running for "
+          f"{open_count} open positions.", flush=True)
+
+    return jsonify({
+        "success": True,
+        "message": f"Paused. Resolution running for {open_count} open position(s).",
+        "open_positions": open_count,
+    })
+
+
+@app.route('/api/contrarian/resume', methods=['POST'])
+def api_contrarian_resume():
+    """Resume contrarian engine scanning."""
+    if not contrarian_thread or not contrarian_thread.is_alive():
+        return jsonify({"error": "Contrarian engine not running"}), 400
+
+    if not contrarian_paused.is_set():
+        return jsonify({"error": "Not paused"}), 400
+
+    contrarian_paused.clear()
+    print("[CONTRARIAN] RESUMED - Scanning for new fades again.", flush=True)
+    return jsonify({"success": True, "message": "Contrarian engine resumed"})
+
+
+@app.route('/api/contrarian/status')
+def api_contrarian_status():
+    """Get contrarian engine status."""
+    if not HAS_CONTRARIAN_ENGINE:
+        return jsonify({
+            "available": False, "running": False,
+            "error": "Module not available",
+        })
+
+    running = contrarian_thread and contrarian_thread.is_alive()
+    status = {
+        "available": True,
+        "running": running,
+        "paused": contrarian_paused.is_set() if running else False,
+    }
+
+    if contrarian_engine:
+        status.update(contrarian_engine.get_stats())
+
+    return jsonify(status)
+
+
+@app.route('/api/contrarian/settings', methods=['POST'])
+def api_contrarian_settings():
+    """Update contrarian engine settings at runtime."""
+    if not contrarian_engine:
+        return jsonify({"error": "Contrarian engine not running"}), 400
+
+    data = request.get_json() or {}
+    changes = []
+
+    if 'trigger_price' in data:
+        old = contrarian_engine.trigger_price
+        contrarian_engine.trigger_price = float(data['trigger_price'])
+        contrarian_engine.min_entry_price = float(data['trigger_price'])
+        changes.append(
+            f"trigger_price: {old * 100:.0f}¢ -> "
+            f"{contrarian_engine.trigger_price * 100:.0f}¢"
+        )
+
+    if 'bet_amount' in data:
+        old = contrarian_engine.bet_amount
+        contrarian_engine.bet_amount = float(data['bet_amount'])
+        changes.append(
+            f"bet_amount: ${old:.2f} -> ${contrarian_engine.bet_amount:.2f}"
+        )
+
+    if 'coin_bet_amounts' in data:
+        for coin, amt in data['coin_bet_amounts'].items():
+            old = contrarian_engine.coin_bet_amounts.get(
+                coin, contrarian_engine.bet_amount
+            )
+            contrarian_engine.coin_bet_amounts[coin] = float(amt)
+            changes.append(f"{coin.upper()} lot: ${old:.2f} -> ${float(amt):.2f}")
+
+    if not changes:
+        return jsonify({"error": "No settings provided"}), 400
+
+    return jsonify({
+        "success": True,
+        "changes": changes,
+        "current": contrarian_engine.get_stats(),
+    })
+
+
+@app.route('/api/contrarian/trades')
+def api_contrarian_trades():
+    """Get contrarian fade engine trade history."""
+    limit = int(request.args.get('limit', 50))
+    trades = list(contrarian_trades)[-limit:]
     trades.reverse()
     return jsonify(trades)
 
