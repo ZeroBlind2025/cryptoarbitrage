@@ -121,6 +121,13 @@ FOLLOW_UP_COOLDOWN = int(os.getenv("MOMENTUM_FOLLOW_UP_COOLDOWN", "30"))
 FOLLOW_UP_COOLDOWN_15M = int(os.getenv("MOMENTUM_15m_COOLDOWN", "240"))  # 4 minutes for 15m markets
 REENTRY_MIN_PRICE = float(os.getenv("MOMENTUM_REENTRY_MIN_PRICE", "0.80"))  # only re-enter once momentum is confirmed (price >= 80¢)
 
+# Lot-size multiplier applied to every entry AFTER the initial probe.
+# Example: coin_bet_amount=$2, multiplier=2.5 → probe is $2, each
+# subsequent entry (opposite-side or same-side re-entry) is $5.  This
+# lets us recoup the losing probe when momentum confirms on the other
+# side, without requiring a separate per-coin config.
+REENTRY_LOT_MULTIPLIER = float(os.getenv("MOMENTUM_REENTRY_LOT_MULTIPLIER", "2.5"))
+
 # Take-profit floor: when an open position's live ask reaches this price,
 # sell at market and lock in the gain.  Avoids riding a winning position
 # all the way to resolution and risking a last-second reversal.
@@ -868,6 +875,11 @@ class MomentumEngine:
         self.market_entry_count: dict = {}
         self.hedged_markets: set = set()  # condition_ids already arb-hedged
         self.last_trade_time: dict = {}  # (condition_id, token_id) → epoch timestamp
+        # Tracks which side of each market was the initial probe entry.
+        # Maps condition_id -> token_id of the FIRST entry in the market.
+        # The probe side never re-enters; only the opposite side can
+        # stack additional entries (bounded by MAX_ENTRIES_PER_MARKET).
+        self.probe_token_by_cid: dict = {}
 
         # Position tracking — share the same dict as copy trader when available
         # so both engines' trades appear in the combined P&L / balance chart
@@ -943,8 +955,9 @@ class MomentumEngine:
                 print(f"    {', '.join(other)}: global range ({self.min_entry_price*100:.0f}-{self.max_entry_price*100:.0f}¢)")
         print(f"  Markets: {', '.join(INTERVALS) if INTERVALS else 'NONE (all disabled!)'}")
         print(f"  Hedge: {'ENABLED' if MOMENTUM_HEDGE_ENABLE else 'DISABLED'} | gap: {MOMENTUM_HEDGE_PCT:.0f}¢")
-        print(f"  Re-entry: upward only, max {self.max_entries_per_market} entries/market")
+        print(f"  Re-entry: probe side LOCKED (0 re-entries), opposite side max {self.max_entries_per_market} entries")
         print(f"  Re-entry confirmation floor: {REENTRY_MIN_PRICE*100:.0f}¢ (MOMENTUM_REENTRY_MIN_PRICE)")
+        print(f"  Re-entry lot multiplier: {REENTRY_LOT_MULTIPLIER}x (MOMENTUM_REENTRY_LOT_MULTIPLIER) — probe lot * {REENTRY_LOT_MULTIPLIER}")
         print(f"  Cooldown: {FOLLOW_UP_COOLDOWN}s (5m) / {FOLLOW_UP_COOLDOWN_15M}s (15m) — one-shot, gates 2nd market entry only")
         if 0 < TAKE_PROFIT_PRICE < 1:
             print(f"  Take profit: ENABLED @ {TAKE_PROFIT_PRICE*100:.0f}¢ (MOMENTUM_TAKE_PROFIT)")
@@ -972,10 +985,15 @@ class MomentumEngine:
 
         self._start_ws()
 
-        # Seed entered_markets from existing open positions
-        for pos in self.positions.get("open", []):
-            if pos.get("source") != "momentum":
-                continue
+        # Seed entered_markets from existing open positions.  We also
+        # seed probe_token_by_cid from whichever momentum position on
+        # each condition_id has the oldest timestamp — that's the probe.
+        momentum_positions = [
+            p for p in self.positions.get("open", [])
+            if p.get("source") == "momentum"
+        ]
+        momentum_positions.sort(key=lambda p: p.get("timestamp", ""))
+        for pos in momentum_positions:
             cid = pos.get("condition_id", "")
             tid = pos.get("token_id", "")
             ep = pos.get("entry_price", 0)
@@ -985,6 +1003,9 @@ class MomentumEngine:
                 # so this is the safest conservative default
                 self.entered_markets[mk] = ep
                 self.market_entry_count[mk] = self.market_entry_count.get(mk, 0) + 1
+                # First-seen (oldest) entry on this condition is the probe
+                if cid not in self.probe_token_by_cid:
+                    self.probe_token_by_cid[cid] = tid
         # Seed hedged_markets from existing arb_hedge positions
         for pos in self.positions.get("open", []):
             if pos.get("source") == "arb_hedge":
@@ -1752,6 +1773,21 @@ class MomentumEngine:
                     if condition_id in self.hedged_markets:
                         continue
 
+                    # --- PROBE SIDE NEVER RE-ENTERS ---
+                    # The side we first entered in this market (the probe)
+                    # is one-and-done, regardless of MAX_ENTRIES_PER_MARKET.
+                    # Only the opposite side — which triggers OPP-ENTRY at
+                    # the 80¢ floor — can stack additional entries.
+                    probe_tid = self.probe_token_by_cid.get(condition_id)
+                    if probe_tid == token_id:
+                        if self.scans_completed % 30 == 1:
+                            print(
+                                f"  PROBE SIDE LOCKED {_mkt_label} {outcome} "
+                                f"@ {price*100:.1f}¢: probe side never re-enters",
+                                flush=True,
+                            )
+                        continue
+
                     # --- RE-ENTRY GATE: allow re-entry if under max entries ---
                     entry_count = self.market_entry_count.get(market_key, 0)
                     if entry_count >= self.max_entries_per_market:
@@ -1766,7 +1802,19 @@ class MomentumEngine:
 
                 # --- ENTER THE TRADE (probe / re-entry / opposite-side) ---
                 full_lot = self.coin_bet_amounts.get(coin, self.bet_amount)
-                trade_amount = PROBE_AMOUNT if not getattr(self, '_dry_run_no_probe', False) else full_lot
+                # Probe = first entry in the market.  Everything after
+                # (same-side re-entry OR opposite-side first-entry OR
+                # opposite-side re-entry) gets the REENTRY_LOT_MULTIPLIER
+                # size.  Default 2.5x — buy probe at $2, stack at $5.
+                is_probe = (
+                    market_key not in self.entered_markets
+                    and opposite_key not in self.entered_markets
+                )
+                if is_probe:
+                    trade_amount = round(full_lot, 2)
+                else:
+                    trade_amount = round(full_lot * REENTRY_LOT_MULTIPLIER, 2)
+
                 title = (question or slug)[:50]
                 if is_opposite_first_entry:
                     entry_type = "OPP-ENTRY"
@@ -1778,7 +1826,7 @@ class MomentumEngine:
                 print(f"\n[MOMENTUM] ENTERING {coin.upper()} {outcome} @ {price*100:.1f}¢ ({entry_type})", flush=True)
                 print(f"           Market: {title}", flush=True)
                 print(f"           Interval: {market['interval']}", flush=True)
-                print(f"           Amount: ${trade_amount:.2f} ({entry_type})", flush=True)
+                print(f"           Amount: ${trade_amount:.2f} ({entry_type}, lot×{1.0 if is_probe else REENTRY_LOT_MULTIPLIER})", flush=True)
 
                 trade_record = {
                     "id": f"momentum_{condition_id[:12]}_{oi}_{int(time.time())}",
@@ -1835,6 +1883,10 @@ class MomentumEngine:
                     self.entered_markets[market_key] = price
                     self.market_entry_count[market_key] = self.market_entry_count.get(market_key, 0) + 1
                     self.last_trade_time[market_key] = time.time()
+                    # If this was the first entry on this market, lock
+                    # this side in as the probe — it can't re-enter.
+                    if condition_id not in self.probe_token_by_cid:
+                        self.probe_token_by_cid[condition_id] = token_id
 
                     # Save position
                     position = {
