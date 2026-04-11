@@ -49,6 +49,7 @@ class PaperExecutor:
         # The dashboard shows both but labels MARK closes distinctly.
         self._realized_pnl = 0.0
         self._mark_pnl = 0.0
+        self._total_fees = 0.0   # cumulative taker fees paid (entry + exit)
         self._trade_count = 0
         self._wins = 0
         self._losses = 0
@@ -97,10 +98,21 @@ class PaperExecutor:
 
     def stats(self) -> dict:
         with self._lock:
+            gross_realized = self._realized_pnl
+            fees = self._total_fees
             return {
                 "open_exposure": self._open_exposure_dollars,
-                # Only resolution-based P/L is honest paper P/L.
-                "realized_pnl": self._realized_pnl,
+                # Resolution-based P/L — gross and net of fees.
+                # ``realized_pnl`` always reflects the NET number the
+                # dashboard should display as SESSION P/L (it's the
+                # money that would actually be in the wallet), while
+                # ``realized_pnl_gross`` is kept for diagnostic
+                # purposes and ``total_fees`` exposes what was paid
+                # away. When ``cfg.taker_fee_bps == 0`` these are
+                # identical.
+                "realized_pnl": gross_realized - fees,
+                "realized_pnl_gross": gross_realized,
+                "total_fees": fees,
                 # Mark-to-market P/L from early-exit closes. 0 in v1
                 # (early exits disabled by default) but tracked
                 # separately so it can never contaminate the
@@ -118,6 +130,38 @@ class PaperExecutor:
                 "resolved_wins": self._resolved_wins,
                 "resolved_losses": self._resolved_losses,
             }
+
+    def _fee_for(self, size_dollars: float, price: float) -> float:
+        """Polymarket taker fee on one leg at the given per-contract price.
+
+        The real Polymarket schedule (per the published table) is:
+
+            fee_usdc = (peak_bps / 2500) * size_dollars * (1 - price)
+
+        which peaks at ``peak_bps / 10_000`` of notional at
+        ``price = 0.5`` and falls toward zero at both tails. With
+        the default ``peak_bps = 180`` this matches the published
+        schedule exactly: $1.80 on a $50 trade at price 0.50,
+        $0.65 on a $10 trade at price 0.10, $0.07 on a $1 trade
+        at price 0.01, etc.
+
+        ``price`` is the side-local per-contract price:
+          - for a UP / YES entry, ``price = best_ask_yes``
+          - for a DOWN / NO entry, ``price = 1 - best_ask_yes``
+          - for a resolution settlement, ``price = 1.0`` (winning
+            side receives $1 per contract) — but Polymarket does
+            NOT charge fees on settlement, only on actual trades,
+            so callers pass ``price = None`` to skip the deduction.
+        """
+        if price is None:
+            return 0.0
+        peak_bps = getattr(self.cfg, "taker_fee_peak_bps", 0.0) or 0.0
+        if peak_bps <= 0:
+            return 0.0
+        p = float(price)
+        if p <= 0.0 or p >= 1.0:
+            return 0.0
+        return float(size_dollars) * (peak_bps / 2500.0) * (1.0 - p)
 
     # ------------------------------------------------------------------ #
     # Signal logging
@@ -240,8 +284,16 @@ class PaperExecutor:
         )
         market.open_position = pos
 
+        # Entry-leg Polymarket taker fee. Uses the real published
+        # schedule: fee = 0.072 * size * (1 - price) at the default
+        # peak_bps of 180. Price passed in is the side-local
+        # per-contract price (UP position -> ask_yes, DOWN position
+        # -> 1 - ask_yes). At resolution no fee is charged, so the
+        # settle_at_resolution path passes ``price=None``.
+        entry_fee = self._fee_for(dollars, entry_price)
         with self._lock:
             self._open_exposure_dollars += dollars
+            self._total_fees += entry_fee
 
         self._append(
             self.trade_log_path,
@@ -296,6 +348,10 @@ class PaperExecutor:
         pos.exit_reason = reason
         pos.realized_pnl = realized
 
+        # Early-exit mark-to-market close *is* a real trade on the
+        # real book (it's filled against the other side's best bid),
+        # so a taker fee applies at the side-local exit price.
+        exit_fee = self._fee_for(pos.size_dollars, exit_price)
         with self._lock:
             self._open_exposure_dollars = max(0.0, self._open_exposure_dollars - pos.size_dollars)
             # Mark-to-market close: tracked in ``_mark_pnl`` and the
@@ -305,6 +361,7 @@ class PaperExecutor:
             # dashboard's BALANCE / SESSION P/L numbers only reflect
             # settlements against actual outcomes.
             self._mark_pnl += realized
+            self._total_fees += exit_fee
             self._trade_count += 1
             if realized > 0:
                 self._wins += 1
@@ -360,8 +417,14 @@ class PaperExecutor:
         pos.exit_reason = "resolution"
         pos.realized_pnl = realized
 
+        # Settlement against the true outcome does NOT incur a
+        # trading fee on Polymarket (it's an on-chain payout, not a
+        # trade), so pass ``price=None`` and ``_fee_for`` returns 0.
+        # We still stamp ``_total_fees`` unchanged for symmetry.
+        settle_fee = self._fee_for(pos.size_dollars, None)
         with self._lock:
             self._open_exposure_dollars = max(0.0, self._open_exposure_dollars - pos.size_dollars)
+            self._total_fees += settle_fee
             # True resolution P/L — the only honest paper P/L in v1.
             self._realized_pnl += realized
             self._trade_count += 1

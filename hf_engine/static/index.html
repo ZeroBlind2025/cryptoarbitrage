@@ -124,10 +124,15 @@ function render() {
 
   // Stats
   const pendingCount = s.pendingCount || 0;
+  const grossPnl = s.gross_pnl != null ? s.gross_pnl : s.totalPnl;
+  const totalFees = s.total_fees || 0;
+  const pnlSub = totalFees > 0
+    ? `gross ${ps(grossPnl)}$${fmt(Math.abs(grossPnl),2)} · fees $${fmt(totalFees,2)}`
+    : null;
   const statGrid = h('div', { class:'stat-grid', style: { gridTemplateColumns:'repeat(8,1fr)' }});
   const stats = [
     ['BALANCE', `$${fmt(s.balance)}`, null, '#f8fafc'],
-    ['SESSION P/L', `${ps(s.totalPnl)}$${fmt(Math.abs(s.totalPnl),3)}`, null, pc(s.totalPnl)],
+    ['SESSION P/L', `${ps(s.totalPnl)}$${fmt(Math.abs(s.totalPnl),3)}`, pnlSub, pc(s.totalPnl)],
     ['RESOLVED', String(s.totalTrades), `${s.totalWins}W / ${s.totalTrades-s.totalWins}L`, '#f8fafc'],
     ['WIN RATE', wr==='—'?'—':`${wr}%`, null, wr!=='—'&&parseFloat(wr)>=50?'#10b981':'#ef4444'],
     ['ACTIVE', String(s.activeCount), `${s.positionCount} positioned`, '#f8fafc'],

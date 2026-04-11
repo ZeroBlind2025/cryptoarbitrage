@@ -144,6 +144,12 @@ def snapshot(engine) -> Dict[str, Any]:
         "totalWins": total_wins,
         "totalLosses": int(ex_stats.get("resolved_losses", 0)),
         "mark_pnl": float(ex_stats.get("mark_pnl", 0.0)),
+        # Gross vs net: ``totalPnl`` (reused for BALANCE too) is
+        # already net of Polymarket taker fees. Expose the gross
+        # number and the fee total separately so the dashboard can
+        # show them side by side.
+        "gross_pnl": float(ex_stats.get("realized_pnl_gross", total_pnl)),
+        "total_fees": float(ex_stats.get("total_fees", 0.0)),
         "balance": PAPER_STARTING_BALANCE + total_pnl,
         "early_exit_enabled": engine.cfg.early_exit_enabled,
         "activeCount": len(active),
