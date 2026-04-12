@@ -630,6 +630,8 @@ class SimpleMomentumEngine(InformedMoneyEngine):
         sl_spent = 0.0
         sl_proceeds = 0.0
         tp_count = 0
+        tp_spent = 0.0
+        tp_proceeds = 0.0
         for p in resolved:
             if p.get("result") == "STOP_LOSS":
                 sl_count += 1
@@ -637,11 +639,15 @@ class SimpleMomentumEngine(InformedMoneyEngine):
                 sl_proceeds += float(p.get("proceeds", 0) or 0)
             elif p.get("result") == "TAKE_PROFIT":
                 tp_count += 1
+                tp_spent += float(p.get("amount", 0) or 0)
+                tp_proceeds += float(p.get("proceeds", 0) or 0)
 
         stats["stop_losses"] = sl_count
         stats["sl_spent"] = sl_spent
         stats["sl_proceeds"] = sl_proceeds
         stats["take_profits"] = tp_count
+        stats["tp_spent"] = tp_spent
+        stats["tp_proceeds"] = tp_proceeds
 
         # Filter balance history to simple_momentum events
         all_history = self.positions.get("stats", {}).get("balance_history", [])

@@ -2335,7 +2335,7 @@ class MomentumEngine:
             result = pos.get("result", "")
             coin_data[coin]["deployed"] += amount
             coin_data[coin]["pnl"] += pnl
-            if result == "WIN":
+            if result in ("WIN", "TAKE_PROFIT"):
                 coin_data[coin]["wins"] += 1
                 coin_data[coin]["results"].append("W")
             elif result in ("LOSS", "STOP_LOSS"):

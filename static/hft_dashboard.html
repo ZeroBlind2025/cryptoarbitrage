@@ -1451,6 +1451,14 @@
                                                 {momentum.stop_losses || 0}{(momentum.sl_spent || 0) > 0 ? ` (lost $${((momentum.sl_spent || 0) - (momentum.sl_proceeds || 0)).toFixed(2)}, recovered $${(momentum.sl_proceeds || 0).toFixed(2)})` : ''}
                                             </span>
                                         </div>
+                                        {(momentum.take_profits > 0 || momentum.tp_proceeds > 0) && (
+                                            <div className="flex justify-between">
+                                                <span className="text-green-400">Take Profits</span>
+                                                <span className="text-green-400 font-mono">
+                                                    {momentum.take_profits || 0}{(momentum.tp_proceeds || 0) > 0 ? ` (+$${(momentum.tp_proceeds - momentum.tp_spent).toFixed(2)}, returned $${(momentum.tp_proceeds || 0).toFixed(2)})` : ''}
+                                                </span>
+                                            </div>
+                                        )}
                                         <div className="flex justify-between">
                                             <span className="text-slate-400">Entry Range</span>
                                             <span className="text-white font-mono">
