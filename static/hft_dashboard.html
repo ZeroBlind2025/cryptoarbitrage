@@ -983,7 +983,7 @@
                                                     trade={trade}
                                                     isNew={newTradeIds.has(trade.id)}
                                                 />
-                                            ) : trade.source === 'momentum' ? (
+                                            ) : (trade.source === 'momentum' || trade.source === 'simple_momentum') ? (
                                                 <div key={trade.id} className={`bg-slate-800/30 rounded-lg p-3 border border-slate-700/50 hover:border-orange-500/30 transition-all ${newTradeIds.has(trade.id) ? 'flash-green' : ''}`}>
                                                     <div className="flex items-center justify-between mb-2">
                                                         <div className="flex items-center gap-2">
