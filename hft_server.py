@@ -2111,8 +2111,9 @@ def api_momentum_start():
     live_mode = data.get('live', False)
     bet_amount = data.get('bet_amount')
     coin_bet_amounts = data.get('coin_bet_amounts')
-    min_entry = data.get('min_entry_price')
+    trigger_price = data.get('trigger_price') or data.get('min_entry_price')
     stop_loss_pct = data.get('stop_loss_pct')
+    take_profit_pct = data.get('take_profit_pct')
 
     if live_mode and not data.get('confirm_live'):
         return jsonify({
@@ -2137,10 +2138,13 @@ def api_momentum_start():
             coin_bet_amounts=coin_bet_amounts,
             shared_positions=shared_pos,
         )
-        if min_entry is not None:
-            momentum_engine.min_entry_price = float(min_entry)
+        if trigger_price is not None:
+            momentum_engine.trigger_price = float(trigger_price)
+            momentum_engine.min_entry_price = float(trigger_price)
         if stop_loss_pct is not None:
             momentum_engine.stop_loss_pct = float(stop_loss_pct)
+        if take_profit_pct is not None:
+            momentum_engine.take_profit_pct = float(take_profit_pct)
         momentum_engine.start()
     except Exception as e:
         print(f"[SERVER] Failed to start momentum engine: {e}")
@@ -2165,7 +2169,8 @@ def api_momentum_start():
     return jsonify({
         "success": True,
         "message": f"Simple momentum engine started in {mode_str} mode",
-        "min_entry_price": momentum_engine.min_entry_price,
+        "trigger_price": momentum_engine.trigger_price,
+        "take_profit_pct": momentum_engine.take_profit_pct,
         "stop_loss_pct": momentum_engine.stop_loss_pct,
         "copy_trader_paused": copy_trader_was_active,
     })
@@ -2269,10 +2274,17 @@ def api_momentum_settings():
     data = request.get_json() or {}
     changes = []
 
-    if 'min_entry_price' in data:
-        old = momentum_engine.min_entry_price
-        momentum_engine.min_entry_price = float(data['min_entry_price'])
-        changes.append(f"min_entry: {old*100:.0f}¢ -> {momentum_engine.min_entry_price*100:.0f}¢")
+    if 'trigger_price' in data or 'min_entry_price' in data:
+        val = float(data.get('trigger_price', data.get('min_entry_price')))
+        old = getattr(momentum_engine, 'trigger_price', momentum_engine.min_entry_price)
+        momentum_engine.trigger_price = val
+        momentum_engine.min_entry_price = val
+        changes.append(f"trigger: {old*100:.0f}c -> {val*100:.0f}c")
+
+    if 'take_profit_pct' in data:
+        old = getattr(momentum_engine, 'take_profit_pct', 0)
+        momentum_engine.take_profit_pct = float(data['take_profit_pct'])
+        changes.append(f"take_profit: {old:.1f}% -> {momentum_engine.take_profit_pct:.1f}%")
 
     if 'stop_loss_pct' in data:
         old = getattr(momentum_engine, 'stop_loss_pct', 0)

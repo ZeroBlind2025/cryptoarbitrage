@@ -1,22 +1,20 @@
 #!/usr/bin/env python3
 """
-SIMPLE MOMENTUM ENGINE
-=======================
+SIMPLE MOMENTUM ENGINE — FADE STRATEGY
+========================================
 
-Stripped-down momentum engine testing a single hypothesis:
-enter any market when the WS price crosses 75¢, stop loss at
-12% off entry.  That's it.
+When either side of a market crosses 65¢, buy the OPPOSITE side.
+Take profit at +30%, stop loss at -15%.  One entry per market.
 
-Rules:
-  - Enter when price >= 75¢ (SIMPLE_MIN_ENTRY_PRICE)
-  - Stop loss at 12% below ENTRY price (fixed, not trailing)
-  - One entry per market total — no re-entries, no hedges,
-    no cooldowns, no no-trade hours, no per-interval brackets
+Example: UP hits 66¢ → buy DOWN at ~34¢
+  - TP triggers at 34¢ * 1.30 = ~44¢
+  - SL triggers at 34¢ * 0.85 = ~29¢
+
+No re-entries, no hedges, no cooldowns, no per-interval brackets.
 
 Subclasses InformedMoneyEngine to reuse market discovery,
 WebSocket streaming, CLOB REST cache, resolution logic and
-per-source stats.  Overrides scan_and_trade (same-side entry)
-and check_stop_losses (12% fixed from entry).
+per-source stats.
 """
 
 import os
@@ -28,7 +26,6 @@ from typing import Optional
 from copy_trader import (
     ALGO_STARTING_BALANCE,
     PRICE_BUFFER_BPS,
-    STOP_LOSS_PCT,
     detect_coin,
     get_clob_client,
     place_bet,
@@ -48,14 +45,14 @@ from informed_money_engine import InformedMoneyEngine
 # CONFIGURATION
 # =============================================================================
 
-# Minimum price to enter — 75¢ on either side
-SIMPLE_MIN_ENTRY_PRICE = float(os.getenv("SIMPLE_MIN_ENTRY_PRICE", "0.75"))
+# Trigger price — when either side crosses this, fade the opposite
+SIMPLE_TRIGGER_PRICE = float(os.getenv("SIMPLE_TRIGGER_PRICE", "0.65"))
 
-# Sanity cap — avoid buying outcomes that are essentially already resolved
-SIMPLE_MAX_ENTRY_PRICE = float(os.getenv("SIMPLE_MAX_ENTRY_PRICE", "0.99"))
+# Take profit: sell when price rises this % above ENTRY price
+SIMPLE_TAKE_PROFIT_PCT = float(os.getenv("SIMPLE_TAKE_PROFIT_PCT", "30"))
 
-# Fixed stop loss: sell when price drops this % below ENTRY price
-SIMPLE_STOP_LOSS_PCT = float(os.getenv("SIMPLE_STOP_LOSS_PCT", "12"))
+# Stop loss: sell when price drops this % below ENTRY price
+SIMPLE_STOP_LOSS_PCT = float(os.getenv("SIMPLE_STOP_LOSS_PCT", "15"))
 
 # How often the background loop ticks
 POLL_INTERVAL = int(os.getenv("SIMPLE_POLL_INTERVAL", "1"))
@@ -66,7 +63,8 @@ POLL_INTERVAL = int(os.getenv("SIMPLE_POLL_INTERVAL", "1"))
 # =============================================================================
 
 class SimpleMomentumEngine(InformedMoneyEngine):
-    """Bare-bones momentum engine: enter >= 75¢, stop loss 12% from entry.
+    """Fade engine with TP/SL: trigger >= 65¢ → buy opposite side,
+    take profit +30%, stop loss -15%.
 
     Inherits market discovery, WS prices, CLOB REST fallback, resolution
     and per-source stats from InformedMoneyEngine/MomentumEngine.
@@ -76,8 +74,10 @@ class SimpleMomentumEngine(InformedMoneyEngine):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.min_entry_price = SIMPLE_MIN_ENTRY_PRICE
-        self.max_entry_price = SIMPLE_MAX_ENTRY_PRICE
+        self.trigger_price = SIMPLE_TRIGGER_PRICE
+        self.min_entry_price = SIMPLE_TRIGGER_PRICE
+        self.max_entry_price = 1.0
+        self.take_profit_pct = SIMPLE_TAKE_PROFIT_PCT
         self.stop_loss_pct = SIMPLE_STOP_LOSS_PCT
         # No per-interval brackets
         self.interval_price_brackets = {}
@@ -103,16 +103,16 @@ class SimpleMomentumEngine(InformedMoneyEngine):
         print("#" + "  SIMPLE MOMENTUM ENGINE  —  STARTING".center(68) + "#")
         print("#" + " " * 68 + "#")
         print("#" * 70)
-        print(f"  Class:     {type(self).__name__}")
-        print(f"  Entry:     price >= {self.min_entry_price * 100:.0f}c "
-              f"on EITHER side")
-        print(f"  Sanity:    price < {self.max_entry_price * 100:.0f}c")
-        print(f"  Stop loss: {self.stop_loss_pct:.0f}% below entry (fixed)")
-        print("  Re-entry:  DISABLED (one entry per market)")
-        print(f"  Lot sizes: {lot_sizes} (default: ${self.bet_amount})")
-        print(f"  Balance:   ${balance:.2f}")
-        print(f"  Mode:      {'DRY RUN' if self.dry_run else 'LIVE'}")
-        print(f"  Poll:      {POLL_INTERVAL}s")
+        print(f"  Class:       {type(self).__name__}")
+        print(f"  Strategy:    FADE — trigger >= {self.trigger_price * 100:.0f}c, "
+              f"buy OPPOSITE side")
+        print(f"  Take profit: +{self.take_profit_pct:.0f}% above entry")
+        print(f"  Stop loss:   -{self.stop_loss_pct:.0f}% below entry (fixed)")
+        print("  Re-entry:    DISABLED (one entry per market)")
+        print(f"  Lot sizes:   {lot_sizes} (default: ${self.bet_amount})")
+        print(f"  Balance:     ${balance:.2f}")
+        print(f"  Mode:        {'DRY RUN' if self.dry_run else 'LIVE'}")
+        print(f"  Poll:        {POLL_INTERVAL}s")
         print("#" * 70 + "\n", flush=True)
 
         if not self.dry_run:
@@ -143,16 +143,15 @@ class SimpleMomentumEngine(InformedMoneyEngine):
                   f"open entries from positions file", flush=True)
 
     # -------------------------------------------------------------------------
-    # Main scan/entry loop
+    # Main scan/entry loop — FADE: trigger side >= 65c → buy opposite
     # -------------------------------------------------------------------------
 
     def scan_and_trade(self) -> int:
-        """Enter any market where either side prices >= 75c.
+        """When a side crosses trigger price, buy the OPPOSITE side.
 
         Guards:
-          1. price >= min_entry_price
-          2. price < max_entry_price (sanity cap)
-          3. neither side of this market has been bought yet
+          1. trigger side price >= trigger_price (65c)
+          2. one entry per market (condition_id level)
         """
         self.scans_completed += 1
 
@@ -241,70 +240,97 @@ class SimpleMomentumEngine(InformedMoneyEngine):
 
             _mkt_label = f"{coin.upper()}_{market['interval']} {slug[:30]}"
 
-            # Check each side
-            for oi in range(2):
-                outcome = market["outcomes"][oi]
-                token_id = market["token_ids"][oi]
-                gamma_price = market["prices"][oi]
+            # --- Scan both sides for the trigger, fade on first hit ---
+            for trigger_oi in range(2):
+                trigger_outcome = market["outcomes"][trigger_oi]
+                trigger_token_id = market["token_ids"][trigger_oi]
+                trigger_gamma = market["prices"][trigger_oi]
 
-                live_price = self.get_live_price(token_id)
-                price = live_price if live_price is not None else gamma_price
-                if price is None:
+                trigger_live = self.get_live_price(trigger_token_id)
+                trigger_price = (
+                    trigger_live if trigger_live is not None else trigger_gamma
+                )
+                if trigger_price is None:
                     continue
 
-                # --- GUARD: price >= 75c ---
-                if price < self.min_entry_price:
+                # Does this side cross the trigger?
+                if trigger_price < self.trigger_price:
                     continue
 
-                # --- GUARD: sanity cap ---
-                if price >= self.max_entry_price:
+                # --- TRIGGER HIT — fade the opposite side ---
+                fade_oi = 1 - trigger_oi
+                fade_outcome = market["outcomes"][fade_oi]
+                fade_token_id = market["token_ids"][fade_oi]
+                fade_gamma = market["prices"][fade_oi]
+
+                fade_live = self.get_live_price(fade_token_id)
+                fade_price = fade_live if fade_live is not None else fade_gamma
+                if fade_price is None:
+                    print(
+                        f"[SIMPLE] SKIP {_mkt_label}: "
+                        f"trigger {trigger_outcome} @ {trigger_price * 100:.1f}c "
+                        f"but no price for fade side {fade_outcome}",
+                        flush=True,
+                    )
                     continue
 
-                market_key = (condition_id, token_id)
-
-                # --- ENTER ---
-                full_lot = self.coin_bet_amounts.get(coin, self.bet_amount)
-                trade_amount = full_lot
+                trade_amount = self.coin_bet_amounts.get(coin, self.bet_amount)
                 title = (question or slug)[:50]
+                tp_price = fade_price * (1 + self.take_profit_pct / 100)
+                sl_price = fade_price * (1 - self.stop_loss_pct / 100)
 
-                print(f"\n[SIMPLE] ENTERING {coin.upper()} {outcome} "
-                      f"@ {price * 100:.1f}c", flush=True)
+                print(
+                    f"\n[SIMPLE] FADE {coin.upper()} "
+                    f"{trigger_outcome} @ {trigger_price * 100:.1f}c "
+                    f"-> buying {fade_outcome} @ {fade_price * 100:.1f}c",
+                    flush=True,
+                )
                 print(f"         Market:   {title}", flush=True)
                 print(f"         Interval: {market['interval']}", flush=True)
                 print(f"         Amount:   ${trade_amount:.2f}", flush=True)
+                print(f"         TP: {tp_price * 100:.1f}c (+{self.take_profit_pct:.0f}%) | "
+                      f"SL: {sl_price * 100:.1f}c (-{self.stop_loss_pct:.0f}%)",
+                      flush=True)
 
                 trade_record = {
-                    "id": f"simple_{condition_id[:12]}_{oi}_{int(time.time())}",
+                    "id": f"simple_{condition_id[:12]}_{fade_oi}_{int(time.time())}",
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                     "market": title,
                     "slug": slug,
-                    "outcome": outcome,
-                    "outcome_index": oi,
+                    "outcome": fade_outcome,
+                    "outcome_index": fade_oi,
                     "side": "BUY",
                     "amount": trade_amount,
                     "coin": coin,
-                    "price": price,
+                    "price": fade_price,
+                    "trigger_side": trigger_outcome,
+                    "trigger_price": trigger_price,
                     "interval": market["interval"],
                     "source": self.SOURCE_TAG,
                 }
 
                 if self.dry_run:
-                    print(f"         DRY RUN — would buy @ {price * 100:.1f}c",
-                          flush=True)
+                    print(
+                        f"         DRY RUN — would buy {fade_outcome} "
+                        f"@ {fade_price * 100:.1f}c",
+                        flush=True,
+                    )
                     trade_record["status"] = "dry_run"
                     entered += 1
                 else:
                     buffer = PRICE_BUFFER_BPS / 10000
-                    max_price = min(price * (1 + buffer), 0.99)
+                    max_price = min(fade_price * (1 + buffer), 0.99)
                     fill = place_bet(
-                        self.client, token_id, trade_amount, max_price=max_price
+                        self.client, fade_token_id, trade_amount, max_price=max_price
                     )
                     if fill.get("success"):
                         if fill.get("fill_price"):
-                            price = fill["fill_price"]
-                            trade_record["price"] = price
-                        print(f"         EXECUTED @ {price * 100:.1f}c",
-                              flush=True)
+                            fade_price = fill["fill_price"]
+                            trade_record["price"] = fade_price
+                        print(
+                            f"         EXECUTED @ {fade_price * 100:.1f}c",
+                            flush=True,
+                        )
                         trade_record["status"] = "filled"
                         entered += 1
                         self.total_spent += trade_amount
@@ -317,20 +343,23 @@ class SimpleMomentumEngine(InformedMoneyEngine):
                     "id": trade_record["id"],
                     "coin": coin,
                     "interval": market["interval"],
-                    "outcome": outcome,
-                    "price": price,
+                    "outcome": fade_outcome,
+                    "price": fade_price,
+                    "trigger_side": trigger_outcome,
+                    "trigger_price": trigger_price,
                     "amount": trade_amount,
                     "slug": slug,
                     "market": title,
                     "condition_id": condition_id,
-                    "token_id": token_id,
+                    "token_id": fade_token_id,
                     "minutes_until_close": minutes_left,
                     "engine": "simple_momentum",
                 })
 
                 if trade_record["status"] in ("filled", "dry_run"):
                     self.entered_condition_ids.add(condition_id)
-                    self.entered_markets[market_key] = price
+                    market_key = (condition_id, fade_token_id)
+                    self.entered_markets[market_key] = fade_price
                     self.market_entry_count[market_key] = 1
                     self.last_trade_time[market_key] = time.time()
 
@@ -338,19 +367,22 @@ class SimpleMomentumEngine(InformedMoneyEngine):
                         "id": trade_record["id"],
                         "timestamp": trade_record["timestamp"],
                         "condition_id": condition_id,
-                        "token_id": token_id,
-                        "outcome_index": oi,
-                        "outcome": outcome,
+                        "token_id": fade_token_id,
+                        "outcome_index": fade_oi,
+                        "outcome": fade_outcome,
                         "market": title,
                         "slug": slug,
                         "interval": market.get("interval", ""),
                         "end_date": end_date.isoformat() if end_date else None,
-                        "entry_price": price,
-                        "peak_price": price,
+                        "entry_price": fade_price,
                         "amount": trade_amount,
-                        "potential_payout": trade_amount / price if price > 0 else 0,
+                        "potential_payout": (
+                            trade_amount / fade_price if fade_price > 0 else 0
+                        ),
                         "dry_run": self.dry_run,
                         "source": self.SOURCE_TAG,
+                        "trigger_side": trigger_outcome,
+                        "trigger_price": trigger_price,
                     }
                     self.positions["open"].append(position)
 
@@ -369,16 +401,20 @@ class SimpleMomentumEngine(InformedMoneyEngine):
                             "pnl": stats.get("total_pnl", 0.0),
                             "equity": stats["balance"] + open_staked,
                             "event": "simple_momentum_trade",
-                            "detail": f"{coin.upper()} {outcome} {title[:30]}",
+                            "detail": (
+                                f"FADE {coin.upper()} {trigger_outcome} "
+                                f"-> {fade_outcome} {title[:30]}"
+                            ),
                         })
                     except Exception:
                         pass
 
                     save_positions(self.positions)
-                    print(f"         Position saved. Balance: "
-                          f"${self.positions['stats'].get('balance', 0):.2f}",
-                          flush=True)
-
+                    print(
+                        f"         Position saved. Balance: "
+                        f"${self.positions['stats'].get('balance', 0):.2f}",
+                        flush=True,
+                    )
                     self.trades_entered += 1
 
                     if self.on_trade:
@@ -387,23 +423,21 @@ class SimpleMomentumEngine(InformedMoneyEngine):
                         except Exception as e:
                             print(f"[SIMPLE] Callback error: {e}", flush=True)
 
-                    # One entry per market — stop checking the other side
+                    # One entry per market — break out of the side loop
                     break
 
         return entered
 
     # -------------------------------------------------------------------------
-    # Stop loss — 12% fixed from entry price (NOT trailing)
+    # TP / SL — check both take profit and stop loss every tick
     # -------------------------------------------------------------------------
 
     def check_stop_losses(self) -> int:
-        """Sell when price drops SIMPLE_STOP_LOSS_PCT% below entry price.
+        """Check take profit (+30%) and stop loss (-15%) on all open positions.
 
-        Fixed stop (not trailing): threshold = entry_price * (1 - pct/100).
+        Fixed from entry price (not trailing).
+        Returns number of positions closed (TP + SL combined).
         """
-        if self.stop_loss_pct <= 0:
-            return 0
-
         open_positions = self.positions.get("open", [])
         our_positions = [
             p for p in open_positions if p.get("source") == self.SOURCE_TAG
@@ -411,9 +445,10 @@ class SimpleMomentumEngine(InformedMoneyEngine):
         if not our_positions:
             return 0
 
-        stopped = 0
+        closed = 0
         no_price_count = 0
-        threshold_mult = 1 - (self.stop_loss_pct / 100)  # 0.875 for 12.5%
+        sl_mult = 1 - (self.stop_loss_pct / 100)   # 0.85 for 15%
+        tp_mult = 1 + (self.take_profit_pct / 100)  # 1.30 for 30%
 
         for position in our_positions[:]:
             entry_price = position.get("entry_price", 0)
@@ -426,39 +461,49 @@ class SimpleMomentumEngine(InformedMoneyEngine):
                 no_price_count += 1
                 continue
 
-            stop_price = entry_price * threshold_mult
-            if live_price >= stop_price:
+            sl_price = entry_price * sl_mult
+            tp_price = entry_price * tp_mult
+
+            # Check which triggered
+            if live_price >= tp_price:
+                reason = "TAKE_PROFIT"
+                pct_move = (live_price / entry_price - 1) * 100
+                label = f"TP +{pct_move:.1f}%"
+            elif live_price <= sl_price:
+                reason = "STOP_LOSS"
+                pct_move = (1 - live_price / entry_price) * 100
+                label = f"SL -{pct_move:.1f}%"
+            else:
                 continue
 
-            # --- STOP LOSS TRIGGERED ---
+            # --- TRIGGERED ---
             condition_id = position.get("condition_id", "")
             shares = position.get("potential_payout", 0)
             title = position.get("market", "Unknown")[:50]
             outcome = position.get("outcome", "?")
             amount_spent = position.get("amount", 0)
             coin = detect_coin(position.get("slug", ""), title)
-            drop_from_entry = (1 - live_price / entry_price) * 100
 
-            print(f"\n[SIMPLE] *** STOP LOSS TRIGGERED ***", flush=True)
+            print(f"\n[SIMPLE] *** {reason} TRIGGERED ***", flush=True)
             print(f"         Market: {title}", flush=True)
             print(f"         {outcome} | Entry: {entry_price*100:.1f}c | "
-                  f"Now: {live_price*100:.1f}c "
-                  f"({drop_from_entry:.1f}% from entry)", flush=True)
-            print(f"         Stop level: {stop_price*100:.1f}c "
-                  f"(-{self.stop_loss_pct:.0f}% from entry)", flush=True)
+                  f"Now: {live_price*100:.1f}c ({label})", flush=True)
+            print(f"         TP: {tp_price*100:.1f}c | SL: {sl_price*100:.1f}c",
+                  flush=True)
             print(f"         Selling {shares:.2f} shares", flush=True)
 
             trade_record = {
-                "id": f"simple_sl_{position.get('id', '')}_{int(time.time())}",
+                "id": f"simple_{reason.lower()}_{position.get('id', '')}_{int(time.time())}",
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "market": title,
                 "slug": position.get("slug", ""),
                 "outcome": outcome,
                 "side": "SELL",
-                "reason": "stop_loss",
+                "reason": reason.lower(),
                 "shares": shares,
                 "entry_price": entry_price,
-                "stop_price": stop_price,
+                "tp_price": tp_price,
+                "sl_price": sl_price,
                 "trigger_price": live_price,
                 "coin": coin,
                 "source": self.SOURCE_TAG,
@@ -474,10 +519,10 @@ class SimpleMomentumEngine(InformedMoneyEngine):
                         trade_record["status"] = "filled"
                         fill_price = fill.get("fill_price") or live_price
                         trade_record["price"] = fill_price
-                        print(f"         STOP LOSS SELL EXECUTED! "
+                        print(f"         {reason} SELL EXECUTED! "
                               f"Fill: {fill_price:.4f}", flush=True)
                     else:
-                        print(f"         STOP LOSS SELL FAILED!", flush=True)
+                        print(f"         {reason} SELL FAILED!", flush=True)
                         trade_record["status"] = "failed"
                 else:
                     trade_record["status"] = "error"
@@ -491,8 +536,9 @@ class SimpleMomentumEngine(InformedMoneyEngine):
                     proceeds = 0
                     pnl = -amount_spent
 
-                position["result"] = "STOP_LOSS"
-                position["won"] = False
+                is_win = reason == "TAKE_PROFIT"
+                position["result"] = reason
+                position["won"] = is_win
                 position["pnl"] = pnl
                 position["proceeds"] = proceeds
                 position["sold_at"] = trade_record["timestamp"]
@@ -502,22 +548,25 @@ class SimpleMomentumEngine(InformedMoneyEngine):
                     stats = self.positions["stats"]
                     stats["total_pnl"] = stats.get("total_pnl", 0.0) + pnl
                     stats["balance"] = stats.get("balance", ALGO_STARTING_BALANCE) + proceeds
-                    stats["losses"] = stats.get("losses", 0) + 1
+                    if is_win:
+                        stats["wins"] = stats.get("wins", 0) + 1
+                    else:
+                        stats["losses"] = stats.get("losses", 0) + 1
                     open_staked = sum(
                         p.get("amount", 0)
                         for p in self.positions.get("open", [])
                         if p is not position
                     )
+                    event_type = "take_profit" if is_win else "stop_loss"
                     stats.setdefault("balance_history", []).append({
                         "timestamp": trade_record["timestamp"],
                         "balance": stats["balance"],
                         "pnl": stats["total_pnl"],
                         "equity": stats["balance"] + open_staked,
-                        "event": "simple_momentum_stop_loss",
+                        "event": f"simple_momentum_{event_type}",
                         "detail": (
-                            f"STOP LOSS {outcome} {title[:30]} "
-                            f"drop={drop_from_entry:.1f}% pnl={pnl:+.2f} "
-                            f"(returned ${proceeds:.2f})"
+                            f"{reason} {outcome} {title[:30]} "
+                            f"pnl={pnl:+.2f} (returned ${proceeds:.2f})"
                         ),
                     })
                 except Exception:
@@ -539,16 +588,16 @@ class SimpleMomentumEngine(InformedMoneyEngine):
                     "outcome": position.get("outcome", ""),
                     "entry_price": entry_price,
                     "amount": amount_spent,
-                    "result": "STOP_LOSS",
+                    "result": reason,
                     "pnl": pnl,
-                    "won": False,
+                    "won": is_win,
                     "slug": position.get("slug", ""),
                     "market": position.get("market", ""),
                     "condition_id": condition_id,
                     "engine": "simple_momentum",
                 })
 
-                stopped += 1
+                closed += 1
                 print(f"         PnL: {pnl:+.2f} | "
                       f"Balance: ${self.positions['stats'].get('balance', 0):.2f}",
                       flush=True)
@@ -556,10 +605,10 @@ class SimpleMomentumEngine(InformedMoneyEngine):
             self.trade_history.append(trade_record)
 
         if no_price_count > 0 and self.scans_completed % 60 == 0:
-            print(f"[SIMPLE] SL check: {len(our_positions)} positions, "
+            print(f"[SIMPLE] TP/SL check: {len(our_positions)} positions, "
                   f"{no_price_count} with no price data", flush=True)
 
-        return stopped
+        return closed
 
     # -------------------------------------------------------------------------
     # Stats
@@ -568,9 +617,11 @@ class SimpleMomentumEngine(InformedMoneyEngine):
     def get_stats(self) -> dict:
         stats = super().get_stats()
         stats["engine"] = "simple_momentum"
+        stats["trigger_price"] = self.trigger_price
+        stats["take_profit_pct"] = self.take_profit_pct
         stats["stop_loss_pct"] = self.stop_loss_pct
 
-        # Count stop losses and compute spent/proceeds from resolved positions
+        # Count stop losses / take profits from resolved positions
         resolved = [
             p for p in self.positions.get("resolved", [])
             if p.get("source") == self.SOURCE_TAG
@@ -578,15 +629,19 @@ class SimpleMomentumEngine(InformedMoneyEngine):
         sl_count = 0
         sl_spent = 0.0
         sl_proceeds = 0.0
+        tp_count = 0
         for p in resolved:
             if p.get("result") == "STOP_LOSS":
                 sl_count += 1
                 sl_spent += float(p.get("amount", 0) or 0)
                 sl_proceeds += float(p.get("proceeds", 0) or 0)
+            elif p.get("result") == "TAKE_PROFIT":
+                tp_count += 1
 
         stats["stop_losses"] = sl_count
         stats["sl_spent"] = sl_spent
         stats["sl_proceeds"] = sl_proceeds
+        stats["take_profits"] = tp_count
 
         # Filter balance history to simple_momentum events
         all_history = self.positions.get("stats", {}).get("balance_history", [])
