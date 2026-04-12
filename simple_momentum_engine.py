@@ -85,6 +85,11 @@ class SimpleMomentumEngine(InformedMoneyEngine):
         self.max_entries_per_market = 1
         # Track at condition_id level — structurally prevents both-sides entry
         self.entered_condition_ids: set = set()
+        # Per-coin strategy: True = fade underdog (buy opposite side),
+        # False = back leader (buy same side that hit trigger)
+        self.invert_by_coin: dict = {
+            "btc": True, "eth": True, "sol": True, "xrp": True,
+        }
 
     # -------------------------------------------------------------------------
     # Lifecycle
@@ -257,25 +262,41 @@ class SimpleMomentumEngine(InformedMoneyEngine):
                 if trigger_price < self.trigger_price:
                     continue
 
-                # --- TRIGGER HIT — fade the opposite side ---
-                fade_oi = 1 - trigger_oi
-                fade_outcome = market["outcomes"][fade_oi]
-                fade_token_id = market["token_ids"][fade_oi]
-                fade_gamma = market["prices"][fade_oi]
+                # --- TRIGGER HIT — decide which side to buy based on invert flag ---
+                # invert=True (default): fade the underdog → buy opposite side
+                # invert=False: back the leader → buy the trigger side itself
+                invert = self.invert_by_coin.get(coin, True)
 
-                fade_live = self.get_live_price(fade_token_id)
-                fade_price = fade_live if fade_live is not None else fade_gamma
+                if invert:
+                    # FADE: buy opposite side
+                    fade_oi = 1 - trigger_oi
+                    fade_outcome = market["outcomes"][fade_oi]
+                    fade_token_id = market["token_ids"][fade_oi]
+                    fade_gamma = market["prices"][fade_oi]
+                    fade_live = self.get_live_price(fade_token_id)
+                    fade_price = fade_live if fade_live is not None else fade_gamma
+                    mode_label = "FADE"
+                    price_cap = 0.35  # must be cheap
+                else:
+                    # BACK: buy trigger side itself
+                    fade_oi = trigger_oi
+                    fade_outcome = trigger_outcome
+                    fade_token_id = trigger_token_id
+                    fade_price = trigger_price
+                    mode_label = "BACK"
+                    price_cap = 0.90  # skip end-of-market entries
+
                 if fade_price is None:
                     print(
                         f"[SIMPLE] SKIP {_mkt_label}: "
                         f"trigger {trigger_outcome} @ {trigger_price * 100:.1f}c "
-                        f"but no price for fade side {fade_outcome}",
+                        f"but no price for buy side {fade_outcome}",
                         flush=True,
                     )
                     continue
 
-                # Hard cap: only enter fade side at <= 35c
-                if fade_price > 0.35:
+                # Hard cap per mode
+                if fade_price > price_cap:
                     continue
 
                 trade_amount = self.coin_bet_amounts.get(coin, self.bet_amount)
@@ -284,7 +305,7 @@ class SimpleMomentumEngine(InformedMoneyEngine):
                 sl_price = fade_price * (1 - self.stop_loss_pct / 100)
 
                 print(
-                    f"\n[SIMPLE] FADE {coin.upper()} "
+                    f"\n[SIMPLE] {mode_label} {coin.upper()} "
                     f"{trigger_outcome} @ {trigger_price * 100:.1f}c "
                     f"-> buying {fade_outcome} @ {fade_price * 100:.1f}c",
                     flush=True,
@@ -406,7 +427,7 @@ class SimpleMomentumEngine(InformedMoneyEngine):
                             "equity": stats["balance"] + open_staked,
                             "event": "simple_momentum_trade",
                             "detail": (
-                                f"FADE {coin.upper()} {trigger_outcome} "
+                                f"{mode_label} {coin.upper()} {trigger_outcome} "
                                 f"-> {fade_outcome} {title[:30]}"
                             ),
                         })
@@ -652,6 +673,7 @@ class SimpleMomentumEngine(InformedMoneyEngine):
         stats["take_profits"] = tp_count
         stats["tp_spent"] = tp_spent
         stats["tp_proceeds"] = tp_proceeds
+        stats["invert_by_coin"] = dict(self.invert_by_coin)
 
         # Filter balance history to simple_momentum events
         all_history = self.positions.get("stats", {}).get("balance_history", [])

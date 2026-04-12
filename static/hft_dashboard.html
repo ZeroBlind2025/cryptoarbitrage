@@ -648,6 +648,19 @@
                 } catch (e) { console.error(e); }
             };
 
+            const invertByCoin = copyTrader.invert_by_coin || {};
+            const showInvertToggle = apiPrefix === '/api/momentum';
+            const toggleInvert = async (coin) => {
+                try {
+                    await fetch('/api/momentum/invert', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ coin }),
+                    });
+                    fetchData();
+                } catch (e) { console.error(e); }
+            };
+
             const getStreakDisplay = (s) => {
                 if (!s.streak || !s.streak_type) return null;
                 const isWin = s.streak_type === 'W';
@@ -727,6 +740,24 @@
                                                 <span className={`text-sm font-mono font-bold ${getRoiColor(s.roi)}`}>
                                                     {s.roi >= 0 ? '+' : ''}{s.roi.toFixed(1)}%
                                                 </span>
+                                                {copyTrader.running && showInvertToggle && (() => {
+                                                    const isFade = invertByCoin[coin] !== false;
+                                                    return (
+                                                        <button
+                                                            onClick={(e) => { e.stopPropagation(); toggleInvert(coin); }}
+                                                            className={`px-2 py-0.5 text-xs rounded border font-mono transition-all ${
+                                                                isFade
+                                                                    ? 'bg-purple-500/20 text-purple-400 border-purple-500/30 hover:bg-purple-500/30'
+                                                                    : 'bg-blue-500/20 text-blue-400 border-blue-500/30 hover:bg-blue-500/30'
+                                                            }`}
+                                                            title={isFade
+                                                                ? `${coin.toUpperCase()}: FADE underdog (buy opposite at <=35c). Click to BACK leader instead.`
+                                                                : `${coin.toUpperCase()}: BACK leader (buy same side >=65c). Click to FADE underdog instead.`}
+                                                        >
+                                                            {isFade ? 'FADE' : 'BACK'}
+                                                        </button>
+                                                    );
+                                                })()}
                                                 {copyTrader.running && (
                                                     <button
                                                         onClick={(e) => { e.stopPropagation(); toggleCoinPause(coin); }}

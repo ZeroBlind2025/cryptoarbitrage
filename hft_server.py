@@ -2354,6 +2354,40 @@ def api_momentum_resume_coin():
     return jsonify({"success": True, "message": f"{coin.upper()} resumed", "paused_coins": sorted(momentum_engine.paused_coins)})
 
 
+@app.route('/api/momentum/invert', methods=['POST'])
+def api_momentum_invert():
+    """Toggle per-coin invert flag.
+
+    invert=True (default): fade underdog — buy opposite side
+    invert=False: back leader — buy trigger side
+    """
+    if not momentum_engine:
+        return jsonify({"error": "Momentum engine not running"}), 400
+    if not hasattr(momentum_engine, 'invert_by_coin'):
+        return jsonify({"error": "Engine does not support invert toggle"}), 400
+
+    data = request.get_json() or {}
+    coin = (data.get('coin') or '').lower().strip()
+    if not coin:
+        return jsonify({"error": "Missing 'coin' parameter"}), 400
+
+    if 'invert' in data:
+        momentum_engine.invert_by_coin[coin] = bool(data['invert'])
+    else:
+        # Toggle
+        current = momentum_engine.invert_by_coin.get(coin, True)
+        momentum_engine.invert_by_coin[coin] = not current
+
+    new_val = momentum_engine.invert_by_coin[coin]
+    return jsonify({
+        "success": True,
+        "coin": coin,
+        "invert": new_val,
+        "mode": "FADE" if new_val else "BACK",
+        "invert_by_coin": dict(momentum_engine.invert_by_coin),
+    })
+
+
 @app.route('/api/momentum/trades')
 def api_momentum_trades():
     """Get momentum engine trade history"""
