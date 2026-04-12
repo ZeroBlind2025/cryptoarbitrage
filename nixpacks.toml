@@ -9,4 +9,4 @@ cmds = [
 ]
 
 [start]
-cmd = "/app/venv/bin/python3 -m hf_engine.server --port $PORT"
+cmd = "/app/venv/bin/python3 hft_server.py --port $PORT --mode demo"
