@@ -2094,11 +2094,15 @@ def momentum_loop():
 
 @app.route('/api/momentum/start', methods=['POST'])
 def api_momentum_start():
-    """Start momentum engine. Auto-pauses copy trader polling."""
+    """Start simple momentum engine (75c entry, 12% fixed stop loss).
+
+    Uses SimpleMomentumEngine — clean, stripped-down: enter >= 75c,
+    stop loss 12% from entry, one entry per market, no re-entries.
+    """
     global momentum_engine, momentum_thread, stop_momentum, copy_trader_paused
 
-    if not HAS_MOMENTUM_ENGINE:
-        return jsonify({"error": "Momentum engine module not available"}), 400
+    if not HAS_SIMPLE_ENGINE:
+        return jsonify({"error": "Simple momentum engine module not available"}), 400
 
     if momentum_thread and momentum_thread.is_alive():
         return jsonify({"error": "Momentum engine already running"}), 400
@@ -2108,6 +2112,7 @@ def api_momentum_start():
     bet_amount = data.get('bet_amount')
     coin_bet_amounts = data.get('coin_bet_amounts')
     min_entry = data.get('min_entry_price')
+    stop_loss_pct = data.get('stop_loss_pct')
 
     if live_mode and not data.get('confirm_live'):
         return jsonify({
@@ -2125,7 +2130,7 @@ def api_momentum_start():
         # Share positions dict with copy trader so both engines' trades
         # appear in the combined P&L, balance chart, and equity display
         shared_pos = copy_trader.positions if copy_trader else None
-        momentum_engine = MomentumEngine(
+        momentum_engine = SimpleMomentumEngine(
             dry_run=not live_mode,
             on_trade=on_momentum_trade,
             bet_amount=bet_amount,
@@ -2134,6 +2139,8 @@ def api_momentum_start():
         )
         if min_entry is not None:
             momentum_engine.min_entry_price = float(min_entry)
+        if stop_loss_pct is not None:
+            momentum_engine.stop_loss_pct = float(stop_loss_pct)
         momentum_engine.start()
     except Exception as e:
         print(f"[SERVER] Failed to start momentum engine: {e}")
@@ -2157,8 +2164,9 @@ def api_momentum_start():
     mode_str = "LIVE" if live_mode else "DRY RUN"
     return jsonify({
         "success": True,
-        "message": f"Momentum engine started in {mode_str} mode",
+        "message": f"Simple momentum engine started in {mode_str} mode",
         "min_entry_price": momentum_engine.min_entry_price,
+        "stop_loss_pct": momentum_engine.stop_loss_pct,
         "copy_trader_paused": copy_trader_was_active,
     })
 
@@ -2265,6 +2273,11 @@ def api_momentum_settings():
         old = momentum_engine.min_entry_price
         momentum_engine.min_entry_price = float(data['min_entry_price'])
         changes.append(f"min_entry: {old*100:.0f}¢ -> {momentum_engine.min_entry_price*100:.0f}¢")
+
+    if 'stop_loss_pct' in data:
+        old = getattr(momentum_engine, 'stop_loss_pct', 0)
+        momentum_engine.stop_loss_pct = float(data['stop_loss_pct'])
+        changes.append(f"stop_loss: {old:.1f}% -> {momentum_engine.stop_loss_pct:.1f}%")
 
     if 'max_entry_price' in data:
         old = momentum_engine.max_entry_price
