@@ -2354,6 +2354,64 @@ def api_momentum_resume_coin():
     return jsonify({"success": True, "message": f"{coin.upper()} resumed", "paused_coins": sorted(momentum_engine.paused_coins)})
 
 
+@app.route('/api/momentum/wild-mode', methods=['POST'])
+def api_momentum_wild_mode():
+    """Toggle wild mode — buy both sides at open, ignore trigger/price cap."""
+    if not momentum_engine:
+        return jsonify({"error": "Momentum engine not running"}), 400
+    if not hasattr(momentum_engine, 'wild_mode'):
+        return jsonify({"error": "Engine does not support wild mode"}), 400
+
+    data = request.get_json() or {}
+    if 'enabled' in data:
+        momentum_engine.wild_mode = bool(data['enabled'])
+    else:
+        momentum_engine.wild_mode = not momentum_engine.wild_mode
+
+    return jsonify({
+        "success": True,
+        "wild_mode": momentum_engine.wild_mode,
+        "message": (
+            "WILD MODE ON — buying both sides at open"
+            if momentum_engine.wild_mode
+            else "WILD MODE OFF — normal trigger/fade logic"
+        ),
+    })
+
+
+@app.route('/api/momentum/interval', methods=['POST'])
+def api_momentum_interval():
+    """Toggle a market interval on/off (5m or 15m)."""
+    if not momentum_engine:
+        return jsonify({"error": "Momentum engine not running"}), 400
+    if not hasattr(momentum_engine, 'enabled_intervals'):
+        return jsonify({"error": "Engine does not support interval toggle"}), 400
+
+    data = request.get_json() or {}
+    interval = (data.get('interval') or '').strip()
+    if interval not in ("5m", "15m"):
+        return jsonify({"error": "interval must be '5m' or '15m'"}), 400
+
+    if 'enabled' in data:
+        if data['enabled']:
+            momentum_engine.enabled_intervals.add(interval)
+        else:
+            momentum_engine.enabled_intervals.discard(interval)
+    else:
+        # Toggle
+        if interval in momentum_engine.enabled_intervals:
+            momentum_engine.enabled_intervals.discard(interval)
+        else:
+            momentum_engine.enabled_intervals.add(interval)
+
+    return jsonify({
+        "success": True,
+        "interval": interval,
+        "enabled": interval in momentum_engine.enabled_intervals,
+        "enabled_intervals": sorted(momentum_engine.enabled_intervals),
+    })
+
+
 @app.route('/api/momentum/invert', methods=['POST'])
 def api_momentum_invert():
     """Toggle per-coin invert flag.

@@ -90,6 +90,14 @@ class SimpleMomentumEngine(InformedMoneyEngine):
         self.invert_by_coin: dict = {
             "btc": True, "eth": True, "sol": True, "xrp": True,
         }
+        # Wild mode: buy BOTH sides at market open, ignore trigger price.
+        # For high-volatility periods (open, news, etc.)
+        self.wild_mode: bool = False
+        # Which market intervals to trade
+        self.enabled_intervals: set = {"5m", "15m"}
+        # Track entered (condition_id, outcome_index) pairs so wild mode
+        # doesn't re-enter the same side twice
+        self.entered_sides: set = set()
 
     # -------------------------------------------------------------------------
     # Lifecycle
@@ -135,9 +143,12 @@ class SimpleMomentumEngine(InformedMoneyEngine):
                 continue
             cid = pos.get("condition_id", "")
             tid = pos.get("token_id", "")
+            oi = pos.get("outcome_index")
             ep = pos.get("entry_price", 0)
             if cid:
                 self.entered_condition_ids.add(cid)
+            if cid and oi is not None:
+                self.entered_sides.add((cid, oi))
             if cid and tid:
                 mk = (cid, tid)
                 self.entered_markets[mk] = ep
@@ -222,6 +233,11 @@ class SimpleMomentumEngine(InformedMoneyEngine):
             if coin in self.paused_coins:
                 continue
 
+            # --- GUARD: interval must be enabled ---
+            interval = market.get("interval", "")
+            if interval and interval not in self.enabled_intervals:
+                continue
+
             # Skip resolved
             prices_raw = market.get("prices", [])
             if (len(prices_raw) == 2
@@ -250,65 +266,100 @@ class SimpleMomentumEngine(InformedMoneyEngine):
                 if interval == "15m" and seconds_left < 300:
                     continue
 
-            # --- GUARD: one entry per market (condition_id level) ---
-            if condition_id in self.entered_condition_ids:
-                continue
-
             _mkt_label = f"{coin.upper()}_{market['interval']} {slug[:30]}"
 
-            # --- Scan both sides for the trigger, fade on first hit ---
-            for trigger_oi in range(2):
-                trigger_outcome = market["outcomes"][trigger_oi]
-                trigger_token_id = market["token_ids"][trigger_oi]
-                trigger_gamma = market["prices"][trigger_oi]
+            # --- Build list of entry targets for this market ---
+            entry_targets = []
 
-                trigger_live = self.get_live_price(trigger_token_id)
-                trigger_price = (
-                    trigger_live if trigger_live is not None else trigger_gamma
-                )
-                if trigger_price is None:
+            if self.wild_mode:
+                # WILD: buy BOTH sides at current price, ignore trigger + price cap
+                for oi in range(2):
+                    if (condition_id, oi) in self.entered_sides:
+                        continue
+                    outcome_w = market["outcomes"][oi]
+                    token_id_w = market["token_ids"][oi]
+                    gamma_w = market["prices"][oi]
+                    live_w = self.get_live_price(token_id_w)
+                    price_w = live_w if live_w is not None else gamma_w
+                    if price_w is None or price_w <= 0 or price_w >= 0.99:
+                        continue
+                    entry_targets.append({
+                        "oi": oi,
+                        "outcome": outcome_w,
+                        "token_id": token_id_w,
+                        "price": price_w,
+                        "trigger_side": outcome_w,
+                        "trigger_price": price_w,
+                        "mode_label": "WILD",
+                    })
+            else:
+                # NORMAL: one entry per market (condition_id level)
+                if condition_id in self.entered_condition_ids:
                     continue
 
-                # Does this side cross the trigger?
-                if trigger_price < self.trigger_price:
-                    continue
-
-                # --- TRIGGER HIT — decide which side to buy based on invert flag ---
-                # invert=True (default): fade the underdog → buy opposite side
-                # invert=False: back the leader → buy the trigger side itself
-                invert = self.invert_by_coin.get(coin, True)
-
-                if invert:
-                    # FADE: buy opposite side
-                    fade_oi = 1 - trigger_oi
-                    fade_outcome = market["outcomes"][fade_oi]
-                    fade_token_id = market["token_ids"][fade_oi]
-                    fade_gamma = market["prices"][fade_oi]
-                    fade_live = self.get_live_price(fade_token_id)
-                    fade_price = fade_live if fade_live is not None else fade_gamma
-                    mode_label = "FADE"
-                    price_cap = 0.35  # must be cheap
-                else:
-                    # BACK: buy trigger side itself
-                    fade_oi = trigger_oi
-                    fade_outcome = trigger_outcome
-                    fade_token_id = trigger_token_id
-                    fade_price = trigger_price
-                    mode_label = "BACK"
-                    price_cap = 0.90  # skip end-of-market entries
-
-                if fade_price is None:
-                    print(
-                        f"[SIMPLE] SKIP {_mkt_label}: "
-                        f"trigger {trigger_outcome} @ {trigger_price * 100:.1f}c "
-                        f"but no price for buy side {fade_outcome}",
-                        flush=True,
+                # Scan both sides for trigger, take first hit
+                for trigger_oi in range(2):
+                    trigger_outcome = market["outcomes"][trigger_oi]
+                    trigger_token_id = market["token_ids"][trigger_oi]
+                    trigger_gamma = market["prices"][trigger_oi]
+                    trigger_live = self.get_live_price(trigger_token_id)
+                    trigger_price = (
+                        trigger_live if trigger_live is not None else trigger_gamma
                     )
-                    continue
+                    if trigger_price is None:
+                        continue
+                    if trigger_price < self.trigger_price:
+                        continue
 
-                # Hard cap per mode
-                if fade_price > price_cap:
-                    continue
+                    invert = self.invert_by_coin.get(coin, True)
+                    if invert:
+                        fade_oi = 1 - trigger_oi
+                        fade_outcome = market["outcomes"][fade_oi]
+                        fade_token_id = market["token_ids"][fade_oi]
+                        fade_gamma = market["prices"][fade_oi]
+                        fade_live = self.get_live_price(fade_token_id)
+                        fade_price = fade_live if fade_live is not None else fade_gamma
+                        mode_label = "FADE"
+                        price_cap = 0.35
+                    else:
+                        fade_oi = trigger_oi
+                        fade_outcome = trigger_outcome
+                        fade_token_id = trigger_token_id
+                        fade_price = trigger_price
+                        mode_label = "BACK"
+                        price_cap = 0.90
+
+                    if fade_price is None:
+                        print(
+                            f"[SIMPLE] SKIP {_mkt_label}: "
+                            f"trigger {trigger_outcome} @ {trigger_price * 100:.1f}c "
+                            f"but no price for buy side {fade_outcome}",
+                            flush=True,
+                        )
+                        continue
+                    if fade_price > price_cap:
+                        continue
+
+                    entry_targets.append({
+                        "oi": fade_oi,
+                        "outcome": fade_outcome,
+                        "token_id": fade_token_id,
+                        "price": fade_price,
+                        "trigger_side": trigger_outcome,
+                        "trigger_price": trigger_price,
+                        "mode_label": mode_label,
+                    })
+                    break  # normal mode: one side only
+
+            # --- Execute each entry target ---
+            for tgt in entry_targets:
+                fade_oi = tgt["oi"]
+                fade_outcome = tgt["outcome"]
+                fade_token_id = tgt["token_id"]
+                fade_price = tgt["price"]
+                trigger_outcome = tgt["trigger_side"]
+                trigger_price = tgt["trigger_price"]
+                mode_label = tgt["mode_label"]
 
                 trade_amount = self.coin_bet_amounts.get(coin, self.bet_amount)
                 title = (question or slug)[:50]
@@ -394,6 +445,7 @@ class SimpleMomentumEngine(InformedMoneyEngine):
 
                 if trade_record["status"] in ("filled", "dry_run"):
                     self.entered_condition_ids.add(condition_id)
+                    self.entered_sides.add((condition_id, fade_oi))
                     market_key = (condition_id, fade_token_id)
                     self.entered_markets[market_key] = fade_price
                     self.market_entry_count[market_key] = 1
@@ -458,9 +510,6 @@ class SimpleMomentumEngine(InformedMoneyEngine):
                             self.on_trade(trade_record)
                         except Exception as e:
                             print(f"[SIMPLE] Callback error: {e}", flush=True)
-
-                    # One entry per market — break out of the side loop
-                    break
 
         return entered
 
@@ -685,6 +734,8 @@ class SimpleMomentumEngine(InformedMoneyEngine):
         stats["tp_spent"] = tp_spent
         stats["tp_proceeds"] = tp_proceeds
         stats["invert_by_coin"] = dict(self.invert_by_coin)
+        stats["wild_mode"] = self.wild_mode
+        stats["enabled_intervals"] = sorted(self.enabled_intervals)
 
         # Filter balance history to simple_momentum events
         all_history = self.positions.get("stats", {}).get("balance_history", [])

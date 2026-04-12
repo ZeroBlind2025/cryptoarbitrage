@@ -1493,6 +1493,64 @@
                                         {momentum.running && (
                                             <div className="pt-2 mt-1 border-t border-slate-700 space-y-2">
                                                 <div className="flex items-center justify-between gap-2">
+                                                    <span className="text-xs text-slate-400 whitespace-nowrap">Mode</span>
+                                                    <div className="flex items-center gap-1">
+                                                        <button
+                                                            onClick={async () => {
+                                                                try {
+                                                                    await fetch('/api/momentum/wild-mode', {
+                                                                        method: 'POST',
+                                                                        headers: { 'Content-Type': 'application/json' },
+                                                                        body: JSON.stringify({ enabled: !momentum.wild_mode }),
+                                                                    });
+                                                                    fetchData();
+                                                                } catch (e) { console.error(e); }
+                                                            }}
+                                                            className={`px-2 py-0.5 text-xs rounded border font-mono transition-all ${
+                                                                momentum.wild_mode
+                                                                    ? 'bg-red-500/20 text-red-400 border-red-500/30 hover:bg-red-500/30'
+                                                                    : 'bg-slate-700/40 text-slate-400 border-slate-600 hover:bg-slate-700'
+                                                            }`}
+                                                            title={momentum.wild_mode
+                                                                ? 'WILD MODE ON — buying both sides at open. Click to disable.'
+                                                                : 'WILD MODE OFF — normal trigger/fade. Click to enable (buys both sides at open for high-volatility periods).'}
+                                                        >
+                                                            {momentum.wild_mode ? 'WILD ON' : 'WILD OFF'}
+                                                        </button>
+                                                    </div>
+                                                </div>
+                                                <div className="flex items-center justify-between gap-2">
+                                                    <span className="text-xs text-slate-400 whitespace-nowrap">Intervals</span>
+                                                    <div className="flex items-center gap-1">
+                                                        {['5m', '15m'].map(ivl => {
+                                                            const enabled = (momentum.enabled_intervals || ['5m', '15m']).includes(ivl);
+                                                            return (
+                                                                <button
+                                                                    key={ivl}
+                                                                    onClick={async () => {
+                                                                        try {
+                                                                            await fetch('/api/momentum/interval', {
+                                                                                method: 'POST',
+                                                                                headers: { 'Content-Type': 'application/json' },
+                                                                                body: JSON.stringify({ interval: ivl, enabled: !enabled }),
+                                                                            });
+                                                                            fetchData();
+                                                                        } catch (e) { console.error(e); }
+                                                                    }}
+                                                                    className={`px-2 py-0.5 text-xs rounded border font-mono transition-all ${
+                                                                        enabled
+                                                                            ? 'bg-cyan-500/20 text-cyan-400 border-cyan-500/30 hover:bg-cyan-500/30'
+                                                                            : 'bg-slate-700/40 text-slate-500 border-slate-600 hover:bg-slate-700'
+                                                                    }`}
+                                                                    title={enabled ? `${ivl} enabled — click to disable` : `${ivl} disabled — click to enable`}
+                                                                >
+                                                                    {ivl.toUpperCase()} {enabled ? 'ON' : 'OFF'}
+                                                                </button>
+                                                            );
+                                                        })}
+                                                    </div>
+                                                </div>
+                                                <div className="flex items-center justify-between gap-2">
                                                     <span className="text-green-400 text-xs whitespace-nowrap">TP %</span>
                                                     <div className="flex items-center gap-1">
                                                         <input
