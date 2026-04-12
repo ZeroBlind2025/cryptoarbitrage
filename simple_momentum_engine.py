@@ -83,6 +83,8 @@ class SimpleMomentumEngine(InformedMoneyEngine):
         self.interval_price_brackets = {}
         # One entry per market, no re-entries
         self.max_entries_per_market = 1
+        # Track at condition_id level — structurally prevents both-sides entry
+        self.entered_condition_ids: set = set()
 
     # -------------------------------------------------------------------------
     # Lifecycle
@@ -122,20 +124,22 @@ class SimpleMomentumEngine(InformedMoneyEngine):
 
         self._start_ws()
 
-        # Seed entered_markets from existing open simple_momentum positions
+        # Seed entered_condition_ids + entered_markets from open positions
         for pos in self.positions.get("open", []):
             if pos.get("source") != self.SOURCE_TAG:
                 continue
             cid = pos.get("condition_id", "")
             tid = pos.get("token_id", "")
             ep = pos.get("entry_price", 0)
+            if cid:
+                self.entered_condition_ids.add(cid)
             if cid and tid:
                 mk = (cid, tid)
                 self.entered_markets[mk] = ep
                 self.market_entry_count[mk] = self.market_entry_count.get(mk, 0) + 1
 
-        if self.entered_markets:
-            print(f"[SIMPLE] Resumed {len(self.entered_markets)} "
+        if self.entered_condition_ids:
+            print(f"[SIMPLE] Resumed {len(self.entered_condition_ids)} "
                   f"open entries from positions file", flush=True)
 
     # -------------------------------------------------------------------------
@@ -231,11 +235,8 @@ class SimpleMomentumEngine(InformedMoneyEngine):
             else:
                 minutes_left = market.get("minutes_until_close")
 
-            # --- GUARD: one entry per market ---
-            tid_a = market["token_ids"][0]
-            tid_b = market["token_ids"][1]
-            if ((condition_id, tid_a) in self.entered_markets
-                    or (condition_id, tid_b) in self.entered_markets):
+            # --- GUARD: one entry per market (condition_id level) ---
+            if condition_id in self.entered_condition_ids:
                 continue
 
             _mkt_label = f"{coin.upper()}_{market['interval']} {slug[:30]}"
@@ -328,6 +329,7 @@ class SimpleMomentumEngine(InformedMoneyEngine):
                 })
 
                 if trade_record["status"] in ("filled", "dry_run"):
+                    self.entered_condition_ids.add(condition_id)
                     self.entered_markets[market_key] = price
                     self.market_entry_count[market_key] = 1
                     self.last_trade_time[market_key] = time.time()
@@ -401,8 +403,6 @@ class SimpleMomentumEngine(InformedMoneyEngine):
         """
         if self.stop_loss_pct <= 0:
             return 0
-        if not self.ws:
-            return 0
 
         open_positions = self.positions.get("open", [])
         our_positions = [
@@ -412,7 +412,8 @@ class SimpleMomentumEngine(InformedMoneyEngine):
             return 0
 
         stopped = 0
-        threshold_mult = 1 - (self.stop_loss_pct / 100)  # 0.88 for 12%
+        no_price_count = 0
+        threshold_mult = 1 - (self.stop_loss_pct / 100)  # 0.875 for 12.5%
 
         for position in our_positions[:]:
             entry_price = position.get("entry_price", 0)
@@ -422,6 +423,7 @@ class SimpleMomentumEngine(InformedMoneyEngine):
 
             live_price = self.get_live_price(token_id)
             if not live_price or live_price <= 0:
+                no_price_count += 1
                 continue
 
             stop_price = entry_price * threshold_mult
@@ -552,6 +554,10 @@ class SimpleMomentumEngine(InformedMoneyEngine):
                       flush=True)
 
             self.trade_history.append(trade_record)
+
+        if no_price_count > 0 and self.scans_completed % 60 == 0:
+            print(f"[SIMPLE] SL check: {len(our_positions)} positions, "
+                  f"{no_price_count} with no price data", flush=True)
 
         return stopped
 
