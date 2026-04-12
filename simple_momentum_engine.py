@@ -569,4 +569,31 @@ class SimpleMomentumEngine(InformedMoneyEngine):
         stats = super().get_stats()
         stats["engine"] = "simple_momentum"
         stats["stop_loss_pct"] = self.stop_loss_pct
+
+        # Count stop losses and compute spent/proceeds from resolved positions
+        resolved = [
+            p for p in self.positions.get("resolved", [])
+            if p.get("source") == self.SOURCE_TAG
+        ]
+        sl_count = 0
+        sl_spent = 0.0
+        sl_proceeds = 0.0
+        for p in resolved:
+            if p.get("result") == "STOP_LOSS":
+                sl_count += 1
+                sl_spent += float(p.get("amount", 0) or 0)
+                sl_proceeds += float(p.get("proceeds", 0) or 0)
+
+        stats["stop_losses"] = sl_count
+        stats["sl_spent"] = sl_spent
+        stats["sl_proceeds"] = sl_proceeds
+
+        # Filter balance history to simple_momentum events
+        all_history = self.positions.get("stats", {}).get("balance_history", [])
+        raw_history = [
+            h for h in all_history
+            if str(h.get("event", "")).startswith("simple_momentum")
+        ]
+        stats["balance_history"] = self._thin_balance_history(raw_history)
+
         return stats
