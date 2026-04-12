@@ -468,12 +468,12 @@ class SimpleMomentumEngine(InformedMoneyEngine):
             sl_price = entry_price * sl_mult
             tp_price = entry_price * tp_mult
 
-            # Check which triggered
-            if live_price >= tp_price and live_price < 0.90:
+            # Check which triggered (0 = disabled)
+            if self.take_profit_pct > 0 and live_price >= tp_price and live_price < 0.90:
                 reason = "TAKE_PROFIT"
                 pct_move = (live_price / entry_price - 1) * 100
                 label = f"TP +{pct_move:.1f}%"
-            elif live_price <= sl_price:
+            elif self.stop_loss_pct > 0 and live_price <= sl_price:
                 reason = "STOP_LOSS"
                 pct_move = (1 - live_price / entry_price) * 100
                 label = f"SL -{pct_move:.1f}%"
