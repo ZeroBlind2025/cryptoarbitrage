@@ -465,7 +465,7 @@ class SimpleMomentumEngine(InformedMoneyEngine):
             tp_price = entry_price * tp_mult
 
             # Check which triggered
-            if live_price >= tp_price:
+            if live_price >= tp_price and live_price < 0.90:
                 reason = "TAKE_PROFIT"
                 pct_move = (live_price / entry_price - 1) * 100
                 label = f"TP +{pct_move:.1f}%"
