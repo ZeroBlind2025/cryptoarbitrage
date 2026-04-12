@@ -855,8 +855,9 @@
             const scanner = data?.scanner || {};
             const trades = data?.trades || { demo: [], live: [], copy: [] };
             const copyTrader = data?.copy_trader || {};
-            const momentum = data?.momentum || {};
-            const allTrades = [...(trades.demo || []), ...(trades.live || []), ...(trades.copy || []), ...(trades.momentum || [])]
+            // On claude/midline-spread-strategy the Momentum card drives midline.
+            const momentum = data?.midline || {};
+            const allTrades = [...(trades.demo || []), ...(trades.live || []), ...(trades.copy || []), ...(trades.momentum || []), ...(trades.midline || [])]
                 .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
 
             return (
@@ -959,12 +960,12 @@
                                                     trade={trade}
                                                     isNew={newTradeIds.has(trade.id)}
                                                 />
-                                            ) : trade.source === 'momentum' ? (
+                                            ) : (trade.source === 'momentum' || trade.source === 'midline' || trade.source === 'informed') ? (
                                                 <div key={trade.id} className={`bg-slate-800/30 rounded-lg p-3 border border-slate-700/50 hover:border-orange-500/30 transition-all ${newTradeIds.has(trade.id) ? 'flash-green' : ''}`}>
                                                     <div className="flex items-center justify-between mb-2">
                                                         <div className="flex items-center gap-2">
                                                             <span className="px-2 py-0.5 text-xs rounded border font-medium bg-orange-500/20 text-orange-400 border-orange-500/30">
-                                                                MOMENTUM
+                                                                {(trade.source || 'trade').toUpperCase()}
                                                             </span>
                                                             <span className={`px-2 py-0.5 text-xs rounded border ${
                                                                 trade.status === 'filled' ? 'bg-green-500/20 text-green-400 border-green-500/30' :
@@ -1285,12 +1286,12 @@
                                 />
                             </div>
 
-                            {/* Momentum Engine */}
+                            {/* Midline Spread Engine (was: Momentum - repurposed on this branch) */}
                             <div className="bg-slate-800/50 backdrop-blur rounded-xl border border-slate-700/50 p-4">
                                 <div className="flex items-center justify-between mb-4">
                                     <h2 className="text-lg font-semibold flex items-center gap-2">
                                         <span className="text-orange-400"><TrendingUp /></span>
-                                        Momentum Engine
+                                        Midline Spread Engine
                                     </h2>
                                     <div className="flex items-center gap-2">
                                         <span className={`px-2 py-0.5 text-xs rounded border ${
@@ -1309,8 +1310,8 @@
                                                     onClick={async () => {
                                                         try {
                                                             const endpoint = momentum.paused
-                                                                ? '/api/momentum/resume'
-                                                                : '/api/momentum/pause';
+                                                                ? '/api/midline/resume'
+                                                                : '/api/midline/pause';
                                                             await fetch(endpoint, { method: 'POST' });
                                                             fetchData();
                                                         } catch (e) { console.error(e); }
@@ -1330,7 +1331,7 @@
                                                 <button
                                                     onClick={async () => {
                                                         try {
-                                                            await fetch('/api/momentum/stop', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}) });
+                                                            await fetch('/api/midline/stop', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}) });
                                                             fetchData();
                                                         } catch (e) { console.error(e); }
                                                     }}
@@ -1343,7 +1344,7 @@
                                             <button
                                                 onClick={async () => {
                                                     try {
-                                                        const res = await fetch('/api/momentum/start', {
+                                                        const res = await fetch('/api/midline/start', {
                                                             method: 'POST',
                                                             headers: { 'Content-Type': 'application/json' },
                                                             body: JSON.stringify({})
@@ -1364,7 +1365,7 @@
                                 </div>
 
                                 <p className="text-xs text-slate-500 mb-3">
-                                    Independent price-momentum trader. Enters between {((momentum.min_entry_price || 0.65) * 100).toFixed(0)}¢ – {((momentum.max_entry_price || 0.989) * 100).toFixed(1)}¢, re-enters only on upward movement. {momentum.running && copyTrader.paused ? '(Copy trader auto-paused)' : ''}
+                                    Midline spread engine. Buys the side trading in [{((momentum.first_price_min || 0.50) * 100).toFixed(0)}c, {((momentum.first_price_max || 0.60) * 100).toFixed(0)}c) at standard lot, then stacks the opposite side at {((momentum.opposite_lot_multiplier || 1.5) * 100).toFixed(0)}% lot once it dips below {((momentum.opposite_price_max || 0.50) * 100).toFixed(0)}c. One entry per side, ride to resolution.
                                 </p>
 
                                 {momentum.running && (
@@ -1447,13 +1448,13 @@
                                         )}
 
                                         {/* Per-Coin Performance for Momentum */}
-                                        <CoinROI coinRoi={momentum.coin_roi} copyTrader={momentum} fetchData={fetchData} apiPrefix="/api/momentum" />
+                                        <CoinROI coinRoi={momentum.coin_roi} copyTrader={momentum} fetchData={fetchData} apiPrefix="/api/midline" />
                                     </div>
                                 )}
 
                                 {!momentum.running && (
                                     <p className="text-slate-500 text-sm">
-                                        Click Start to begin momentum trading.
+                                        Click Start to begin midline spread trading.
                                     </p>
                                 )}
                             </div>

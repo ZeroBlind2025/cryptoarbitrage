@@ -771,7 +771,7 @@ class InformedMoneyEngine(MomentumEngine):
 
         raw_history = [
             h for h in stats.get("balance_history", [])
-            if str(h.get("event", "")).startswith("informed")
+            if str(h.get("event", "")).startswith(self.SOURCE_TAG)
         ]
         balance_history = self._thin_balance_history(raw_history)
 

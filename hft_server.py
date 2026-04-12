@@ -145,6 +145,24 @@ stop_informed = threading.Event()
 informed_paused = threading.Event()
 informed_trades: deque = deque(maxlen=500)
 
+# Midline spread engine (theory #21)
+try:
+    from midline_spread_engine import (
+        MidlineSpreadEngine,
+        POLL_INTERVAL as MIDLINE_POLL_INTERVAL,
+    )
+    HAS_MIDLINE_ENGINE = True
+except Exception as e:
+    print(f"[SERVER] Failed to import midline_spread_engine: {e}")
+    HAS_MIDLINE_ENGINE = False
+    MIDLINE_POLL_INTERVAL = 1
+
+midline_engine: Optional["MidlineSpreadEngine"] = None
+midline_thread: Optional[threading.Thread] = None
+stop_midline = threading.Event()
+midline_paused = threading.Event()
+midline_trades: deque = deque(maxlen=500)
+
 
 def on_copy_trade(trade_record: dict):
     """Callback when copy trader executes a trade"""
@@ -162,6 +180,12 @@ def on_informed_trade(trade_record: dict):
     """Callback when informed money engine executes a trade"""
     informed_trades.append(trade_record)
     print(f"[INFORMED] Trade recorded: {trade_record.get('market', '?')[:30]} - {trade_record.get('status', '?')}", flush=True)
+
+
+def on_midline_trade(trade_record: dict):
+    """Callback when midline spread engine executes a trade"""
+    midline_trades.append(trade_record)
+    print(f"[MIDLINE] Trade recorded: {trade_record.get('market', '?')[:30]} - {trade_record.get('status', '?')}", flush=True)
 
 
 # Sports data (no longer using WebSocket)
@@ -2542,6 +2566,281 @@ def api_informed_trades():
     return jsonify(trades)
 
 
+# =============================================================================
+# MIDLINE SPREAD ENGINE ENDPOINTS  (theory #21)
+# =============================================================================
+
+def midline_loop():
+    """Background loop for the midline spread engine."""
+    global midline_engine
+    if not midline_engine:
+        print("[MIDLINE] Loop abort: engine is None", flush=True)
+        return
+
+    poll_s = MIDLINE_POLL_INTERVAL
+    print(f"[MIDLINE] Background scanning started (every {poll_s}s)...",
+          flush=True)
+    loop_count = 0
+
+    while not stop_midline.is_set():
+        try:
+            loop_count += 1
+
+            if not midline_paused.is_set():
+                entered = midline_engine.scan_and_trade()
+                if entered > 0:
+                    print(f"[MIDLINE] Entered {entered} trade(s)", flush=True)
+
+            midline_engine.check_resolutions()
+
+            heartbeat_every = max(1, 300 // poll_s)
+            if loop_count % heartbeat_every == 0:
+                stats = midline_engine.get_stats()
+                paused_label = "PAUSED" if midline_paused.is_set() else "ACTIVE"
+                print(f"[MIDLINE] Heartbeat #{loop_count}: {paused_label} | "
+                      f"{stats['open_positions']} open | "
+                      f"{stats['trades_entered']} entered | "
+                      f"{stats['scans_completed']} scans", flush=True)
+        except Exception as e:
+            print(f"[MIDLINE] Error in loop: {e}", flush=True)
+            import traceback; traceback.print_exc()
+
+        stop_midline.wait(timeout=poll_s)
+
+    print("[MIDLINE] Background scanning stopped", flush=True)
+
+
+@app.route('/api/midline/start', methods=['POST'])
+def api_midline_start():
+    """Start the midline spread engine."""
+    global midline_engine, midline_thread, stop_midline
+
+    if not HAS_MIDLINE_ENGINE:
+        return jsonify({"error": "Midline engine module not available"}), 400
+
+    if midline_thread and midline_thread.is_alive():
+        return jsonify({"error": "Midline engine already running"}), 400
+
+    data = request.get_json() or {}
+    live_mode = data.get('live', False)
+    bet_amount = data.get('bet_amount')
+    coin_bet_amounts = data.get('coin_bet_amounts')
+
+    if live_mode and not data.get('confirm_live'):
+        return jsonify({
+            "error": "Live mode requires confirmation",
+            "message": "Set confirm_live=true to enable live trading",
+        }), 403
+
+    if not coin_bet_amounts and copy_trader:
+        coin_bet_amounts = dict(copy_trader.coin_bet_amounts)
+    if not coin_bet_amounts and momentum_engine:
+        coin_bet_amounts = dict(momentum_engine.coin_bet_amounts)
+    if not bet_amount and copy_trader:
+        bet_amount = copy_trader.bet_amount
+    if not bet_amount and momentum_engine:
+        bet_amount = momentum_engine.bet_amount
+
+    try:
+        shared_pos = (
+            copy_trader.positions if copy_trader
+            else momentum_engine.positions if momentum_engine
+            else informed_engine.positions if informed_engine
+            else None
+        )
+        midline_engine = MidlineSpreadEngine(
+            dry_run=not live_mode,
+            on_trade=on_midline_trade,
+            bet_amount=bet_amount,
+            coin_bet_amounts=coin_bet_amounts,
+            shared_positions=shared_pos,
+        )
+        midline_engine.start()
+    except Exception as e:
+        print(f"[SERVER] Failed to start midline engine: {e}")
+        import traceback; traceback.print_exc()
+        midline_engine = None
+        return jsonify({"error": f"Failed to start: {e}"}), 500
+
+    stop_midline.clear()
+    midline_paused.clear()
+    midline_thread = threading.Thread(target=midline_loop, daemon=True)
+    midline_thread.start()
+
+    mode_str = "LIVE" if live_mode else "DRY RUN"
+    return jsonify({
+        "success": True,
+        "message": f"Midline spread engine started in {mode_str} mode",
+        "first_price_min": midline_engine.first_price_min,
+        "first_price_max": midline_engine.first_price_max,
+        "opposite_price_max": midline_engine.opposite_price_max,
+        "opposite_lot_multiplier": midline_engine.opposite_lot_multiplier,
+    })
+
+
+@app.route('/api/midline/stop', methods=['POST'])
+def api_midline_stop():
+    """Stop the midline spread engine."""
+    global midline_engine, midline_thread, stop_midline
+
+    if not midline_thread or not midline_thread.is_alive():
+        return jsonify({"error": "Midline engine not running"}), 400
+
+    stop_midline.set()
+    midline_thread.join(timeout=5)
+
+    stats = midline_engine.get_stats() if midline_engine else {}
+
+    if midline_engine:
+        midline_engine.stop()
+    midline_engine = None
+
+    return jsonify({
+        "success": True,
+        "message": "Midline spread engine stopped",
+        "stats": stats,
+    })
+
+
+@app.route('/api/midline/pause', methods=['POST'])
+def api_midline_pause():
+    """Pause the midline engine — stop new scans, keep resolutions."""
+    if not midline_thread or not midline_thread.is_alive():
+        return jsonify({"error": "Midline engine not running"}), 400
+
+    if midline_paused.is_set():
+        return jsonify({"error": "Already paused"}), 400
+
+    midline_paused.set()
+    open_count = (
+        len(midline_engine.positions.get("open", []))
+        if midline_engine else 0
+    )
+    print(f"[MIDLINE] PAUSED - No new scans. Resolution still running for "
+          f"{open_count} open positions.", flush=True)
+
+    return jsonify({
+        "success": True,
+        "message": f"Paused. Resolution running for {open_count} open position(s).",
+        "open_positions": open_count,
+    })
+
+
+@app.route('/api/midline/resume', methods=['POST'])
+def api_midline_resume():
+    """Resume the midline engine."""
+    if not midline_thread or not midline_thread.is_alive():
+        return jsonify({"error": "Midline engine not running"}), 400
+
+    if not midline_paused.is_set():
+        return jsonify({"error": "Not paused"}), 400
+
+    midline_paused.clear()
+    print("[MIDLINE] RESUMED - Scanning for new spreads again.", flush=True)
+    return jsonify({"success": True, "message": "Midline spread engine resumed"})
+
+
+@app.route('/api/midline/status')
+def api_midline_status():
+    """Get midline engine status."""
+    if not HAS_MIDLINE_ENGINE:
+        return jsonify({
+            "available": False, "running": False,
+            "error": "Module not available",
+        })
+
+    running = midline_thread and midline_thread.is_alive()
+    status = {
+        "available": True,
+        "running": running,
+        "paused": midline_paused.is_set() if running else False,
+    }
+
+    if midline_engine:
+        status.update(midline_engine.get_stats())
+
+    return jsonify(status)
+
+
+@app.route('/api/midline/settings', methods=['POST'])
+def api_midline_settings():
+    """Update midline engine settings at runtime."""
+    if not midline_engine:
+        return jsonify({"error": "Midline engine not running"}), 400
+
+    data = request.get_json() or {}
+    changes = []
+
+    if 'first_price_min' in data:
+        old = midline_engine.first_price_min
+        midline_engine.first_price_min = float(data['first_price_min'])
+        midline_engine.min_entry_price = midline_engine.first_price_min
+        changes.append(
+            f"first_price_min: {old * 100:.0f}c -> "
+            f"{midline_engine.first_price_min * 100:.0f}c"
+        )
+
+    if 'first_price_max' in data:
+        old = midline_engine.first_price_max
+        midline_engine.first_price_max = float(data['first_price_max'])
+        midline_engine.max_entry_price = midline_engine.first_price_max
+        changes.append(
+            f"first_price_max: {old * 100:.0f}c -> "
+            f"{midline_engine.first_price_max * 100:.0f}c"
+        )
+
+    if 'opposite_price_max' in data:
+        old = midline_engine.opposite_price_max
+        midline_engine.opposite_price_max = float(data['opposite_price_max'])
+        changes.append(
+            f"opposite_price_max: {old * 100:.0f}c -> "
+            f"{midline_engine.opposite_price_max * 100:.0f}c"
+        )
+
+    if 'opposite_lot_multiplier' in data:
+        old = midline_engine.opposite_lot_multiplier
+        midline_engine.opposite_lot_multiplier = float(
+            data['opposite_lot_multiplier']
+        )
+        changes.append(
+            f"opposite_lot_multiplier: {old}x -> "
+            f"{midline_engine.opposite_lot_multiplier}x"
+        )
+
+    if 'bet_amount' in data:
+        old = midline_engine.bet_amount
+        midline_engine.bet_amount = float(data['bet_amount'])
+        changes.append(
+            f"bet_amount: ${old:.2f} -> ${midline_engine.bet_amount:.2f}"
+        )
+
+    if 'coin_bet_amounts' in data:
+        for coin, amt in data['coin_bet_amounts'].items():
+            old = midline_engine.coin_bet_amounts.get(
+                coin, midline_engine.bet_amount
+            )
+            midline_engine.coin_bet_amounts[coin] = float(amt)
+            changes.append(f"{coin.upper()} lot: ${old:.2f} -> ${float(amt):.2f}")
+
+    if not changes:
+        return jsonify({"error": "No settings provided"}), 400
+
+    return jsonify({
+        "success": True,
+        "changes": changes,
+        "current": midline_engine.get_stats(),
+    })
+
+
+@app.route('/api/midline/trades')
+def api_midline_trades():
+    """Get midline spread engine trade history."""
+    limit = int(request.args.get('limit', 50))
+    trades = list(midline_trades)[-limit:]
+    trades.reverse()
+    return jsonify(trades)
+
+
 @app.route('/api/sweep', methods=['POST'])
 def api_sweep():
     """Sweep all unredeemed winning positions from our Polymarket wallet.
@@ -2700,6 +2999,38 @@ def _get_momentum_data() -> dict:
     return base
 
 
+def _get_midline_data() -> dict:
+    """Get midline spread engine data for /api/data, with error isolation"""
+    _defaults = {
+        "running": False,
+        "trades_entered": 0, "trades_skipped": 0,
+        "total_spent": 0, "scans_completed": 0,
+        "open_positions": 0, "resolved_positions": 0,
+        "min_entry_price": 0.50, "max_entry_price": 0.60,
+        "first_price_min": 0.50, "first_price_max": 0.60,
+        "opposite_price_max": 0.50,
+        "opposite_lot_multiplier": 1.5,
+        "bet_amount": 2.0,
+        "coin_bet_amounts": {"btc": 2.0, "eth": 2.0, "sol": 2.0, "xrp": 2.0},
+        "paused_coins": [], "dry_run": True,
+        "active_entries": {},
+    }
+    running = midline_thread and midline_thread.is_alive()
+    base = {
+        "running": running,
+        "paused": midline_paused.is_set() if running else False,
+    }
+    try:
+        if midline_engine:
+            base.update(midline_engine.get_stats())
+        else:
+            base.update(_defaults)
+    except Exception as e:
+        print(f"[MIDLINE] get_stats error (using defaults): {e}", flush=True)
+        base.update(_defaults)
+    return base
+
+
 @app.route('/api/data')
 def api_data():
     """Get all dashboard data in one call"""
@@ -2742,9 +3073,11 @@ def api_data():
             "live": recent_live,
             "copy": list(copy_trades)[-20:],
             "momentum": list(momentum_trades)[-20:],
+            "midline": list(midline_trades)[-20:],
         },
         "copy_trader": _get_copy_trader_data(),
         "momentum": _get_momentum_data(),
+        "midline": _get_midline_data(),
         "pnl": {
             "demo": {
                 "filled": len(demo_filled),
@@ -2801,6 +3134,75 @@ def api_events():
 # MAIN
 # =============================================================================
 
+# =============================================================================
+# MIDLINE AUTO-START (theory #21)
+# =============================================================================
+#
+# The claude/midline-spread-strategy branch is meant to run the midline
+# spread engine as its default mode of operation.  Without this helper
+# the container boots idle and we have to poke it manually.  Auto-starting
+# at boot makes the midline engine the only thing running by default, with
+# no dashboard click required.
+#
+# Env knobs:
+#   MIDLINE_AUTOSTART (default "true") — set to "false" to disable
+#   MIDLINE_LIVE      (default "false") — set to "true" to run LIVE
+#
+def _autostart_midline_engine():
+    global midline_engine, midline_thread, stop_midline
+
+    if os.getenv("MIDLINE_AUTOSTART", "true").lower() != "true":
+        print("[AUTOSTART] MIDLINE_AUTOSTART=false - skipping", flush=True)
+        return
+
+    if not HAS_MIDLINE_ENGINE:
+        print("[AUTOSTART] midline_spread_engine module NOT available - "
+              "this branch is missing midline_spread_engine.py.  "
+              "Nothing to auto-start.", flush=True)
+        return
+
+    if midline_thread and midline_thread.is_alive():
+        print("[AUTOSTART] Midline engine already running - skipping",
+              flush=True)
+        return
+
+    live_mode = os.getenv("MIDLINE_LIVE", "false").lower() == "true"
+
+    print("\n" + "=" * 70)
+    print("   AUTO-START: MIDLINE SPREAD ENGINE")
+    print("   (claude/midline-spread-strategy branch)")
+    print(f"   Mode: {'LIVE (REAL MONEY)' if live_mode else 'DRY RUN'}")
+    print("=" * 70 + "\n", flush=True)
+
+    try:
+        # Share positions dict with whichever engine already owns state,
+        # so the combined balance chart stays consistent.
+        shared_pos = (
+            copy_trader.positions if copy_trader
+            else momentum_engine.positions if momentum_engine
+            else informed_engine.positions if informed_engine
+            else None
+        )
+        midline_engine = MidlineSpreadEngine(
+            dry_run=not live_mode,
+            on_trade=on_midline_trade,
+            shared_positions=shared_pos,
+        )
+        midline_engine.start()
+    except Exception as e:
+        print(f"[AUTOSTART] Failed to init midline engine: {e}", flush=True)
+        import traceback; traceback.print_exc()
+        midline_engine = None
+        return
+
+    stop_midline.clear()
+    midline_paused.clear()
+    midline_thread = threading.Thread(target=midline_loop, daemon=True)
+    midline_thread.start()
+    print("[AUTOSTART] Midline spread engine is LIVE in the scan loop",
+          flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description="HFT Arbitrage Server")
     parser.add_argument("--port", type=int, default=5000, help="Server port")
@@ -2846,7 +3248,17 @@ def main():
     print("  GET  /api/trades    - Trade history")
     print("  GET  /api/data      - All dashboard data")
     print("  GET  /api/events    - Real-time SSE stream")
+    print("  POST /api/midline/start   - (auto-started by default on this branch)")
     print(f"{'=' * 60}\n")
+
+    # Auto-start the midline spread engine on this branch.  See
+    # _autostart_midline_engine() for env-var knobs (MIDLINE_AUTOSTART,
+    # MIDLINE_LIVE).  Logs loudly on success or failure.
+    try:
+        _autostart_midline_engine()
+    except Exception as e:
+        print(f"[AUTOSTART] Unexpected error during auto-start: {e}", flush=True)
+        import traceback; traceback.print_exc()
 
     app.run(host=args.host, port=args.port, debug=args.debug, threaded=True)
 
