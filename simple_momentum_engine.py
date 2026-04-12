@@ -274,6 +274,10 @@ class SimpleMomentumEngine(InformedMoneyEngine):
                     )
                     continue
 
+                # Hard cap: only enter fade side at <= 35c
+                if fade_price > 0.35:
+                    continue
+
                 trade_amount = self.coin_bet_amounts.get(coin, self.bet_amount)
                 title = (question or slug)[:50]
                 tp_price = fade_price * (1 + self.take_profit_pct / 100)
