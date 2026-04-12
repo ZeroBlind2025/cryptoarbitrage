@@ -163,6 +163,24 @@ stop_contrarian = threading.Event()
 contrarian_paused = threading.Event()
 contrarian_trades: deque = deque(maxlen=500)
 
+# Simple momentum engine (75c entry, 12% fixed stop loss, no re-entries)
+try:
+    from simple_momentum_engine import (
+        SimpleMomentumEngine,
+        POLL_INTERVAL as SIMPLE_POLL_INTERVAL,
+    )
+    HAS_SIMPLE_ENGINE = True
+except Exception as e:
+    print(f"[SERVER] Failed to import simple_momentum_engine: {e}")
+    HAS_SIMPLE_ENGINE = False
+    SIMPLE_POLL_INTERVAL = 1
+
+simple_engine: Optional["SimpleMomentumEngine"] = None
+simple_thread: Optional[threading.Thread] = None
+stop_simple = threading.Event()
+simple_paused = threading.Event()
+simple_trades: deque = deque(maxlen=500)
+
 
 def on_copy_trade(trade_record: dict):
     """Callback when copy trader executes a trade"""
@@ -186,6 +204,12 @@ def on_contrarian_trade(trade_record: dict):
     """Callback when contrarian fade engine executes a trade"""
     contrarian_trades.append(trade_record)
     print(f"[CONTRARIAN] Trade recorded: {trade_record.get('market', '?')[:30]} - {trade_record.get('status', '?')}", flush=True)
+
+
+def on_simple_trade(trade_record: dict):
+    """Callback when simple momentum engine executes a trade"""
+    simple_trades.append(trade_record)
+    print(f"[SIMPLE] Trade recorded: {trade_record.get('market', '?')[:30]} - {trade_record.get('status', '?')}", flush=True)
 
 
 # Sports data (no longer using WebSocket)
@@ -2809,6 +2833,267 @@ def api_contrarian_trades():
     """Get contrarian fade engine trade history."""
     limit = int(request.args.get('limit', 50))
     trades = list(contrarian_trades)[-limit:]
+    trades.reverse()
+    return jsonify(trades)
+
+
+# =============================================================================
+# SIMPLE MOMENTUM ENGINE ENDPOINTS
+# =============================================================================
+
+def simple_loop():
+    """Background loop for simple momentum engine"""
+    global simple_engine
+    if not simple_engine:
+        print("[SIMPLE] Loop abort: engine is None", flush=True)
+        return
+
+    poll_s = SIMPLE_POLL_INTERVAL
+    print(f"[SIMPLE] Background scanning started (every {poll_s}s)...", flush=True)
+    loop_count = 0
+
+    while not stop_simple.is_set():
+        try:
+            loop_count += 1
+
+            if not simple_paused.is_set():
+                entered = simple_engine.scan_and_trade()
+                if entered > 0:
+                    print(f"[SIMPLE] Entered {entered} trade(s)", flush=True)
+
+            # Always check stop losses and resolutions (even when paused)
+            simple_engine.check_stop_losses()
+            simple_engine.check_resolutions()
+
+            heartbeat_every = max(1, 300 // poll_s)
+            if loop_count % heartbeat_every == 0:
+                stats = simple_engine.get_stats()
+                paused_label = "PAUSED" if simple_paused.is_set() else "ACTIVE"
+                print(f"[SIMPLE] Heartbeat #{loop_count}: {paused_label} | "
+                      f"{stats['open_positions']} open | "
+                      f"{stats['trades_entered']} entered | "
+                      f"{stats['scans_completed']} scans", flush=True)
+        except Exception as e:
+            print(f"[SIMPLE] Error in loop: {e}", flush=True)
+            import traceback; traceback.print_exc()
+
+        stop_simple.wait(timeout=poll_s)
+
+    print("[SIMPLE] Background scanning stopped", flush=True)
+
+
+@app.route('/api/simple/start', methods=['POST'])
+def api_simple_start():
+    """Start the simple momentum engine."""
+    global simple_engine, simple_thread, stop_simple
+
+    if not HAS_SIMPLE_ENGINE:
+        return jsonify({"error": "Simple momentum engine module not available"}), 400
+
+    if simple_thread and simple_thread.is_alive():
+        return jsonify({"error": "Simple momentum engine already running"}), 400
+
+    data = request.get_json() or {}
+    live_mode = data.get('live', False)
+    bet_amount = data.get('bet_amount')
+    coin_bet_amounts = data.get('coin_bet_amounts')
+    min_entry = data.get('min_entry_price')
+    stop_loss_pct = data.get('stop_loss_pct')
+
+    if live_mode and not data.get('confirm_live'):
+        return jsonify({
+            "error": "Live mode requires confirmation",
+            "message": "Set confirm_live=true to enable live trading"
+        }), 403
+
+    # Share lot sizes if not supplied
+    if not coin_bet_amounts and copy_trader:
+        coin_bet_amounts = dict(copy_trader.coin_bet_amounts)
+    if not coin_bet_amounts and momentum_engine:
+        coin_bet_amounts = dict(momentum_engine.coin_bet_amounts)
+    if not bet_amount and copy_trader:
+        bet_amount = copy_trader.bet_amount
+    if not bet_amount and momentum_engine:
+        bet_amount = momentum_engine.bet_amount
+
+    try:
+        shared_pos = (
+            copy_trader.positions if copy_trader
+            else momentum_engine.positions if momentum_engine
+            else informed_engine.positions if informed_engine
+            else contrarian_engine.positions if contrarian_engine
+            else None
+        )
+        simple_engine = SimpleMomentumEngine(
+            dry_run=not live_mode,
+            on_trade=on_simple_trade,
+            bet_amount=bet_amount,
+            coin_bet_amounts=coin_bet_amounts,
+            shared_positions=shared_pos,
+        )
+        if min_entry is not None:
+            simple_engine.min_entry_price = float(min_entry)
+        if stop_loss_pct is not None:
+            simple_engine.stop_loss_pct = float(stop_loss_pct)
+        simple_engine.start()
+    except Exception as e:
+        print(f"[SERVER] Failed to start simple engine: {e}")
+        import traceback; traceback.print_exc()
+        simple_engine = None
+        return jsonify({"error": f"Failed to start: {e}"}), 500
+
+    stop_simple.clear()
+    simple_paused.clear()
+    simple_thread = threading.Thread(target=simple_loop, daemon=True)
+    simple_thread.start()
+
+    mode_str = "LIVE" if live_mode else "DRY RUN"
+    return jsonify({
+        "success": True,
+        "message": f"Simple momentum engine started in {mode_str} mode",
+        "min_entry_price": simple_engine.min_entry_price,
+        "stop_loss_pct": simple_engine.stop_loss_pct,
+    })
+
+
+@app.route('/api/simple/stop', methods=['POST'])
+def api_simple_stop():
+    """Stop the simple momentum engine."""
+    global simple_engine, simple_thread, stop_simple
+
+    if not simple_thread or not simple_thread.is_alive():
+        return jsonify({"error": "Simple momentum engine not running"}), 400
+
+    stop_simple.set()
+    simple_thread.join(timeout=5)
+
+    stats = simple_engine.get_stats() if simple_engine else {}
+
+    if simple_engine:
+        simple_engine.stop()
+    simple_engine = None
+
+    return jsonify({
+        "success": True,
+        "message": "Simple momentum engine stopped",
+        "stats": stats,
+    })
+
+
+@app.route('/api/simple/pause', methods=['POST'])
+def api_simple_pause():
+    """Pause simple engine — stop new scans, keep stop loss + resolution."""
+    if not simple_thread or not simple_thread.is_alive():
+        return jsonify({"error": "Simple momentum engine not running"}), 400
+
+    if simple_paused.is_set():
+        return jsonify({"error": "Already paused"}), 400
+
+    simple_paused.set()
+    open_count = (
+        len(simple_engine.positions.get("open", []))
+        if simple_engine else 0
+    )
+    print(f"[SIMPLE] PAUSED - No new scans. Stop loss + resolution still running "
+          f"for {open_count} open positions.", flush=True)
+
+    return jsonify({
+        "success": True,
+        "message": f"Paused. Stop loss + resolution running for {open_count} open position(s).",
+        "open_positions": open_count,
+    })
+
+
+@app.route('/api/simple/resume', methods=['POST'])
+def api_simple_resume():
+    """Resume simple engine scanning."""
+    if not simple_thread or not simple_thread.is_alive():
+        return jsonify({"error": "Simple momentum engine not running"}), 400
+
+    if not simple_paused.is_set():
+        return jsonify({"error": "Not paused"}), 400
+
+    simple_paused.clear()
+    print("[SIMPLE] RESUMED - Scanning for new trades again.", flush=True)
+    return jsonify({"success": True, "message": "Simple momentum engine resumed"})
+
+
+@app.route('/api/simple/status')
+def api_simple_status():
+    """Get simple momentum engine status."""
+    if not HAS_SIMPLE_ENGINE:
+        return jsonify({
+            "available": False, "running": False,
+            "error": "Module not available",
+        })
+
+    running = simple_thread and simple_thread.is_alive()
+    status = {
+        "available": True,
+        "running": running,
+        "paused": simple_paused.is_set() if running else False,
+    }
+
+    if simple_engine:
+        status.update(simple_engine.get_stats())
+
+    return jsonify(status)
+
+
+@app.route('/api/simple/settings', methods=['POST'])
+def api_simple_settings():
+    """Update simple momentum engine settings at runtime."""
+    if not simple_engine:
+        return jsonify({"error": "Simple momentum engine not running"}), 400
+
+    data = request.get_json() or {}
+    changes = []
+
+    if 'min_entry_price' in data:
+        old = simple_engine.min_entry_price
+        simple_engine.min_entry_price = float(data['min_entry_price'])
+        changes.append(
+            f"min_entry_price: {old * 100:.0f}c -> "
+            f"{simple_engine.min_entry_price * 100:.0f}c"
+        )
+
+    if 'stop_loss_pct' in data:
+        old = simple_engine.stop_loss_pct
+        simple_engine.stop_loss_pct = float(data['stop_loss_pct'])
+        changes.append(
+            f"stop_loss_pct: {old:.0f}% -> {simple_engine.stop_loss_pct:.0f}%"
+        )
+
+    if 'bet_amount' in data:
+        old = simple_engine.bet_amount
+        simple_engine.bet_amount = float(data['bet_amount'])
+        changes.append(
+            f"bet_amount: ${old:.2f} -> ${simple_engine.bet_amount:.2f}"
+        )
+
+    if 'coin_bet_amounts' in data:
+        for coin, amt in data['coin_bet_amounts'].items():
+            old = simple_engine.coin_bet_amounts.get(
+                coin, simple_engine.bet_amount
+            )
+            simple_engine.coin_bet_amounts[coin] = float(amt)
+            changes.append(f"{coin.upper()} lot: ${old:.2f} -> ${float(amt):.2f}")
+
+    if not changes:
+        return jsonify({"error": "No settings provided"}), 400
+
+    return jsonify({
+        "success": True,
+        "changes": changes,
+        "current": simple_engine.get_stats(),
+    })
+
+
+@app.route('/api/simple/trades')
+def api_simple_trades():
+    """Get simple momentum engine trade history."""
+    limit = int(request.args.get('limit', 50))
+    trades = list(simple_trades)[-limit:]
     trades.reverse()
     return jsonify(trades)
 
