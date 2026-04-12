@@ -239,6 +239,17 @@ class SimpleMomentumEngine(InformedMoneyEngine):
             else:
                 minutes_left = market.get("minutes_until_close")
 
+            # --- GUARD: no late entries (don't catch falling knives) ---
+            # 5m markets: block last 90 seconds
+            # 15m markets: block last 300 seconds (5 min)
+            interval = market.get("interval", "")
+            if minutes_left is not None:
+                seconds_left = minutes_left * 60
+                if interval == "5m" and seconds_left < 90:
+                    continue
+                if interval == "15m" and seconds_left < 300:
+                    continue
+
             # --- GUARD: one entry per market (condition_id level) ---
             if condition_id in self.entered_condition_ids:
                 continue
