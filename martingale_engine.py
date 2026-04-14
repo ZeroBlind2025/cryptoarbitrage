@@ -211,6 +211,16 @@ class MartingaleEngine(InformedMoneyEngine):
             else:
                 minutes_left = market.get("minutes_until_close")
 
+            # --- GUARD: no late entries ---
+            # 5m markets: block last 90s.  15m markets: block last 300s.
+            interval = market.get("interval", "")
+            if minutes_left is not None:
+                seconds_left = minutes_left * 60
+                if interval == "5m" and seconds_left < 90:
+                    continue
+                if interval == "15m" and seconds_left < 300:
+                    continue
+
             # Side-level state for this market
             side_a_entered = (condition_id, 0) in self.entered_sides
             side_b_entered = (condition_id, 1) in self.entered_sides
@@ -232,26 +242,33 @@ class MartingaleEngine(InformedMoneyEngine):
             if price_a is None or price_b is None:
                 continue
 
+            # Upper caps: keep entries close to the trigger price, not resolution.
+            # First entry: trigger_1 (65c) .. +10c.  Hedge: trigger_2 (80c) .. +10c.
+            cap_1 = self.trigger_1 + 0.10
+            cap_2 = self.trigger_2 + 0.10
+
             # Decide which side (if any) to enter
             buy_oi = None
             buy_lot_mult = 1.0
             entry_reason = ""
 
             if not side_a_entered and not side_b_entered:
-                # --- First entry: trigger_1 on either side ---
-                if price_a >= self.trigger_1:
+                # --- First entry: trigger_1 on either side, capped ---
+                if self.trigger_1 <= price_a <= cap_1:
                     buy_oi = 0
                     entry_reason = "entry_1"
-                elif price_b >= self.trigger_1:
+                elif self.trigger_1 <= price_b <= cap_1:
                     buy_oi = 1
                     entry_reason = "entry_1"
             else:
-                # --- Hedge entry: opposite side at trigger_2 ---
-                if side_a_entered and not side_b_entered and price_b >= self.trigger_2:
+                # --- Hedge entry: opposite side at trigger_2, capped ---
+                if (side_a_entered and not side_b_entered
+                        and self.trigger_2 <= price_b <= cap_2):
                     buy_oi = 1
                     buy_lot_mult = self.lot_multiplier
                     entry_reason = "entry_2_hedge"
-                elif side_b_entered and not side_a_entered and price_a >= self.trigger_2:
+                elif (side_b_entered and not side_a_entered
+                        and self.trigger_2 <= price_a <= cap_2):
                     buy_oi = 0
                     buy_lot_mult = self.lot_multiplier
                     entry_reason = "entry_2_hedge"
