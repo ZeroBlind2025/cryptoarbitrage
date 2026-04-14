@@ -335,7 +335,6 @@ class MartingaleEngine(InformedMoneyEngine):
 
             if trade_record["status"] in ("filled", "dry_run"):
                 self.entered_sides.add((condition_id, buy_oi))
-                self.entered_condition_ids.add(condition_id)
                 market_key = (condition_id, buy_token_id)
                 self.entered_markets[market_key] = buy_price
 
