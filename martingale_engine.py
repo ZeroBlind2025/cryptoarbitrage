@@ -212,11 +212,12 @@ class MartingaleEngine(InformedMoneyEngine):
                 minutes_left = market.get("minutes_until_close")
 
             # --- GUARD: no late entries ---
-            # 5m markets: block last 90s.  15m markets: block last 300s.
+            # Resolution play (hold to close), so only block tiny sliver at end.
+            # 5m markets: block last 20s.  15m markets: block last 300s.
             interval = market.get("interval", "")
             if minutes_left is not None:
                 seconds_left = minutes_left * 60
-                if interval == "5m" and seconds_left < 90:
+                if interval == "5m" and seconds_left < 20:
                     continue
                 if interval == "15m" and seconds_left < 300:
                     continue
