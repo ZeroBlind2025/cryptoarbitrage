@@ -2094,11 +2094,14 @@ def momentum_loop():
 
 @app.route('/api/momentum/start', methods=['POST'])
 def api_momentum_start():
-    """Start momentum engine. Auto-pauses copy trader polling."""
+    """Start martingale engine (65c first entry, 80c hedge at 2.5x).
+
+    Routes the dashboard's momentum start button to MartingaleEngine.
+    """
     global momentum_engine, momentum_thread, stop_momentum, copy_trader_paused
 
-    if not HAS_MOMENTUM_ENGINE:
-        return jsonify({"error": "Momentum engine module not available"}), 400
+    if not HAS_MARTINGALE_ENGINE:
+        return jsonify({"error": "Martingale engine module not available"}), 400
 
     if momentum_thread and momentum_thread.is_alive():
         return jsonify({"error": "Momentum engine already running"}), 400
@@ -2107,7 +2110,10 @@ def api_momentum_start():
     live_mode = data.get('live', False)
     bet_amount = data.get('bet_amount')
     coin_bet_amounts = data.get('coin_bet_amounts')
-    min_entry = data.get('min_entry_price')
+    lot_multiplier = (
+        data.get('lot_multiplier')
+        or data.get('max_rentry_lot_multiplier')
+    )
 
     if live_mode and not data.get('confirm_live'):
         return jsonify({
@@ -2125,18 +2131,18 @@ def api_momentum_start():
         # Share positions dict with copy trader so both engines' trades
         # appear in the combined P&L, balance chart, and equity display
         shared_pos = copy_trader.positions if copy_trader else None
-        momentum_engine = MomentumEngine(
+        momentum_engine = MartingaleEngine(
             dry_run=not live_mode,
             on_trade=on_momentum_trade,
             bet_amount=bet_amount,
             coin_bet_amounts=coin_bet_amounts,
             shared_positions=shared_pos,
         )
-        if min_entry is not None:
-            momentum_engine.min_entry_price = float(min_entry)
+        if lot_multiplier is not None:
+            momentum_engine.lot_multiplier = float(lot_multiplier)
         momentum_engine.start()
     except Exception as e:
-        print(f"[SERVER] Failed to start momentum engine: {e}")
+        print(f"[SERVER] Failed to start martingale engine: {e}")
         import traceback; traceback.print_exc()
         momentum_engine = None
         return jsonify({"error": f"Failed to start: {e}"}), 500
@@ -2157,8 +2163,10 @@ def api_momentum_start():
     mode_str = "LIVE" if live_mode else "DRY RUN"
     return jsonify({
         "success": True,
-        "message": f"Momentum engine started in {mode_str} mode",
-        "min_entry_price": momentum_engine.min_entry_price,
+        "message": f"Martingale engine started in {mode_str} mode",
+        "trigger_1": momentum_engine.trigger_1,
+        "trigger_2": momentum_engine.trigger_2,
+        "lot_multiplier": momentum_engine.lot_multiplier,
         "copy_trader_paused": copy_trader_was_active,
     })
 
