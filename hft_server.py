@@ -163,6 +163,24 @@ stop_contrarian = threading.Event()
 contrarian_paused = threading.Event()
 contrarian_trades: deque = deque(maxlen=500)
 
+# Martingale engine (65c entry, 80c hedge at 2.5x)
+try:
+    from martingale_engine import (
+        MartingaleEngine,
+        POLL_INTERVAL as MARTINGALE_POLL_INTERVAL,
+    )
+    HAS_MARTINGALE_ENGINE = True
+except Exception as e:
+    print(f"[SERVER] Failed to import martingale_engine: {e}")
+    HAS_MARTINGALE_ENGINE = False
+    MARTINGALE_POLL_INTERVAL = 1
+
+martingale_engine: Optional["MartingaleEngine"] = None
+martingale_thread: Optional[threading.Thread] = None
+stop_martingale = threading.Event()
+martingale_paused = threading.Event()
+martingale_trades: deque = deque(maxlen=500)
+
 
 def on_copy_trade(trade_record: dict):
     """Callback when copy trader executes a trade"""
@@ -186,6 +204,12 @@ def on_contrarian_trade(trade_record: dict):
     """Callback when contrarian fade engine executes a trade"""
     contrarian_trades.append(trade_record)
     print(f"[CONTRARIAN] Trade recorded: {trade_record.get('market', '?')[:30]} - {trade_record.get('status', '?')}", flush=True)
+
+
+def on_martingale_trade(trade_record: dict):
+    """Callback when martingale engine executes a trade"""
+    martingale_trades.append(trade_record)
+    print(f"[MARTINGALE] Trade recorded: {trade_record.get('market', '?')[:30]} - {trade_record.get('status', '?')}", flush=True)
 
 
 # Sports data (no longer using WebSocket)
@@ -2809,6 +2833,257 @@ def api_contrarian_trades():
     """Get contrarian fade engine trade history."""
     limit = int(request.args.get('limit', 50))
     trades = list(contrarian_trades)[-limit:]
+    trades.reverse()
+    return jsonify(trades)
+
+
+# =============================================================================
+# MARTINGALE ENGINE ENDPOINTS
+# =============================================================================
+
+def martingale_loop():
+    """Background loop for martingale engine."""
+    global martingale_engine
+    if not martingale_engine:
+        print("[MARTINGALE] Loop abort: engine is None", flush=True)
+        return
+
+    poll_s = MARTINGALE_POLL_INTERVAL
+    print(f"[MARTINGALE] Background scanning started (every {poll_s}s)...",
+          flush=True)
+    loop_count = 0
+
+    while not stop_martingale.is_set():
+        try:
+            loop_count += 1
+
+            if not martingale_paused.is_set():
+                entered = martingale_engine.scan_and_trade()
+                if entered > 0:
+                    print(f"[MARTINGALE] Entered {entered} trade(s)", flush=True)
+
+            martingale_engine.check_resolutions()
+
+            heartbeat_every = max(1, 300 // poll_s)
+            if loop_count % heartbeat_every == 0:
+                stats = martingale_engine.get_stats()
+                paused_label = "PAUSED" if martingale_paused.is_set() else "ACTIVE"
+                print(f"[MARTINGALE] Heartbeat #{loop_count}: {paused_label} | "
+                      f"{stats['open_positions']} open | "
+                      f"{stats['trades_entered']} entered | "
+                      f"{stats['scans_completed']} scans", flush=True)
+        except Exception as e:
+            print(f"[MARTINGALE] Error in loop: {e}", flush=True)
+            import traceback; traceback.print_exc()
+
+        stop_martingale.wait(timeout=poll_s)
+
+    print("[MARTINGALE] Background scanning stopped", flush=True)
+
+
+@app.route('/api/martingale/start', methods=['POST'])
+def api_martingale_start():
+    """Start the martingale engine."""
+    global martingale_engine, martingale_thread, stop_martingale
+
+    if not HAS_MARTINGALE_ENGINE:
+        return jsonify({"error": "Martingale engine module not available"}), 400
+
+    if martingale_thread and martingale_thread.is_alive():
+        return jsonify({"error": "Martingale engine already running"}), 400
+
+    data = request.get_json() or {}
+    live_mode = data.get('live', False)
+    bet_amount = data.get('bet_amount')
+    coin_bet_amounts = data.get('coin_bet_amounts')
+    lot_multiplier = data.get('lot_multiplier')
+
+    if live_mode and not data.get('confirm_live'):
+        return jsonify({
+            "error": "Live mode requires confirmation",
+            "message": "Set confirm_live=true to enable live trading"
+        }), 403
+
+    if not coin_bet_amounts and copy_trader:
+        coin_bet_amounts = dict(copy_trader.coin_bet_amounts)
+    if not bet_amount and copy_trader:
+        bet_amount = copy_trader.bet_amount
+
+    try:
+        shared_pos = (
+            copy_trader.positions if copy_trader
+            else momentum_engine.positions if momentum_engine
+            else None
+        )
+        martingale_engine = MartingaleEngine(
+            dry_run=not live_mode,
+            on_trade=on_martingale_trade,
+            bet_amount=bet_amount,
+            coin_bet_amounts=coin_bet_amounts,
+            shared_positions=shared_pos,
+        )
+        if lot_multiplier is not None:
+            martingale_engine.lot_multiplier = float(lot_multiplier)
+        martingale_engine.start()
+    except Exception as e:
+        print(f"[SERVER] Failed to start martingale engine: {e}")
+        import traceback; traceback.print_exc()
+        martingale_engine = None
+        return jsonify({"error": f"Failed to start: {e}"}), 500
+
+    stop_martingale.clear()
+    martingale_paused.clear()
+    martingale_thread = threading.Thread(target=martingale_loop, daemon=True)
+    martingale_thread.start()
+
+    mode_str = "LIVE" if live_mode else "DRY RUN"
+    return jsonify({
+        "success": True,
+        "message": f"Martingale engine started in {mode_str} mode",
+        "trigger_1": martingale_engine.trigger_1,
+        "trigger_2": martingale_engine.trigger_2,
+        "lot_multiplier": martingale_engine.lot_multiplier,
+    })
+
+
+@app.route('/api/martingale/stop', methods=['POST'])
+def api_martingale_stop():
+    """Stop the martingale engine."""
+    global martingale_engine, martingale_thread, stop_martingale
+
+    if not martingale_thread or not martingale_thread.is_alive():
+        return jsonify({"error": "Martingale engine not running"}), 400
+
+    stop_martingale.set()
+    martingale_thread.join(timeout=5)
+
+    stats = martingale_engine.get_stats() if martingale_engine else {}
+
+    if martingale_engine:
+        martingale_engine.stop()
+    martingale_engine = None
+
+    return jsonify({
+        "success": True,
+        "message": "Martingale engine stopped",
+        "stats": stats,
+    })
+
+
+@app.route('/api/martingale/pause', methods=['POST'])
+def api_martingale_pause():
+    """Pause martingale engine — stop new scans, keep resolution."""
+    if not martingale_thread or not martingale_thread.is_alive():
+        return jsonify({"error": "Martingale engine not running"}), 400
+
+    if martingale_paused.is_set():
+        return jsonify({"error": "Already paused"}), 400
+
+    martingale_paused.set()
+    open_count = (
+        len(martingale_engine.positions.get("open", []))
+        if martingale_engine else 0
+    )
+    return jsonify({
+        "success": True,
+        "message": f"Paused. Resolution running for {open_count} open position(s).",
+        "open_positions": open_count,
+    })
+
+
+@app.route('/api/martingale/resume', methods=['POST'])
+def api_martingale_resume():
+    """Resume martingale engine scanning."""
+    if not martingale_thread or not martingale_thread.is_alive():
+        return jsonify({"error": "Martingale engine not running"}), 400
+
+    if not martingale_paused.is_set():
+        return jsonify({"error": "Not paused"}), 400
+
+    martingale_paused.clear()
+    return jsonify({"success": True, "message": "Martingale engine resumed"})
+
+
+@app.route('/api/martingale/status')
+def api_martingale_status():
+    """Get martingale engine status."""
+    if not HAS_MARTINGALE_ENGINE:
+        return jsonify({
+            "available": False, "running": False,
+            "error": "Module not available",
+        })
+
+    running = martingale_thread and martingale_thread.is_alive()
+    status = {
+        "available": True,
+        "running": running,
+        "paused": martingale_paused.is_set() if running else False,
+    }
+
+    if martingale_engine:
+        status.update(martingale_engine.get_stats())
+
+    return jsonify(status)
+
+
+@app.route('/api/martingale/settings', methods=['POST'])
+def api_martingale_settings():
+    """Update martingale engine settings at runtime."""
+    if not martingale_engine:
+        return jsonify({"error": "Martingale engine not running"}), 400
+
+    data = request.get_json() or {}
+    changes = []
+
+    if 'lot_multiplier' in data:
+        old = martingale_engine.lot_multiplier
+        martingale_engine.lot_multiplier = float(data['lot_multiplier'])
+        changes.append(
+            f"lot_multiplier: {old:.2f}x -> {martingale_engine.lot_multiplier:.2f}x"
+        )
+
+    if 'trigger_1' in data:
+        old = martingale_engine.trigger_1
+        martingale_engine.trigger_1 = float(data['trigger_1'])
+        changes.append(
+            f"trigger_1: {old*100:.0f}c -> {martingale_engine.trigger_1*100:.0f}c"
+        )
+
+    if 'trigger_2' in data:
+        old = martingale_engine.trigger_2
+        martingale_engine.trigger_2 = float(data['trigger_2'])
+        changes.append(
+            f"trigger_2: {old*100:.0f}c -> {martingale_engine.trigger_2*100:.0f}c"
+        )
+
+    if 'bet_amount' in data:
+        old = martingale_engine.bet_amount
+        martingale_engine.bet_amount = float(data['bet_amount'])
+        changes.append(f"bet_amount: ${old:.2f} -> ${martingale_engine.bet_amount:.2f}")
+
+    if 'coin_bet_amounts' in data:
+        for coin, amt in data['coin_bet_amounts'].items():
+            old = martingale_engine.coin_bet_amounts.get(
+                coin, martingale_engine.bet_amount
+            )
+            martingale_engine.coin_bet_amounts[coin] = float(amt)
+            changes.append(f"{coin.upper()} lot: ${old:.2f} -> ${float(amt):.2f}")
+
+    if not changes:
+        return jsonify({"error": "No settings provided"}), 400
+
+    return jsonify({
+        "success": True,
+        "changes": changes,
+        "current": martingale_engine.get_stats(),
+    })
+
+
+@app.route('/api/martingale/trades')
+def api_martingale_trades():
+    """Get martingale engine trade history."""
+    limit = int(request.args.get('limit', 50))
+    trades = list(martingale_trades)[-limit:]
     trades.reverse()
     return jsonify(trades)
 

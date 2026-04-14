@@ -4,8 +4,8 @@
     "builder": "NIXPACKS"
   },
   "deploy": {
-    "startCommand": "/app/venv/bin/python3 -m hf_engine.server --port $PORT",
-    "healthcheckPath": "/health",
+    "startCommand": "/app/venv/bin/python3 hft_server.py --port $PORT --mode demo",
+    "healthcheckPath": "/api/status",
     "restartPolicyType": "ON_FAILURE",
     "restartPolicyMaxRetries": 10
   }
