@@ -65,15 +65,20 @@ class MartingaleEngine(InformedMoneyEngine):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.trigger_1 = MARTINGALE_TRIGGER_1
-        self.trigger_2 = MARTINGALE_TRIGGER_2
-        self.lot_multiplier = MAX_RENTRY_LOT_MULTIPLIER
-        self.min_entry_price = MARTINGALE_TRIGGER_1
+        # Re-read env vars fresh on every start (don't rely on import-time cache)
+        self.trigger_1 = float(os.getenv("MARTINGALE_TRIGGER_1", "0.65"))
+        self.trigger_2 = float(os.getenv("MARTINGALE_TRIGGER_2", "0.80"))
+        self.lot_multiplier = float(os.getenv("MAX_RENTRY_LOT_MULTIPLIER", "2.5"))
+        self.min_entry_price = self.trigger_1
         self.max_entry_price = 1.0
         self.interval_price_brackets = {}
         self.max_entries_per_market = 2
         # Track per-side entries: (condition_id, outcome_index)
         self.entered_sides: set = set()
+        print(f"[MARTINGALE] init: trigger_1={self.trigger_1}, "
+              f"trigger_2={self.trigger_2}, "
+              f"lot_multiplier={self.lot_multiplier}x "
+              f"(MAX_RENTRY_LOT_MULTIPLIER env var)", flush=True)
 
     # -------------------------------------------------------------------------
     # Lifecycle

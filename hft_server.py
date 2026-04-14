@@ -2896,7 +2896,10 @@ def api_martingale_start():
     live_mode = data.get('live', False)
     bet_amount = data.get('bet_amount')
     coin_bet_amounts = data.get('coin_bet_amounts')
-    lot_multiplier = data.get('lot_multiplier')
+    lot_multiplier = (
+        data.get('lot_multiplier')
+        or data.get('max_rentry_lot_multiplier')
+    )
 
     if live_mode and not data.get('confirm_live'):
         return jsonify({
@@ -3035,9 +3038,10 @@ def api_martingale_settings():
     data = request.get_json() or {}
     changes = []
 
-    if 'lot_multiplier' in data:
+    if 'lot_multiplier' in data or 'max_rentry_lot_multiplier' in data:
+        val = data.get('lot_multiplier', data.get('max_rentry_lot_multiplier'))
         old = martingale_engine.lot_multiplier
-        martingale_engine.lot_multiplier = float(data['lot_multiplier'])
+        martingale_engine.lot_multiplier = float(val)
         changes.append(
             f"lot_multiplier: {old:.2f}x -> {martingale_engine.lot_multiplier:.2f}x"
         )
