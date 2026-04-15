@@ -2384,12 +2384,20 @@ class CopyTrader:
         # Get our positions
         my_positions = get_positions(FUNDER_ADDRESS) if FUNDER_ADDRESS else []
 
+        # Diagnostic counters — report per-poll so silent filters don't hide
+        _already_seen = 0
+        _new_trades = 0
+        _down_filtered = 0
+
         for bet in bets:
             trade_id = bet.get("id") or f"{bet.get('conditionId')}_{bet.get('timestamp')}"
 
             # Skip if already copied
             if trade_id in self.copied_trades:
+                _already_seen += 1
                 continue
+
+            _new_trades += 1
 
             # Mark as seen (even if we skip it)
             self.copied_trades.add(trade_id)
@@ -2450,6 +2458,8 @@ class CopyTrader:
 
             # Skip DOWN bets if disabled
             if not COPY_DOWN_ENABLED and outcome.lower() == "down":
+                _down_filtered += 1
+                print(f"[ALGO] Skip (DOWN disabled): {title}")
                 self.trades_skipped += 1
                 continue
 
@@ -2750,6 +2760,11 @@ class CopyTrader:
 
             self.trades_copied += copied
             self.total_buys += copied
+
+        # Per-poll summary — shows immediately if all trades are silently filtered
+        print(f"[ALGO] Poll summary: {len(bets)} fetched | "
+              f"{_already_seen} already-seen | {_new_trades} new | "
+              f"{_down_filtered} down-filtered | {copied} copied", flush=True)
 
         return copied
 
