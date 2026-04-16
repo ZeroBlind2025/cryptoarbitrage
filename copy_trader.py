@@ -2137,9 +2137,21 @@ class CopyTrader:
         # Only copy NEW trades that happen AFTER we start monitoring
         print("[ALGO] Loading existing trades to avoid duplicates...")
         existing_bets = get_latest_bets(TARGET_ADDRESS, limit=50)
+        crypto_seen = 0
+        other_seen = 0
+        other_samples: list[str] = []
         for bet in existing_bets:
             trade_id = bet.get("id") or f"{bet.get('conditionId')}_{bet.get('timestamp')}"
             self.copied_trades.add(trade_id)
+            # Categorize so the operator can tell at a glance whether the
+            # target is actually trading non-crypto markets (e.g. weather).
+            if is_crypto_market(bet):
+                crypto_seen += 1
+            else:
+                other_seen += 1
+                if len(other_samples) < 5:
+                    title = (bet.get("title") or bet.get("slug") or "?")[:60]
+                    other_samples.append(title)
             # Also snapshot target sizes so we don't re-copy existing positions
             cid = bet.get("conditionId") or bet.get("condition_id") or ""
             oi = bet.get("outcomeIndex")
@@ -2151,6 +2163,14 @@ class CopyTrader:
             if cid and target_size:
                 self.copied_sizes.add((cid, str(oi), str(round(float(target_size), 2))))
         print(f"[ALGO] Marked {len(self.copied_trades)} existing trades ({len(self.copied_sizes)} unique sizes) as seen. Waiting for NEW trades...")
+        print(f"[ALGO] Target history breakdown: {crypto_seen} crypto | {other_seen} non-crypto (weather/sports/etc)")
+        if other_seen and not self.crypto_only:
+            for sample in other_samples:
+                print(f"         non-crypto sample: {sample}")
+        elif other_seen and self.crypto_only:
+            print(f"[ALGO] crypto_only=True — non-crypto trades will be skipped. Set COPY_CRYPTO_ONLY=false to copy them.")
+        elif not other_seen:
+            print(f"[ALGO] No non-crypto trades in target history — target may not trade weather markets.")
 
         # Snapshot existing sells so we don't mirror historical ones on startup
         existing_sells = get_latest_sells(TARGET_ADDRESS, limit=50)
@@ -2250,6 +2270,15 @@ class CopyTrader:
 
         # Get our positions
         my_positions = get_positions(FUNDER_ADDRESS) if FUNDER_ADDRESS else []
+
+        # Tick summary: how many of the fetched bets are new vs already seen,
+        # and how many of the new ones are non-crypto. Helps diagnose "no
+        # weather trades showing" — if every fetched bet is already-seen the
+        # target simply hasn't placed anything new since startup.
+        new_bets = [b for b in bets if (b.get("id") or f"{b.get('conditionId')}_{b.get('timestamp')}") not in self.copied_trades]
+        if new_bets:
+            new_other = sum(1 for b in new_bets if not is_crypto_market(b))
+            print(f"[ALGO] Tick: {len(bets)} fetched | {len(new_bets)} new | {new_other} non-crypto new", flush=True)
 
         for bet in bets:
             trade_id = bet.get("id") or f"{bet.get('conditionId')}_{bet.get('timestamp')}"
