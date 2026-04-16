@@ -1443,9 +1443,16 @@ def api_copy_trader_start():
         if not bet_amount and momentum_engine:
             bet_amount = momentum_engine.bet_amount
 
+        # Respect crypto_only from the request body; fall back to the
+        # COPY_CRYPTO_ONLY env var (default True) so weather-copy deployments
+        # can flip the filter off without editing the code.
+        env_default = os.getenv("COPY_CRYPTO_ONLY", "true").strip().lower() not in ("0", "false", "no", "off")
+        crypto_only = data.get('crypto_only', env_default)
+        print(f"[SERVER] Copy trader crypto_only={crypto_only} (request={data.get('crypto_only')!r}, env default={env_default})", flush=True)
+
         copy_trader = CopyTrader(
             dry_run=True,
-            crypto_only=True,
+            crypto_only=crypto_only,
             on_trade=on_copy_trade,
         )
         if bet_amount:
