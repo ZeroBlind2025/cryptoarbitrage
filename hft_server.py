@@ -1388,6 +1388,10 @@ def api_copy_trader_start():
     try:
         bet_amount = data.get('bet_amount')
         coin_bet_amounts = data.get('coin_bet_amounts')
+        # Allow caller to disable crypto-only filter (e.g. for weather/sports traders).
+        # Precedence: request body > env var > default True.
+        crypto_only_default = os.getenv('COPY_CRYPTO_ONLY', 'true').lower() == 'true'
+        crypto_only = data.get('crypto_only', crypto_only_default)
 
         # Share coin bet amounts from momentum engine if available
         if not coin_bet_amounts and momentum_engine:
@@ -1397,7 +1401,7 @@ def api_copy_trader_start():
 
         copy_trader = CopyTrader(
             dry_run=True,
-            crypto_only=True,
+            crypto_only=crypto_only,
             on_trade=on_copy_trade,
         )
         if bet_amount:
