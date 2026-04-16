@@ -1052,6 +1052,17 @@ def index():
     return app.send_static_file('hft_dashboard.html')
 
 
+@app.route('/health')
+def health():
+    """Lightweight liveness probe for Railway / load balancers."""
+    return jsonify({
+        "status": "ok",
+        "mode": server_state.get("mode"),
+        "is_running": bool(server_state.get("is_running")),
+        "copy_trader_running": bool(copy_trader_thread and copy_trader_thread.is_alive()),
+    })
+
+
 @app.route('/api/status')
 def api_status():
     """Get server status"""
