@@ -2127,7 +2127,7 @@ class CopyTrader:
         # Get target's recent bets — always verbose to diagnose scanning
         bets = get_latest_bets(TARGET_ADDRESS, verbose=True)
         if not bets:
-            return 0
+            bets = []
 
         # Get our positions
         my_positions = get_positions(FUNDER_ADDRESS) if FUNDER_ADDRESS else []
