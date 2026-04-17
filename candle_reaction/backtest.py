@@ -36,12 +36,15 @@ def run(
     warmup: int = 30,
     verbose: bool = True,
     contrarian: Optional[bool] = None,
+    aggregate: Optional[int] = None,
 ) -> dict:
     cfg = load()
     if not cfg.api_key:
         raise RuntimeError("COINDESK_API_KEY is not set")
     if contrarian is None:
         contrarian = cfg.contrarian
+    if aggregate is not None:
+        cfg.aggregate = int(aggregate)
 
     client = CoindeskClient(cfg)
     if verbose:
@@ -58,12 +61,18 @@ def run(
     equity = cfg.bankroll
     wins = losses = voids = skips = 0
     bucket_stats: dict[str, dict[str, int]] = defaultdict(lambda: {"n": 0, "w": 0})
+    regime_stats: dict[str, dict[str, int]] = defaultdict(lambda: {"n": 0, "w": 0})
 
     for i in range(warmup, len(candles) - 1):
         hist = candles[: i + 1]
         feat = extract(hist, lookback=cfg.lookback)
         j = judge(feat, contrarian=contrarian)
-        stake = stake_for(j.confidence, cfg)
+        # The regime judge can return side="SKIP" for neutral bars.
+        # Respect that before applying the confidence ladder.
+        if j.side == "SKIP":
+            stake = 0.0
+        else:
+            stake = stake_for(j.confidence, cfg)
 
         next_close = candles[i + 1].close
         cur_close = candles[i].close
@@ -92,6 +101,9 @@ def run(
             bucket_stats[bucket]["n"] += 1
             if result == "WIN":
                 bucket_stats[bucket]["w"] += 1
+            regime_stats[j.regime]["n"] += 1
+            if result == "WIN":
+                regime_stats[j.regime]["w"] += 1
 
         out_rows.append({
             "ts": candles[i].ts,
@@ -104,6 +116,7 @@ def run(
             "streak": feat.streak,
             "p_up": round(j.p_up, 6),
             "side": j.side,
+            "regime": j.regime,
             "confidence": round(j.confidence, 6),
             "stake": stake,
             "actual": actual,
@@ -131,6 +144,14 @@ def run(
         }
         for name in ("70-80", "80-90", "90-100")
     }
+    regimes = {
+        name: {
+            "n": s["n"],
+            "wins": s["w"],
+            "hit_rate": (s["w"] / s["n"]) if s["n"] else 0.0,
+        }
+        for name, s in regime_stats.items()
+    }
     result = {
         "path": str(out_path),
         "csv_name": out_path.name,
@@ -140,6 +161,7 @@ def run(
         "end_ts": candles[-1].ts,
         "warmup": warmup,
         "mode": "contrarian" if contrarian else "continuation",
+        "aggregate": cfg.aggregate,
         "wins": wins,
         "losses": losses,
         "voids": voids,
@@ -149,6 +171,7 @@ def run(
         "equity": round(equity, 4),
         "pnl": round(equity - cfg.bankroll, 4),
         "buckets": buckets,
+        "regimes": regimes,
     }
 
     if verbose:
@@ -168,6 +191,11 @@ def run(
         for name in ("70-80", "80-90", "90-100"):
             b = buckets[name]
             print(f"  {name}: {b['n']:4d} trades, hit {b['hit_rate']:.2%}")
+        print("\nHit rate by regime:")
+        for name in ("momentum", "exhaustion", "neutral"):
+            if name in regimes:
+                r = regimes[name]
+                print(f"  {name:10s}: {r['n']:4d} trades, hit {r['hit_rate']:.2%}")
         print(f"\nWrote {out_path}")
     return result
 
@@ -202,6 +230,7 @@ def start_async(
     total_candles: int = 6000,
     warmup: int = 30,
     contrarian: Optional[bool] = None,
+    aggregate: Optional[int] = None,
 ) -> dict:
     """Kick off a backtest in a daemon thread. Idempotent while running."""
     with _STATE_LOCK:
@@ -212,23 +241,29 @@ def start_async(
             "started_at": int(time.time()),
             "finished_at": None,
             "params": {"candles": total_candles, "warmup": warmup,
-                       "contrarian": bool(contrarian)},
+                       "contrarian": bool(contrarian), "aggregate": aggregate},
             "result": None,
             "error": None,
         })
     threading.Thread(
         target=_run_and_store,
-        args=(total_candles, warmup, contrarian),
+        args=(total_candles, warmup, contrarian, aggregate),
         daemon=True,
         name="candle-backtest",
     ).start()
     return get_state()
 
 
-def _run_and_store(total_candles: int, warmup: int, contrarian: Optional[bool]) -> None:
+def _run_and_store(
+    total_candles: int,
+    warmup: int,
+    contrarian: Optional[bool],
+    aggregate: Optional[int],
+) -> None:
     try:
         result = run(total_candles=total_candles, warmup=warmup,
-                     verbose=False, contrarian=contrarian)
+                     verbose=False, contrarian=contrarian,
+                     aggregate=aggregate)
         with _STATE_LOCK:
             _STATE["status"] = "done"
             _STATE["finished_at"] = int(time.time())
@@ -257,8 +292,12 @@ def main() -> None:
                    help="Warmup bars skipped for z-score windows")
     p.add_argument("--contrarian", action="store_true",
                    help="Flip the judge (trade against the signal)")
+    p.add_argument("--aggregate", type=int, default=None,
+                   help="Candle aggregation in minutes (default: config / 5m). "
+                        "e.g. --aggregate 15 for 15m bars")
     args = p.parse_args()
-    run(total_candles=args.candles, warmup=args.warmup, contrarian=args.contrarian)
+    run(total_candles=args.candles, warmup=args.warmup,
+        contrarian=args.contrarian, aggregate=args.aggregate)
 
 
 if __name__ == "__main__":

@@ -135,8 +135,17 @@ def create_app() -> Flask:
         contrarian = data.get("contrarian")
         if contrarian is not None:
             contrarian = bool(contrarian)
+        aggregate = data.get("aggregate")
+        if aggregate is not None:
+            try:
+                aggregate = int(aggregate)
+            except (TypeError, ValueError):
+                return jsonify({"error": "aggregate must be an integer"}), 400
+            if aggregate not in (1, 5, 15, 60):
+                return jsonify({"error": "aggregate must be one of 1, 5, 15, 60"}), 400
         return jsonify(bt.start_async(total_candles=candles, warmup=warmup,
-                                      contrarian=contrarian))
+                                      contrarian=contrarian,
+                                      aggregate=aggregate))
 
     @app.route("/api/candle/backtest/status")
     def api_backtest_status():
