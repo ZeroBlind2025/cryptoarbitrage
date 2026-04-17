@@ -31,10 +31,17 @@ from .judge import judge
 from .sizing import stake_for
 
 
-def run(total_candles: int = 6000, warmup: int = 30, verbose: bool = True) -> dict:
+def run(
+    total_candles: int = 6000,
+    warmup: int = 30,
+    verbose: bool = True,
+    contrarian: Optional[bool] = None,
+) -> dict:
     cfg = load()
     if not cfg.api_key:
         raise RuntimeError("COINDESK_API_KEY is not set")
+    if contrarian is None:
+        contrarian = cfg.contrarian
 
     client = CoindeskClient(cfg)
     if verbose:
@@ -55,7 +62,7 @@ def run(total_candles: int = 6000, warmup: int = 30, verbose: bool = True) -> di
     for i in range(warmup, len(candles) - 1):
         hist = candles[: i + 1]
         feat = extract(hist, lookback=cfg.lookback)
-        j = judge(feat)
+        j = judge(feat, contrarian=contrarian)
         stake = stake_for(j.confidence, cfg)
 
         next_close = candles[i + 1].close
@@ -132,6 +139,7 @@ def run(total_candles: int = 6000, warmup: int = 30, verbose: bool = True) -> di
         "start_ts": candles[0].ts,
         "end_ts": candles[-1].ts,
         "warmup": warmup,
+        "mode": "contrarian" if contrarian else "continuation",
         "wins": wins,
         "losses": losses,
         "voids": voids,
@@ -190,7 +198,11 @@ def get_state() -> dict:
         return dict(_STATE)
 
 
-def start_async(total_candles: int = 6000, warmup: int = 30) -> dict:
+def start_async(
+    total_candles: int = 6000,
+    warmup: int = 30,
+    contrarian: Optional[bool] = None,
+) -> dict:
     """Kick off a backtest in a daemon thread. Idempotent while running."""
     with _STATE_LOCK:
         if _STATE["status"] == "running":
@@ -199,22 +211,24 @@ def start_async(total_candles: int = 6000, warmup: int = 30) -> dict:
             "status": "running",
             "started_at": int(time.time()),
             "finished_at": None,
-            "params": {"candles": total_candles, "warmup": warmup},
+            "params": {"candles": total_candles, "warmup": warmup,
+                       "contrarian": bool(contrarian)},
             "result": None,
             "error": None,
         })
     threading.Thread(
         target=_run_and_store,
-        args=(total_candles, warmup),
+        args=(total_candles, warmup, contrarian),
         daemon=True,
         name="candle-backtest",
     ).start()
     return get_state()
 
 
-def _run_and_store(total_candles: int, warmup: int) -> None:
+def _run_and_store(total_candles: int, warmup: int, contrarian: Optional[bool]) -> None:
     try:
-        result = run(total_candles=total_candles, warmup=warmup, verbose=False)
+        result = run(total_candles=total_candles, warmup=warmup,
+                     verbose=False, contrarian=contrarian)
         with _STATE_LOCK:
             _STATE["status"] = "done"
             _STATE["finished_at"] = int(time.time())
@@ -241,8 +255,10 @@ def main() -> None:
                    help="Number of 5m candles to replay (default: 6000 ≈ 20 days)")
     p.add_argument("--warmup", type=int, default=30,
                    help="Warmup bars skipped for z-score windows")
+    p.add_argument("--contrarian", action="store_true",
+                   help="Flip the judge (trade against the signal)")
     args = p.parse_args()
-    run(total_candles=args.candles, warmup=args.warmup)
+    run(total_candles=args.candles, warmup=args.warmup, contrarian=args.contrarian)
 
 
 if __name__ == "__main__":

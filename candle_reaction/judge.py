@@ -47,7 +47,7 @@ def _sigmoid(x: float) -> float:
     return z / (1.0 + z)
 
 
-def judge(f: Features, w: Weights = Weights()) -> Judgement:
+def judge(f: Features, w: Weights = Weights(), contrarian: bool = False) -> Judgement:
     # Centre close_position at 0 and scale to [-1, +1].
     cp = (f.close_position - 0.5) * 2.0
 
@@ -66,6 +66,8 @@ def judge(f: Features, w: Weights = Weights()) -> Judgement:
 
     z = w.bias + amplified + streak_term
     p_up = _sigmoid(z)
+    if contrarian:
+        p_up = 1.0 - p_up
     p_down = 1.0 - p_up
     if p_up >= p_down:
         return Judgement(p_up=p_up, p_down=p_down, side="UP", confidence=p_up)

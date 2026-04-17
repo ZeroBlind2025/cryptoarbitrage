@@ -19,11 +19,26 @@ Env::
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 from pathlib import Path
 
 from flask import Flask, Response, jsonify, request, send_from_directory
 from flask_cors import CORS
+
+
+# Make sure log.info() calls in live.py / polymarket.py reach stdout so
+# Railway surfaces them. Flask/gunicorn don't always set up a root handler
+# for non-werkzeug loggers.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+# Drop the per-request access log; the dashboard polls 3 endpoints every
+# 5s and drowns out real ENTER/RESOLVE/SKIP lines. Real errors still
+# surface at WARNING.
+logging.getLogger("werkzeug").setLevel(logging.WARNING)
 
 from . import backtest as bt
 from .live import get_engine
@@ -68,6 +83,15 @@ def create_app() -> Flask:
         eng.stop()
         return jsonify({"success": True, **eng.status()})
 
+    @app.route("/api/candle/mode", methods=["POST"])
+    def api_mode():
+        data = request.get_json(silent=True) or {}
+        if "contrarian" not in data:
+            return jsonify({"error": "missing 'contrarian' boolean"}), 400
+        eng = get_engine()
+        eng.set_contrarian(bool(data["contrarian"]))
+        return jsonify({"success": True, **eng.status()})
+
     @app.route("/api/candle/trades")
     def api_trades():
         eng = get_engine()
@@ -108,7 +132,11 @@ def create_app() -> Flask:
             return jsonify({"error": "candles/warmup must be integers"}), 400
         candles = max(100, min(candles, 20000))
         warmup = max(5, min(warmup, 200))
-        return jsonify(bt.start_async(total_candles=candles, warmup=warmup))
+        contrarian = data.get("contrarian")
+        if contrarian is not None:
+            contrarian = bool(contrarian)
+        return jsonify(bt.start_async(total_candles=candles, warmup=warmup,
+                                      contrarian=contrarian))
 
     @app.route("/api/candle/backtest/status")
     def api_backtest_status():
