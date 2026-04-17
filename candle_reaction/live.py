@@ -31,8 +31,8 @@ from .judge import judge
 from .polymarket import (
     PolyMarket,
     discover_btc_updown_5m,
+    get_market_settled_prices,
     get_resolution,
-    get_token_price_final,
     get_top_of_book,
 )
 from .store import SignalRow, Store, TradeRow
@@ -202,12 +202,17 @@ class CandleReactionEngine:
     def _try_poly_resolution_all(self) -> None:
         """Poll Polymarket for resolution of every pending trade.
 
-        We look up the settled price of the *specific* CLOB token we
-        "bought" at entry (stored as ``t.token_id``). A price of ~1.0
-        means our token paid out -> WIN; ~0.0 means it settled
-        worthless -> LOSS; ~0.5 would be a VOID. This bypasses any
-        UP/DOWN outcome-label interpretation, so it's impossible to
-        invert the result.
+        A market goes through several states after its 5m window ends:
+
+          1. ``closed=true`` but oracle hasn't posted yet: prices are
+             the last-traded book (e.g. [0.98, 0.02]).
+          2. Oracle settled: prices are [1.0, 0.0] -- sum = 1.0.
+          3. Post-redemption: winning token drops to 0 on the book
+             while the loser can show a 1c residual ([0, 0.01]).
+
+        Only state (2) is the definitive oracle outcome. We require
+        ``our_price + other_price`` to sum to ~1.0 before trusting the
+        numbers; any other sum means 'not yet oracle-settled, poll again'.
         """
         now = int(time.time())
         for t in list(self.state.pending_trades):
@@ -217,16 +222,34 @@ class CandleReactionEngine:
             if now < expected:
                 continue
             try:
-                price = get_token_price_final(
-                    t.market_slug, t.token_id, session=self.client.session,
+                settled = get_market_settled_prices(
+                    t.market_slug, session=self.client.session,
                 )
             except Exception as e:  # pragma: no cover - network
-                log.debug("poly token-price check failed for %s: %s",
+                log.debug("poly settled-prices check failed for %s: %s",
                           t.market_slug, e)
                 continue
-            if price is None:
+            if not settled:
                 continue
-            self._finalise_trade_by_token(t, settled_price=price)
+
+            our_price = settled.get(str(t.token_id))
+            others = [p for tid, p in settled.items() if tid != str(t.token_id)]
+            other_price = others[0] if others else None
+            if our_price is None or other_price is None:
+                continue
+
+            total = our_price + other_price
+            # Only state (2) above: oracle-settled clean 1/0.
+            if abs(total - 1.0) > 0.02:
+                log.info(
+                    "BTC [%s] awaiting oracle settle: our=%.4f other=%.4f sum=%.4f",
+                    _window_label(t.entry_ts), our_price, other_price, total,
+                )
+                continue
+
+            self._finalise_trade_by_token(
+                t, our_price=our_price, other_price=other_price,
+            )
 
     def _void_stale_trades(self) -> None:
         """Safety valve: if Polymarket never settles, mark UNRESOLVED.
@@ -371,31 +394,34 @@ class CandleReactionEngine:
         )
         return trade, market, up_ask, down_ask
 
-    def _finalise_trade_by_token(self, t: TradeRow, settled_price: float) -> None:
-        """Close out ``t`` using the settled price of our specific token.
+    def _finalise_trade_by_token(
+        self, t: TradeRow, our_price: float, other_price: float,
+    ) -> None:
+        """Close out ``t`` using the oracle-settled token prices.
 
-        ~1.0 -> our token paid out -> WIN
-        ~0.0 -> our token was worthless -> LOSS
-        ~0.5 -> VOID
-        anything else is ambiguous; log and skip.
+        Caller has already verified ``our_price + other_price`` ≈ 1.0
+        so the prices are the oracle-settled outcome, not a transient
+        book state. Our token at ~1.0 means we won; at ~0.0 means we
+        lost; ~0.5 means the market voided.
         """
-        t.settled_token_price = settled_price
-        if settled_price >= 0.99:
+        t.settled_token_price = our_price
+        if our_price >= 0.98:
             t.result = "WIN"
             if t.fill_price and t.fill_price > 0:
                 t.pnl = t.stake * (1.0 - t.fill_price) / t.fill_price
             else:
                 t.pnl = t.stake
-        elif settled_price <= 0.01:
+        elif our_price <= 0.02:
             t.result = "LOSS"
             t.pnl = -t.stake
-        elif 0.45 <= settled_price <= 0.55:
+        elif 0.45 <= our_price <= 0.55:
             t.result = "VOID"
             t.pnl = 0.0
         else:
             log.warning(
-                "BTC [%s] polymarket ambiguous settlement token_price=%.4f; "
-                "leaving trade open for re-poll", _window_label(t.entry_ts), settled_price,
+                "BTC [%s] settlement within sum=1 band but our_price=%.4f is ambiguous; "
+                "leaving open",
+                _window_label(t.entry_ts), our_price,
             )
             return
 
@@ -403,11 +429,11 @@ class CandleReactionEngine:
         t.resolution_source = "polymarket"
         self.store.record_trade(t)
         log.info(
-            "BTC [%s] RESOLVE %s -> %s pnl=%s$%.2f (token=%.3f)",
+            "BTC [%s] RESOLVE %s -> %s pnl=%s$%.2f (our=%.3f other=%.3f)",
             _window_label(t.entry_ts), t.side, t.result,
             "+" if (t.pnl or 0) >= 0 else "-",
             abs(t.pnl or 0.0),
-            settled_price,
+            our_price, other_price,
         )
         if t in self.state.pending_trades:
             self.state.pending_trades.remove(t)

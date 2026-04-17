@@ -233,24 +233,23 @@ def get_resolution(
     return result
 
 
-def get_token_price_final(
+def get_market_settled_prices(
     slug: str,
-    token_id: str,
     session: Optional[requests.Session] = None,
-) -> Optional[float]:
-    """Return the settled price of a specific CLOB token, or None if
-    the market hasn't closed yet.
+) -> Optional[dict[str, float]]:
+    """Return ``{token_id: price}`` for a closed market, or None.
 
-    This is the absolute-clarity resolution path: we look up the price
-    of the exact token we "bought" at entry, avoiding any interpretation
-    of the market's UP/DOWN outcome labels. Token price ~1.0 means the
-    token paid out (our side won); ~0.0 means it settled worthless.
+    Prices sum to ~1.0 only when the oracle has fully settled the
+    market (winner=1.0, loser=0.0). Between market close and oracle
+    finalisation, and/or after redemption, Gamma can report transient
+    states like [0, 0.01] that should be *ignored* -- the caller is
+    expected to require a near-unity sum before acting.
     """
     sess = session or requests.Session()
     try:
         r = sess.get(f"{GAMMA_BASE}/events", params={"slug": slug}, timeout=6)
     except requests.RequestException as e:
-        log.debug("gamma token-price %s network error: %s", slug, e)
+        log.debug("gamma settled-prices %s network error: %s", slug, e)
         return None
     if r.status_code != 200:
         return None
@@ -259,7 +258,6 @@ def get_token_price_final(
     except ValueError:
         return None
 
-    target = str(token_id)
     events = data if isinstance(data, list) else [data] if isinstance(data, dict) else []
     for ev in events:
         for mkt in ev.get("markets", []) or []:
@@ -269,13 +267,30 @@ def get_token_price_final(
             prices = _decode_list(mkt.get("outcomePrices"))
             if not token_ids or not prices or len(token_ids) != len(prices):
                 continue
+            out: dict[str, float] = {}
             for tid, pr in zip(token_ids, prices):
-                if str(tid) == target:
-                    try:
-                        return float(pr)
-                    except (TypeError, ValueError):
-                        return None
+                try:
+                    out[str(tid)] = float(pr)
+                except (TypeError, ValueError):
+                    continue
+            if out:
+                return out
     return None
+
+
+def get_token_price_final(
+    slug: str,
+    token_id: str,
+    session: Optional[requests.Session] = None,
+) -> Optional[float]:
+    """Legacy single-token lookup. Prefer ``get_market_settled_prices``
+    so the caller can check that the price pair sums to ~1 (oracle-
+    settled) and avoid transient book-residual states like [0, 0.01].
+    """
+    prices = get_market_settled_prices(slug, session=session)
+    if not prices:
+        return None
+    return prices.get(str(token_id))
 
 
 def get_resolution_detailed(
