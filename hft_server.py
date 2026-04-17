@@ -1147,6 +1147,42 @@ def api_candle_signals():
     return jsonify({"signals": eng.store.read_signals(limit=limit)})
 
 
+@app.route('/api/candle/backtest', methods=['POST'])
+def api_candle_backtest_start():
+    """Kick off a backtest in a background thread."""
+    from candle_reaction import backtest as bt
+    data = request.get_json(silent=True) or {}
+    try:
+        candles = int(data.get("candles", 6000))
+        warmup = int(data.get("warmup", 30))
+    except (TypeError, ValueError):
+        return jsonify({"error": "candles/warmup must be integers"}), 400
+    candles = max(100, min(candles, 20000))
+    warmup = max(5, min(warmup, 200))
+    return jsonify(bt.start_async(total_candles=candles, warmup=warmup))
+
+
+@app.route('/api/candle/backtest/status')
+def api_candle_backtest_status():
+    from candle_reaction import backtest as bt
+    return jsonify(bt.get_state())
+
+
+@app.route('/api/candle/backtest/export')
+def api_candle_backtest_export():
+    from candle_reaction import backtest as bt
+    path = bt.latest_csv_path()
+    if not path or not path.exists():
+        return jsonify({"error": "no backtest result available"}), 404
+    with path.open("r") as fh:
+        body = fh.read()
+    return Response(
+        body,
+        mimetype="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{path.name}"'},
+    )
+
+
 @app.route('/api/candle/export')
 def api_candle_export():
     """Export trades+signals as CSV. `?kind=trades` or `?kind=signals`."""
