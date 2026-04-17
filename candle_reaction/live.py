@@ -93,10 +93,15 @@ class CandleReactionEngine:
             "last_judged_ts": s.last_judged_ts,
             "last_error": s.last_error,
             "bankroll": self.cfg.bankroll,
+            "mode": "contrarian" if self.cfg.contrarian else "continuation",
             **summary,
             "last_signal": self._signal_snapshot(last) if last else None,
             "open_trade": self._trade_snapshot(open_t) if open_t else None,
         }
+
+    def set_contrarian(self, contrarian: bool) -> None:
+        """Flip live-engine polarity. Only affects signals after the flip."""
+        self.cfg.contrarian = bool(contrarian)
 
     # ---- main loop ----
 
@@ -160,7 +165,7 @@ class CandleReactionEngine:
 
         # 2. Judge the newly-closed candle.
         feat = extract(closed_hist, lookback=self.cfg.lookback)
-        j = judge(feat)
+        j = judge(feat, contrarian=self.cfg.contrarian)
         stake = stake_for(j.confidence, self.cfg)
 
         # 3. Record the signal.

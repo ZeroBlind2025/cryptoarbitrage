@@ -50,6 +50,11 @@ class Config:
     # Rolling window for volume/range z-scores.
     lookback: int = 20
 
+    # When True, flip the judge's output (trade against the signal).
+    # The 20-day backtest showed 45% hit rate at 90+% confidence --
+    # decisive closes fade into the next bar on BTC 5m.
+    contrarian: bool = False
+
     # Where trades + signals are persisted.
     data_dir: Path = field(default_factory=lambda: Path(__file__).parent / "data")
     trades_csv: str = "trades.csv"
@@ -70,4 +75,7 @@ def load() -> Config:
     bankroll = os.environ.get("CANDLE_BANKROLL")
     if bankroll:
         cfg.bankroll = float(bankroll)
+    contrarian = os.environ.get("CANDLE_CONTRARIAN", "").strip().lower()
+    if contrarian in ("1", "true", "yes", "on"):
+        cfg.contrarian = True
     return cfg

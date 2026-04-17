@@ -68,6 +68,15 @@ def create_app() -> Flask:
         eng.stop()
         return jsonify({"success": True, **eng.status()})
 
+    @app.route("/api/candle/mode", methods=["POST"])
+    def api_mode():
+        data = request.get_json(silent=True) or {}
+        if "contrarian" not in data:
+            return jsonify({"error": "missing 'contrarian' boolean"}), 400
+        eng = get_engine()
+        eng.set_contrarian(bool(data["contrarian"]))
+        return jsonify({"success": True, **eng.status()})
+
     @app.route("/api/candle/trades")
     def api_trades():
         eng = get_engine()
@@ -108,7 +117,11 @@ def create_app() -> Flask:
             return jsonify({"error": "candles/warmup must be integers"}), 400
         candles = max(100, min(candles, 20000))
         warmup = max(5, min(warmup, 200))
-        return jsonify(bt.start_async(total_candles=candles, warmup=warmup))
+        contrarian = data.get("contrarian")
+        if contrarian is not None:
+            contrarian = bool(contrarian)
+        return jsonify(bt.start_async(total_candles=candles, warmup=warmup,
+                                      contrarian=contrarian))
 
     @app.route("/api/candle/backtest/status")
     def api_backtest_status():
