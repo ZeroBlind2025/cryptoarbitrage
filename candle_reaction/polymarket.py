@@ -199,3 +199,70 @@ def _top(levels: list, pick_max: bool) -> Optional[tuple[float, float]]:
         if best is None or (pick_max and p > best[0]) or (not pick_max and p < best[0]):
             best = (p, s)
     return best
+
+
+def get_resolution(
+    slug: str,
+    session: Optional[requests.Session] = None,
+) -> Optional[str]:
+    """Return 'UP', 'DOWN', 'VOID', or None if the market hasn't resolved.
+
+    Polymarket settles the BTC updown-5m markets off the Chainlink
+    BTC/USD feed. Reading the resolved outcome direct from Gamma is
+    equivalent to reading the Chainlink settlement without replicating
+    their resolution rule locally.
+    """
+    sess = session or requests.Session()
+    try:
+        r = sess.get(f"{GAMMA_BASE}/events", params={"slug": slug}, timeout=6)
+    except requests.RequestException as e:
+        log.debug("gamma resolve %s network error: %s", slug, e)
+        return None
+    if r.status_code != 200:
+        return None
+    try:
+        data = r.json()
+    except ValueError:
+        return None
+
+    events = data if isinstance(data, list) else [data] if isinstance(data, dict) else []
+    for ev in events:
+        for mkt in ev.get("markets", []) or []:
+            res = _parse_resolution(mkt)
+            if res is not None:
+                return res
+    return None
+
+
+def _parse_resolution(mkt: dict) -> Optional[str]:
+    """Read outcomePrices to determine if/how the market resolved.
+
+    On an unresolved market the prices are live book levels (e.g. 0.45/0.55).
+    Once Polymarket settles, they collapse to [1.0, 0.0] or [0.0, 1.0].
+    """
+    prices = mkt.get("outcomePrices")
+    if isinstance(prices, str):
+        import json
+        try:
+            prices = json.loads(prices)
+        except ValueError:
+            return None
+    if not isinstance(prices, (list, tuple)) or len(prices) < 2:
+        return None
+    try:
+        up_price = float(prices[0])
+        down_price = float(prices[1])
+    except (TypeError, ValueError):
+        return None
+
+    # Definitive-resolution threshold: one side is ~1 and the other ~0.
+    if up_price >= 0.99 and down_price <= 0.01:
+        return "UP"
+    if down_price >= 0.99 and up_price <= 0.01:
+        return "DOWN"
+
+    # Some markets void to a 50/50 split.
+    closed = bool(mkt.get("closed"))
+    if closed and abs(up_price - 0.5) < 0.01 and abs(down_price - 0.5) < 0.01:
+        return "VOID"
+    return None

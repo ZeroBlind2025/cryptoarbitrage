@@ -28,7 +28,7 @@ from .config import Config, load
 from .edge import size_edge_trade
 from .features import extract
 from .judge import judge
-from .polymarket import PolyMarket, discover_btc_updown_5m, get_top_of_book
+from .polymarket import PolyMarket, discover_btc_updown_5m, get_resolution, get_top_of_book
 from .store import SignalRow, Store, TradeRow
 
 log = logging.getLogger("candle_reaction")
@@ -144,7 +144,17 @@ class CandleReactionEngine:
             self.state.last_poll_ts = int(time.time())
             self._stop.wait(self.cfg.poll_interval_sec)
 
+    # Seconds after the expected resolve time before we give up on
+    # Polymarket and fall back to CoinDesk. 5 min is long enough for
+    # slow resolutions / transient Gamma errors.
+    FALLBACK_AFTER_SEC = 300
+
     def _tick(self) -> None:
+        # Opportunistic Polymarket resolution check on every tick,
+        # independent of CoinDesk candle arrival. Most trades resolve
+        # within ~60s of the 5m boundary.
+        self._try_poly_resolution()
+
         fresh = self.client.fetch_minutes(limit=30)
         if not fresh:
             return
@@ -175,8 +185,32 @@ class CandleReactionEngine:
         self._process_new_close(newest, closed)
         self.state.last_judged_ts = newest.ts
 
+    def _try_poly_resolution(self) -> None:
+        """Poll Polymarket for resolution of the open trade.
+
+        Fires on every tick. A no-op if there's no open trade, no
+        market slug, or the market isn't settled yet.
+        """
+        t = self.state.open_trade
+        if not t or not t.market_slug:
+            return
+        # Expected resolve time = entry + 5m. Don't even ask before then.
+        expected = t.entry_ts + self.cfg.aggregate * 60
+        if int(time.time()) < expected:
+            return
+        try:
+            outcome = get_resolution(t.market_slug, session=self.client.session)
+        except Exception as e:  # pragma: no cover - network
+            log.debug("poly resolution check failed: %s", e)
+            return
+        if outcome is None:
+            return
+        self._finalise_trade(t, outcome=outcome, source="polymarket")
+
     def _process_new_close(self, candle: Candle, closed_hist: list[Candle]) -> None:
-        # 1. Resolve any open trade against this just-closed candle.
+        # 1. Resolve any open trade. Prefer Polymarket (one last attempt)
+        #    and fall back to CoinDesk candle-close comparison only if
+        #    Polymarket is silent past the fallback window.
         self._resolve_open_trade(candle)
 
         # 2. Judge the newly-closed candle.
@@ -259,20 +293,66 @@ class CandleReactionEngine:
         return trade, market, up_ask, down_ask
 
     def _resolve_open_trade(self, new_candle: Candle) -> None:
+        """Called when a new CoinDesk candle closes.
+
+        First give Polymarket one more shot; if it still hasn't
+        resolved and the fallback window has passed, decide based on
+        the CoinDesk close comparison and mark the source.
+        """
         t = self.state.open_trade
         if not t:
             return
-        if new_candle.close > t.entry_close:
-            actual = "UP"
-        elif new_candle.close < t.entry_close:
-            actual = "DOWN"
-        else:
-            actual = "VOID"
 
-        if actual == "VOID":
+        # Try Polymarket once more.
+        if t.market_slug:
+            try:
+                outcome = get_resolution(t.market_slug, session=self.client.session)
+            except Exception:
+                outcome = None
+            if outcome is not None:
+                self._finalise_trade(t, outcome=outcome, source="polymarket",
+                                     resolve_close=new_candle.close,
+                                     resolve_ts=new_candle.ts)
+                return
+
+        # Fallback: CoinDesk candle-close comparison. Only allowed
+        # once the fallback window has elapsed OR when there was no
+        # Polymarket market at entry.
+        expected = t.entry_ts + self.cfg.aggregate * 60
+        past_fallback = int(time.time()) >= expected + self.FALLBACK_AFTER_SEC
+        if t.market_slug and not past_fallback:
+            # Leave it open; later ticks will keep polling Polymarket.
+            log.info(
+                "BTC [%s] pending Polymarket resolution (will fallback in %ds)",
+                _window_label(t.entry_ts),
+                expected + self.FALLBACK_AFTER_SEC - int(time.time()),
+            )
+            return
+
+        if new_candle.close > t.entry_close:
+            outcome = "UP"
+        elif new_candle.close < t.entry_close:
+            outcome = "DOWN"
+        else:
+            outcome = "VOID"
+        source = "coindesk_fallback" if t.market_slug else "coindesk_synthetic"
+        self._finalise_trade(t, outcome=outcome, source=source,
+                             resolve_close=new_candle.close,
+                             resolve_ts=new_candle.ts)
+
+    def _finalise_trade(
+        self,
+        t: TradeRow,
+        outcome: str,
+        source: str,
+        resolve_close: Optional[float] = None,
+        resolve_ts: Optional[int] = None,
+    ) -> None:
+        """Close out ``t`` with the given outcome and persist."""
+        if outcome == "VOID":
             t.result = "VOID"
             t.pnl = 0.0
-        elif actual == t.side:
+        elif outcome == t.side:
             t.result = "WIN"
             # Polymarket binary pays $1/share on win. Profit = shares - stake
             # = stake * (1 - fill_price) / fill_price. Fall back to 1:1 if
@@ -285,15 +365,17 @@ class CandleReactionEngine:
             t.result = "LOSS"
             t.pnl = -t.stake
 
-        t.resolve_ts = new_candle.ts
-        t.resolve_close = new_candle.close
+        t.resolve_ts = resolve_ts if resolve_ts is not None else int(time.time())
+        t.resolve_close = resolve_close
+        t.resolution_source = source
         self.store.record_trade(t)
         log.info(
-            "BTC [%s] RESOLVE %s -> %s pnl=%s$%.2f (%.2f -> %.2f)",
+            "BTC [%s] RESOLVE %s -> %s pnl=%s$%.2f (source=%s, entry=%.2f)",
             _window_label(t.entry_ts), t.side, t.result,
             "+" if (t.pnl or 0) >= 0 else "-",
             abs(t.pnl or 0.0),
-            t.entry_close, new_candle.close,
+            source,
+            t.entry_close,
         )
         self.state.open_trade = None
 

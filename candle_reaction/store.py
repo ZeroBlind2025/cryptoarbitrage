@@ -35,7 +35,7 @@ TRADE_HEADER = [
     "market_slug", "fill_price", "edge", "kelly_f", "shares",
     "close_position", "body_signed", "direction",
     "volume_z", "range_z", "streak",
-    "resolve_ts", "resolve_close", "result", "pnl",
+    "resolve_ts", "resolve_close", "result", "pnl", "resolution_source",
 ]
 
 
@@ -68,6 +68,7 @@ class TradeRow:
     resolve_close: Optional[float] = None
     result: Optional[str] = None   # "WIN" / "LOSS" / "VOID"
     pnl: Optional[float] = None
+    resolution_source: Optional[str] = None   # "polymarket" | "coindesk_fallback"
 
 
 class Store:
@@ -172,4 +173,5 @@ class Store:
             r.resolve_close if r.resolve_close is not None else "",
             r.result or "",
             _opt(r.pnl, 4),
+            r.resolution_source or "",
         ]
