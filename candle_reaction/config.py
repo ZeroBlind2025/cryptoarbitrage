@@ -16,6 +16,11 @@ DEFAULT_INSTRUMENT = "BTC-USD"
 DEFAULT_AGGREGATE = 5          # five-minute candles
 DEFAULT_POLL_INTERVAL_SEC = 20  # REST polling cadence for live mode
 
+# Live candle data source. "coinbase" (default) hits Coinbase Exchange's
+# public /products/<id>/candles directly; "coindesk" retains the
+# original CoinDesk Data Streamer historical endpoint.
+DEFAULT_SOURCE = "coinbase"
+
 
 @dataclass
 class LadderRung:
@@ -33,6 +38,7 @@ class Config:
     instrument: str = DEFAULT_INSTRUMENT
     aggregate: int = DEFAULT_AGGREGATE
     poll_interval_sec: int = DEFAULT_POLL_INTERVAL_SEC
+    source: str = DEFAULT_SOURCE
 
     # Bankroll in USD (paper).
     bankroll: float = 250.0
@@ -78,4 +84,18 @@ def load() -> Config:
     contrarian = os.environ.get("CANDLE_CONTRARIAN", "").strip().lower()
     if contrarian in ("1", "true", "yes", "on"):
         cfg.contrarian = True
+    source = os.environ.get("CANDLE_SOURCE", "").strip().lower()
+    if source in ("coinbase", "coindesk"):
+        cfg.source = source
     return cfg
+
+
+def make_live_client(cfg: Config):
+    """Build the configured OHLCV client for the live engine."""
+    # Late imports avoid a module-level circular dependency with
+    # coinbase.py (which imports Candle from coindesk.py).
+    if cfg.source == "coinbase":
+        from .coinbase import CoinbaseClient
+        return CoinbaseClient(cfg)
+    from .coindesk import CoindeskClient
+    return CoindeskClient(cfg)

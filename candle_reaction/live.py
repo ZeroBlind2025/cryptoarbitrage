@@ -23,8 +23,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from .coindesk import Candle, CoindeskClient
-from .config import Config, load
+from .coindesk import Candle
+from .config import Config, load, make_live_client
 from .edge import size_edge_trade
 from .features import extract
 from .judge import judge
@@ -66,7 +66,7 @@ class CandleReactionEngine:
 
     def __init__(self, cfg: Optional[Config] = None):
         self.cfg = cfg or load()
-        self.client = CoindeskClient(self.cfg)
+        self.client = make_live_client(self.cfg)
         self.store = Store(self.cfg)
         self.state = EngineState()
         self._thread: Optional[threading.Thread] = None
@@ -110,6 +110,7 @@ class CandleReactionEngine:
             "last_error": s.last_error,
             "bankroll": self.cfg.bankroll,
             "mode": "contrarian" if self.cfg.contrarian else "continuation",
+            "source": self.cfg.source,
             **summary,
             "last_signal": self._signal_snapshot(last) if last else None,
             "open_trade": self._trade_snapshot(open_t) if open_t else None,
