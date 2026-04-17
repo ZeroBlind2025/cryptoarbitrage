@@ -1674,11 +1674,14 @@ def api_copy_trader_settings_get():
 @app.route('/api/copy-trader/settings', methods=['POST'])
 def api_copy_trader_settings_update():
     """Update trading settings at runtime (lot sizes, bet amounts).
-    Works with momentum engine even when copy trader is disabled.
-    Changes take effect immediately - new trades will use the new bet amount."""
-    # Allow settings changes as long as at least one engine is available
-    if not copy_trader and not momentum_engine:
-        return jsonify({"error": "No trading engine running. Start momentum engine first."}), 400
+    Applies to every engine that is running (copy trader, momentum,
+    contrarian fade). Changes take effect immediately — new trades will
+    use the new bet amount."""
+    # Fan changes out to every engine that's alive so the dashboard
+    # panel works regardless of which engine is driving trades.
+    engines = [e for e in (copy_trader, momentum_engine, contrarian_engine) if e]
+    if not engines:
+        return jsonify({"error": "No trading engine running. Start an engine first."}), 400
 
     data = request.get_json() or {}
     changes = []
@@ -1688,32 +1691,25 @@ def api_copy_trader_settings_update():
         new_amount = float(data['bet_amount'])
         if new_amount <= 0:
             return jsonify({"error": "Bet amount must be positive"}), 400
-        # Get old amount from whichever engine is running
-        active = momentum_engine or copy_trader
-        old_amount = active.bet_amount
-        if copy_trader:
-            copy_trader.bet_amount = new_amount
-        if momentum_engine:
-            momentum_engine.bet_amount = new_amount
+        old_amount = engines[0].bet_amount
+        for eng in engines:
+            eng.bet_amount = new_amount
         changes.append(f"Bet amount: ${old_amount:.2f} -> ${new_amount:.2f}")
         print(f"[ALGO] Bet amount changed: ${old_amount:.2f} -> ${new_amount:.2f}", flush=True)
 
     # Update per-coin lot sizes (e.g. {"btc": 1.0, "eth": 2.0, "sol": 1.0})
-    # Applies to BOTH copy trader and momentum engine (whichever is running)
+    # Applied to every running engine.
     if 'coin_bet_amounts' in data:
         new_coin_bets = data['coin_bet_amounts']
         if not isinstance(new_coin_bets, dict):
             return jsonify({"error": "coin_bet_amounts must be an object like {\"btc\": 1.0, \"eth\": 2.0}"}), 400
-        active = momentum_engine or copy_trader
         for coin, amt in new_coin_bets.items():
             amt = float(amt)
             if amt <= 0:
                 return jsonify({"error": f"Lot size for {coin} must be positive"}), 400
-            old_amt = active.coin_bet_amounts.get(coin, active.bet_amount)
-            if copy_trader:
-                copy_trader.coin_bet_amounts[coin] = amt
-            if momentum_engine:
-                momentum_engine.coin_bet_amounts[coin] = amt
+            old_amt = engines[0].coin_bet_amounts.get(coin, engines[0].bet_amount)
+            for eng in engines:
+                eng.coin_bet_amounts[coin] = amt
             changes.append(f"{coin.upper()} lot: ${old_amt:.2f} -> ${amt:.2f}")
             print(f"[ALGO] {coin.upper()} lot size changed: ${old_amt:.2f} -> ${amt:.2f}", flush=True)
 
@@ -1724,7 +1720,7 @@ def api_copy_trader_settings_update():
     if not changes:
         return jsonify({"error": "No settings provided. Send bet_amount or coin_bet_amounts."}), 400
 
-    active = momentum_engine or copy_trader
+    active = engines[0]
     return jsonify({
         "success": True,
         "changes": changes,
