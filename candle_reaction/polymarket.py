@@ -260,9 +260,16 @@ def get_resolution(
 def _parse_resolution(mkt: dict) -> Optional[str]:
     """Read outcomePrices to determine if/how the market resolved.
 
-    On an unresolved market the prices are live book levels (e.g. 0.45/0.55).
-    Once Polymarket settles, they collapse to [1.0, 0.0] or [0.0, 1.0].
+    Polymarket books often converge to [~0.99, ~0.01] in the final
+    seconds of a 5m market when one side is obviously winning on BTC
+    spot -- but that's not settlement. If BTC whipsaws, the on-chain
+    resolution can flip relative to what the book implied. To avoid
+    booking pre-settlement book reads as final, require the market's
+    ``closed`` flag to be true before trusting extreme prices.
     """
+    if not bool(mkt.get("closed")):
+        return None
+
     prices = _decode_list(mkt.get("outcomePrices"))
     if not prices or len(prices) < 2:
         return None
@@ -275,14 +282,12 @@ def _parse_resolution(mkt: dict) -> Optional[str]:
     except (TypeError, ValueError):
         return None
 
-    # Definitive-resolution threshold: one side is ~1 and the other ~0.
     if up_price >= 0.99 and down_price <= 0.01:
         return "UP"
     if down_price >= 0.99 and up_price <= 0.01:
         return "DOWN"
 
-    # Some markets void to a 50/50 split.
-    closed = bool(mkt.get("closed"))
-    if closed and abs(up_price - 0.5) < 0.01 and abs(down_price - 0.5) < 0.01:
+    # Closed with a ~50/50 split -> voided.
+    if abs(up_price - 0.5) < 0.05 and abs(down_price - 0.5) < 0.05:
         return "VOID"
     return None
