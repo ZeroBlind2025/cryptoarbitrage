@@ -25,9 +25,10 @@ from typing import Optional
 
 from .coindesk import Candle, CoindeskClient
 from .config import Config, load
+from .edge import size_edge_trade
 from .features import extract
 from .judge import judge
-from .sizing import stake_for
+from .polymarket import PolyMarket, discover_btc_updown_5m, get_top_of_book
 from .store import SignalRow, Store, TradeRow
 
 log = logging.getLogger("candle_reaction")
@@ -38,6 +39,13 @@ def _window_label(ts: int) -> str:
     start = datetime.fromtimestamp(ts, tz=timezone.utc)
     end = start + timedelta(minutes=5)
     return f"{start:%H:%M}-{end:%H:%M} UTC"
+
+
+def _c(price: Optional[float]) -> str:
+    """Format a 0..1 price as cents, e.g. 0.75 -> '75c'."""
+    if price is None:
+        return "n/a"
+    return f"{price * 100:.0f}c"
 
 
 @dataclass
@@ -174,40 +182,81 @@ class CandleReactionEngine:
         # 2. Judge the newly-closed candle.
         feat = extract(closed_hist, lookback=self.cfg.lookback)
         j = judge(feat, contrarian=self.cfg.contrarian)
-        stake = stake_for(j.confidence, self.cfg)
 
-        # 3. Record the signal.
+        # 3. Ask Polymarket for the next-bucket BTC updown-5m market
+        #    and compute the edge trade. If nothing tradable, signal only.
+        edge_trade, market, up_ask, down_ask = self._price_polymarket(candle.ts, j.p_up)
+        stake = edge_trade.stake if edge_trade else 0.0
+
+        # 4. Record the signal (always).
         sig = SignalRow(
             candle_ts=candle.ts,
             close_price=candle.close,
             features=feat,
             judgement=j,
             stake=stake,
-            traded=stake > 0.0,
+            traded=edge_trade is not None,
         )
         self.store.record_signal(sig)
         self.state.last_signal = sig
 
-        if stake <= 0.0:
-            log.info(
-                "BTC [%s] SKIP side=%s conf=%.1f%% (below ladder) close=$%.2f",
-                _window_label(candle.ts), j.side, j.confidence * 100.0, candle.close,
-            )
+        window = _window_label(candle.ts)
+        if edge_trade is None:
+            if market is None:
+                log.info(
+                    "BTC [%s] SKIP side=%s conf=%.1f%% (no Polymarket market) close=$%.2f",
+                    window, j.side, j.confidence * 100.0, candle.close,
+                )
+            else:
+                log.info(
+                    "BTC [%s] SKIP side=%s conf=%.1f%% (no edge; up_ask=%s down_ask=%s) close=$%.2f",
+                    window, j.side, j.confidence * 100.0,
+                    _c(up_ask), _c(down_ask), candle.close,
+                )
             return
 
-        # 4. Open a new paper trade; resolution happens on the NEXT close.
+        # 5. Open a new paper trade; resolution happens on the NEXT close.
         self.state.open_trade = TradeRow(
             entry_ts=candle.ts,
             entry_close=candle.close,
-            side=j.side,
-            confidence=j.confidence,
-            stake=stake,
+            side=edge_trade.side,
+            confidence=edge_trade.our_q,
+            stake=edge_trade.stake,
             features=feat,
+            market_slug=market.slug if market else None,
+            fill_price=edge_trade.fill_price,
+            edge=edge_trade.edge,
+            kelly_f=edge_trade.kelly_f,
+            shares=edge_trade.shares,
         )
         log.info(
-            "BTC [%s] ENTER %s conf=%.1f%% stake=$%.2f close=$%.2f",
-            _window_label(candle.ts), j.side, j.confidence * 100.0, stake, candle.close,
+            "BTC [%s] ENTER %s @ %s (edge %s, q=%.1f%%) stake=$%.2f close=$%.2f",
+            window, edge_trade.side, _c(edge_trade.fill_price), _c(edge_trade.edge),
+            edge_trade.our_q * 100.0, edge_trade.stake, candle.close,
         )
+
+    def _price_polymarket(self, candle_ts: int, p_up: float):
+        """Return (EdgeTrade|None, PolyMarket|None, up_ask, down_ask)."""
+        try:
+            market = discover_btc_updown_5m(candle_ts, session=self.client.session)
+        except Exception as e:  # pragma: no cover - network
+            log.warning("polymarket discovery failed: %s", e)
+            return None, None, None, None
+        if market is None:
+            return None, None, None, None
+
+        up_tob = get_top_of_book(market.yes_up_token_id, session=self.client.session)
+        down_tob = get_top_of_book(market.yes_down_token_id, session=self.client.session)
+        up_ask = up_tob.ask if up_tob else None
+        down_ask = down_tob.ask if down_tob else None
+
+        trade = size_edge_trade(
+            p_up=p_up,
+            up_ask=up_ask,
+            down_ask=down_ask,
+            bankroll=self.cfg.bankroll,
+        )
+        return trade, market, up_ask, down_ask
 
     def _resolve_open_trade(self, new_candle: Candle) -> None:
         t = self.state.open_trade
@@ -225,7 +274,13 @@ class CandleReactionEngine:
             t.pnl = 0.0
         elif actual == t.side:
             t.result = "WIN"
-            t.pnl = t.stake
+            # Polymarket binary pays $1/share on win. Profit = shares - stake
+            # = stake * (1 - fill_price) / fill_price. Fall back to 1:1 if
+            # fill_price is missing (synthetic, pre-Polymarket).
+            if t.fill_price and t.fill_price > 0:
+                t.pnl = t.stake * (1.0 - t.fill_price) / t.fill_price
+            else:
+                t.pnl = t.stake
         else:
             t.result = "LOSS"
             t.pnl = -t.stake
@@ -270,6 +325,9 @@ class CandleReactionEngine:
             "side": t.side,
             "confidence": round(t.confidence, 4),
             "stake": t.stake,
+            "fill_price": round(t.fill_price, 4) if t.fill_price is not None else None,
+            "edge": round(t.edge, 4) if t.edge is not None else None,
+            "market_slug": t.market_slug,
         }
 
 

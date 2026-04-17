@@ -307,7 +307,9 @@
                         <th className="text-left py-1 pr-3">Entry (UTC)</th>
                         <th className="text-right py-1 pr-3">BTC @ entry</th>
                         <th className="text-right py-1 pr-3">Side</th>
-                        <th className="text-right py-1 pr-3">Conf</th>
+                        <th className="text-right py-1 pr-3">Our q</th>
+                        <th className="text-right py-1 pr-3">Fill</th>
+                        <th className="text-right py-1 pr-3">Edge</th>
                         <th className="text-right py-1 pr-3">Stake</th>
                         <th className="text-right py-1 pr-3">BTC @ resolve</th>
                         <th className="text-right py-1 pr-3">Result</th>
@@ -324,12 +326,15 @@
                                       : t.result === 'LOSS' ? 'text-red-400'
                                       : t.result === 'VOID' ? 'text-slate-400'
                                       : 'text-yellow-400';
+                        const fmtC = (v) => (v === '' || v === undefined || v === null) ? '—' : (Number(v) * 100).toFixed(0) + '\u00a2';
                         return (
                           <tr key={i} className="border-t border-slate-700/50 text-slate-300">
                             <td className="py-1 pr-3 font-mono">{entry}</td>
                             <td className="py-1 pr-3 text-right">${Number(t.entry_close).toFixed(2)}</td>
                             <td className={`py-1 pr-3 text-right ${sideCls}`}>{t.side}</td>
                             <td className="py-1 pr-3 text-right">{t.confidence ? (Number(t.confidence) * 100).toFixed(1) + '%' : ''}</td>
+                            <td className="py-1 pr-3 text-right">{fmtC(t.fill_price)}</td>
+                            <td className="py-1 pr-3 text-right text-cyan-400">{fmtC(t.edge)}</td>
                             <td className="py-1 pr-3 text-right">${Number(t.stake).toFixed(2)}</td>
                             <td className="py-1 pr-3 text-right">{t.resolve_close !== '' && t.resolve_close !== undefined ? '$' + Number(t.resolve_close).toFixed(2) : '—'}</td>
                             <td className={`py-1 pr-3 text-right ${resCls}`}>{resolved ? t.result : 'OPEN'}</td>
