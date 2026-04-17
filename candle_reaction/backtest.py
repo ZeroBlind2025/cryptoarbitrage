@@ -1,10 +1,13 @@
 """One-off backtest: replay the judge against N historical 5m candles.
 
-Usage:
+Usage (CLI):
     COINDESK_API_KEY=...  python -m candle_reaction.backtest --candles 6000
 
-Output: a human-readable summary, plus a CSV in data/backtest_<ts>.csv
-containing every bar with features, prediction, bet, outcome.
+Or run from the dashboard via POST /api/candle/backtest.
+
+Output: a human-readable summary (CLI only), plus a CSV in
+``data/backtest_<ts>.csv`` containing every bar with features,
+prediction, bet, outcome.
 
 No look-ahead: features for bar i are built from candles[:i+1]; the
 outcome for bar i is determined by comparing candles[i].close to
@@ -15,9 +18,11 @@ from __future__ import annotations
 
 import argparse
 import csv
+import threading
 import time
 from collections import defaultdict
 from pathlib import Path
+from typing import Optional
 
 from .coindesk import CoindeskClient
 from .config import load
@@ -26,24 +31,26 @@ from .judge import judge
 from .sizing import stake_for
 
 
-def run(total_candles: int = 6000, warmup: int = 30) -> dict:
+def run(total_candles: int = 6000, warmup: int = 30, verbose: bool = True) -> dict:
     cfg = load()
     if not cfg.api_key:
-        raise SystemExit("COINDESK_API_KEY is not set")
+        raise RuntimeError("COINDESK_API_KEY is not set")
 
     client = CoindeskClient(cfg)
-    print(f"Fetching ~{total_candles} x {cfg.aggregate}m candles for "
-          f"{cfg.instrument} on {cfg.market}...")
+    if verbose:
+        print(f"Fetching ~{total_candles} x {cfg.aggregate}m candles for "
+              f"{cfg.instrument} on {cfg.market}...")
     candles = client.fetch_history(total_candles)
     if len(candles) < warmup + 2:
-        raise SystemExit(f"Not enough candles: got {len(candles)}")
-    print(f"Got {len(candles)} candles from "
-          f"{candles[0].ts} to {candles[-1].ts}")
+        raise RuntimeError(f"Not enough candles: got {len(candles)}")
+    if verbose:
+        print(f"Got {len(candles)} candles from "
+              f"{candles[0].ts} to {candles[-1].ts}")
 
     out_rows: list[dict] = []
     equity = cfg.bankroll
     wins = losses = voids = skips = 0
-    bucket_stats = defaultdict(lambda: {"n": 0, "w": 0})
+    bucket_stats: dict[str, dict[str, int]] = defaultdict(lambda: {"n": 0, "w": 0})
 
     for i in range(warmup, len(candles) - 1):
         hist = candles[: i + 1]
@@ -74,7 +81,6 @@ def run(total_candles: int = 6000, warmup: int = 30) -> dict:
                 losses += 1
             equity += pnl
 
-            # Bucketise by confidence.
             bucket = _bucket(j.confidence)
             bucket_stats[bucket]["n"] += 1
             if result == "WIN":
@@ -107,32 +113,55 @@ def run(total_candles: int = 6000, warmup: int = 30) -> dict:
         w.writerows(out_rows)
 
     resolved = wins + losses
-    print("\n==== Candle-Reaction Backtest ====")
-    print(f"Candles considered : {len(candles) - warmup - 1}")
-    print(f"Skipped (below 70%): {skips}")
-    print(f"Traded             : {resolved + voids}")
-    print(f"  Wins : {wins}")
-    print(f"  Loss : {losses}")
-    print(f"  Void : {voids}")
-    if resolved:
-        print(f"  Hit rate : {wins / resolved:.2%}")
-    print(f"Start bankroll : ${cfg.bankroll:.2f}")
-    print(f"End equity     : ${equity:.2f}")
-    print(f"Net P&L        : ${equity - cfg.bankroll:+.2f}")
-    print("\nHit rate by confidence bucket:")
-    for name in ("70-80", "80-90", "90-100"):
-        s = bucket_stats.get(name, {"n": 0, "w": 0})
-        rate = (s["w"] / s["n"]) if s["n"] else 0.0
-        print(f"  {name}: {s['n']:4d} trades, hit {rate:.2%}")
-    print(f"\nWrote {out_path}")
-    return {
+    buckets = {
+        name: {
+            "n": bucket_stats.get(name, {}).get("n", 0),
+            "wins": bucket_stats.get(name, {}).get("w", 0),
+            "hit_rate": (
+                (bucket_stats[name]["w"] / bucket_stats[name]["n"])
+                if bucket_stats.get(name, {}).get("n") else 0.0
+            ),
+        }
+        for name in ("70-80", "80-90", "90-100")
+    }
+    result = {
         "path": str(out_path),
+        "csv_name": out_path.name,
+        "candles": len(candles),
+        "considered": len(candles) - warmup - 1,
+        "start_ts": candles[0].ts,
+        "end_ts": candles[-1].ts,
+        "warmup": warmup,
         "wins": wins,
         "losses": losses,
         "voids": voids,
         "skips": skips,
-        "equity": equity,
+        "hit_rate": (wins / resolved) if resolved else 0.0,
+        "bankroll": cfg.bankroll,
+        "equity": round(equity, 4),
+        "pnl": round(equity - cfg.bankroll, 4),
+        "buckets": buckets,
     }
+
+    if verbose:
+        print("\n==== Candle-Reaction Backtest ====")
+        print(f"Candles considered : {result['considered']}")
+        print(f"Skipped (below 70%): {skips}")
+        print(f"Traded             : {resolved + voids}")
+        print(f"  Wins : {wins}")
+        print(f"  Loss : {losses}")
+        print(f"  Void : {voids}")
+        if resolved:
+            print(f"  Hit rate : {wins / resolved:.2%}")
+        print(f"Start bankroll : ${cfg.bankroll:.2f}")
+        print(f"End equity     : ${equity:.2f}")
+        print(f"Net P&L        : ${equity - cfg.bankroll:+.2f}")
+        print("\nHit rate by confidence bucket:")
+        for name in ("70-80", "80-90", "90-100"):
+            b = buckets[name]
+            print(f"  {name}: {b['n']:4d} trades, hit {b['hit_rate']:.2%}")
+        print(f"\nWrote {out_path}")
+    return result
 
 
 def _bucket(confidence: float) -> str:
@@ -141,6 +170,69 @@ def _bucket(confidence: float) -> str:
     if confidence < 0.90:
         return "80-90"
     return "90-100"
+
+
+# ---- Background runner for the dashboard ----------------------------------
+
+_STATE_LOCK = threading.Lock()
+_STATE: dict = {
+    "status": "idle",       # idle | running | done | failed
+    "started_at": None,
+    "finished_at": None,
+    "params": None,
+    "result": None,
+    "error": None,
+}
+
+
+def get_state() -> dict:
+    with _STATE_LOCK:
+        return dict(_STATE)
+
+
+def start_async(total_candles: int = 6000, warmup: int = 30) -> dict:
+    """Kick off a backtest in a daemon thread. Idempotent while running."""
+    with _STATE_LOCK:
+        if _STATE["status"] == "running":
+            return dict(_STATE)
+        _STATE.update({
+            "status": "running",
+            "started_at": int(time.time()),
+            "finished_at": None,
+            "params": {"candles": total_candles, "warmup": warmup},
+            "result": None,
+            "error": None,
+        })
+    threading.Thread(
+        target=_run_and_store,
+        args=(total_candles, warmup),
+        daemon=True,
+        name="candle-backtest",
+    ).start()
+    return get_state()
+
+
+def _run_and_store(total_candles: int, warmup: int) -> None:
+    try:
+        result = run(total_candles=total_candles, warmup=warmup, verbose=False)
+        with _STATE_LOCK:
+            _STATE["status"] = "done"
+            _STATE["finished_at"] = int(time.time())
+            _STATE["result"] = result
+    except Exception as e:
+        with _STATE_LOCK:
+            _STATE["status"] = "failed"
+            _STATE["finished_at"] = int(time.time())
+            _STATE["error"] = str(e)
+
+
+def latest_csv_path() -> Optional[Path]:
+    state = get_state()
+    result = state.get("result")
+    if not result:
+        return None
+    path = result.get("path")
+    return Path(path) if path else None
 
 
 def main() -> None:
