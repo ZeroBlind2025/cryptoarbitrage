@@ -105,21 +105,19 @@ def _fetch_event(sess: requests.Session, slug: str) -> Optional[PolyMarket]:
 
 def _parse_market(mkt: dict, slug: str) -> Optional[PolyMarket]:
     """Pull token ids + resolve ts out of a Gamma market dict."""
-    token_ids = mkt.get("clobTokenIds") or mkt.get("tokens") or None
-    if isinstance(token_ids, str):
-        # sometimes delivered as a JSON-encoded string
-        import json
-        try:
-            token_ids = json.loads(token_ids)
-        except ValueError:
-            return None
+    token_ids = _decode_list(mkt.get("clobTokenIds") or mkt.get("tokens"))
     if not token_ids or len(token_ids) < 2:
         return None
 
-    # Order matters: Gamma returns [YES, NO]. For updown markets,
-    # "YES" = the UP outcome, "NO" = the DOWN outcome.
-    yes_id = str(token_ids[0])
-    no_id = str(token_ids[1])
+    # `outcomes` carries the canonical label order that matches both
+    # clobTokenIds and outcomePrices. Pick the UP-labelled index
+    # explicitly; fall back to [0] = UP when labels are missing.
+    outcomes = _decode_list(mkt.get("outcomes"))
+    up_idx = _up_outcome_index(outcomes)
+    down_idx = 1 - up_idx
+
+    yes_up_id = str(token_ids[up_idx])
+    yes_down_id = str(token_ids[down_idx])
 
     condition_id = str(mkt.get("conditionId") or mkt.get("id") or "")
 
@@ -131,10 +129,35 @@ def _parse_market(mkt: dict, slug: str) -> Optional[PolyMarket]:
     return PolyMarket(
         slug=slug,
         condition_id=condition_id,
-        yes_up_token_id=yes_id,
-        yes_down_token_id=no_id,
+        yes_up_token_id=yes_up_id,
+        yes_down_token_id=yes_down_id,
         resolve_ts=resolve_ts,
     )
+
+
+def _decode_list(value):
+    """Gamma often ships list fields as JSON-encoded strings; normalise."""
+    if isinstance(value, str):
+        import json
+        try:
+            value = json.loads(value)
+        except ValueError:
+            return None
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    return None
+
+
+_UP_WORDS = {"up", "yes", "higher", "above"}
+
+
+def _up_outcome_index(outcomes) -> int:
+    if not outcomes:
+        return 0
+    for i, name in enumerate(outcomes[:2]):
+        if isinstance(name, str) and name.strip().lower() in _UP_WORDS:
+            return i
+    return 0
 
 
 def _parse_resolve_ts(mkt: dict, slug: str) -> Optional[int]:
@@ -240,18 +263,15 @@ def _parse_resolution(mkt: dict) -> Optional[str]:
     On an unresolved market the prices are live book levels (e.g. 0.45/0.55).
     Once Polymarket settles, they collapse to [1.0, 0.0] or [0.0, 1.0].
     """
-    prices = mkt.get("outcomePrices")
-    if isinstance(prices, str):
-        import json
-        try:
-            prices = json.loads(prices)
-        except ValueError:
-            return None
-    if not isinstance(prices, (list, tuple)) or len(prices) < 2:
+    prices = _decode_list(mkt.get("outcomePrices"))
+    if not prices or len(prices) < 2:
         return None
+    outcomes = _decode_list(mkt.get("outcomes"))
+    up_idx = _up_outcome_index(outcomes)
+    down_idx = 1 - up_idx
     try:
-        up_price = float(prices[0])
-        down_price = float(prices[1])
+        up_price = float(prices[up_idx])
+        down_price = float(prices[down_idx])
     except (TypeError, ValueError):
         return None
 
