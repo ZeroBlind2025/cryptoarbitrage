@@ -41,9 +41,21 @@ class CoindeskClient:
         self.cfg = cfg
         self.session = session or requests.Session()
 
+    # CoinDesk /spot/v1/historical/minutes serves at most ~2000 raw 1m
+    # points per call; each returned row is ``aggregate`` minutes of
+    # those, so the usable bar cap is ``2000 // aggregate``. 400 @ 5m,
+    # 133 @ 15m, 33 @ 1h. Give ourselves 1 row of headroom to avoid
+    # off-by-one server rejections.
+    _AGG_BUDGET = 2000
+
+    def _max_per_call(self, aggregate: int) -> int:
+        if aggregate <= 0:
+            return self._AGG_BUDGET
+        return max(1, (self._AGG_BUDGET // aggregate) - 1)
+
     def fetch_minutes(
         self,
-        limit: int = 400,
+        limit: Optional[int] = None,
         to_ts: Optional[int] = None,
         aggregate: Optional[int] = None,
         instrument: Optional[str] = None,
@@ -51,15 +63,17 @@ class CoindeskClient:
     ) -> list[Candle]:
         """Fetch historical minute candles, aggregated to `aggregate` minutes.
 
-        `limit` is capped at 400 by the CoinDesk Data API for spot
-        minute candles. For deeper history, call repeatedly with
-        `to_ts` stepping backwards.
+        The server caps rows at ``floor(2000 / aggregate)``. For deeper
+        history, call repeatedly with `to_ts` stepping backwards.
         """
+        agg = aggregate or self.cfg.aggregate
+        cap = self._max_per_call(agg)
+        req_limit = cap if limit is None else min(limit, cap)
         params = {
             "market": market or self.cfg.market,
             "instrument": instrument or self.cfg.instrument,
-            "aggregate": aggregate or self.cfg.aggregate,
-            "limit": min(limit, 400),
+            "aggregate": agg,
+            "limit": req_limit,
         }
         if to_ts is not None:
             params["to_ts"] = to_ts
@@ -129,13 +143,14 @@ class CoindeskClient:
         """Paginate backwards until at least `total` candles are collected."""
         out: list[Candle] = []
         to_ts: Optional[int] = None
+        per_call = self._max_per_call(self.cfg.aggregate)
         while len(out) < total:
-            batch = self.fetch_minutes(limit=400, to_ts=to_ts)
+            batch = self.fetch_minutes(limit=per_call, to_ts=to_ts)
             if not batch:
                 break
             out = batch + out
             to_ts = batch[0].ts - 1
-            if len(batch) < 400:
+            if len(batch) < per_call:
                 break
         # Dedupe by timestamp, keep chronological order.
         seen: set[int] = set()
