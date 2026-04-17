@@ -18,7 +18,11 @@ from typing import Optional
 
 
 DEFAULT_KELLY_FRACTION = 0.25   # quarter Kelly -- paper-safe
-DEFAULT_MAX_STAKE = 5.0         # $5 cap on a $250 bankroll (2%)
+DEFAULT_MAX_STAKE = 15.0        # $15 cap on a $250 bankroll (6%).
+                                # Bumped from $5 when the regime judge
+                                # started skipping ~60% of bars -- per-
+                                # trade size now reflects the lower
+                                # frequency.
 DEFAULT_MIN_EDGE = 0.03         # 3c of edge required to fire a trade
 
 
