@@ -7,12 +7,15 @@ WebSocket implementation is unnecessary at a 5-minute cadence.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Optional
 
 import requests
 
 from .config import COINDESK_HISTORICAL_MINUTES, COINDESK_REST_BASE, Config
+
+log = logging.getLogger("candle_reaction.coindesk")
 
 
 @dataclass(frozen=True)
@@ -80,6 +83,7 @@ class CoindeskClient:
 
         rows = payload.get("Data") or payload.get("data") or []
         candles: list[Candle] = []
+        dropped = 0
         for r in rows:
             # Field names follow the CCData / CoinDesk Data convention.
             ts = r.get("TIMESTAMP") or r.get("time") or r.get("TS")
@@ -94,17 +98,30 @@ class CoindeskClient:
                 or 0.0
             )
             if None in (ts, o, h, lo, c):
+                dropped += 1
+                continue
+            try:
+                o, h, lo, c = float(o), float(h), float(lo), float(c)
+            except (TypeError, ValueError):
+                dropped += 1
+                continue
+            # Reject degenerate rows: CoinDesk occasionally ships zero-filled
+            # 5m buckets for recent windows before aggregation completes.
+            # A BTC bar where open==high==low==close or all are zero is
+            # useless; it makes the feature extractor read body==0 /
+            # close_position==0.5 which collapses the judge to p=0.5.
+            if o <= 0 or h <= 0 or lo <= 0 or c <= 0:
+                dropped += 1
+                continue
+            if h == lo:   # range is zero -> dead bar
+                dropped += 1
                 continue
             candles.append(
-                Candle(
-                    ts=int(ts),
-                    open=float(o),
-                    high=float(h),
-                    low=float(lo),
-                    close=float(c),
-                    volume=float(v),
-                )
+                Candle(ts=int(ts), open=o, high=h, low=lo, close=c, volume=float(v))
             )
+        if dropped:
+            log.warning("coindesk: dropped %d degenerate bar(s) out of %d",
+                        dropped, len(rows))
         candles.sort(key=lambda k: k.ts)
         return candles
 

@@ -217,9 +217,22 @@ class CandleReactionEngine:
         feat = extract(closed_hist, lookback=self.cfg.lookback)
         j = judge(feat, contrarian=self.cfg.contrarian)
 
+        # Degenerate bar: the CoinDesk row had zero range so features
+        # collapsed to the neutral midpoint. Judge output is meaningless;
+        # record the signal but never trade on it.
+        degenerate = (
+            feat.body_signed == 0.0
+            and abs(feat.close_position - 0.5) < 1e-9
+            and feat.volume_z == 0.0
+            and feat.range_z == 0.0
+        )
+
         # 3. Ask Polymarket for the next-bucket BTC updown-5m market
         #    and compute the edge trade. If nothing tradable, signal only.
-        edge_trade, market, up_ask, down_ask = self._price_polymarket(candle.ts, j.p_up)
+        if degenerate:
+            edge_trade, market, up_ask, down_ask = None, None, None, None
+        else:
+            edge_trade, market, up_ask, down_ask = self._price_polymarket(candle.ts, j.p_up)
         stake = edge_trade.stake if edge_trade else 0.0
 
         # 4. Record the signal (always).
@@ -236,6 +249,13 @@ class CandleReactionEngine:
 
         window = _window_label(candle.ts)
         if edge_trade is None:
+            if degenerate:
+                log.warning(
+                    "BTC [%s] SKIP degenerate candle (flat OHLC from data source); "
+                    "judge uninformative, no trade",
+                    window,
+                )
+                return
             if market is None:
                 log.info(
                     "BTC [%s] SKIP side=%s conf=%.1f%% (no Polymarket market) close=$%.2f",
