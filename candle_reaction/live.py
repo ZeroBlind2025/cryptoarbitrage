@@ -28,7 +28,13 @@ from .config import Config, load, make_live_client
 from .edge import size_edge_trade
 from .features import extract
 from .judge import judge
-from .polymarket import PolyMarket, discover_btc_updown_5m, get_resolution, get_top_of_book
+from .polymarket import (
+    PolyMarket,
+    discover_btc_updown_5m,
+    get_resolution,
+    get_token_price_final,
+    get_top_of_book,
+)
 from .store import SignalRow, Store, TradeRow
 
 log = logging.getLogger("candle_reaction")
@@ -196,26 +202,31 @@ class CandleReactionEngine:
     def _try_poly_resolution_all(self) -> None:
         """Poll Polymarket for resolution of every pending trade.
 
-        Polymarket resolves off the Chainlink BTC/USD data stream, so
-        the closed-market outcome is the only source that won't
-        diverge from on-chain settlement. We poll until ``closed=true``
-        rather than ever falling back to a different price source.
+        We look up the settled price of the *specific* CLOB token we
+        "bought" at entry (stored as ``t.token_id``). A price of ~1.0
+        means our token paid out -> WIN; ~0.0 means it settled
+        worthless -> LOSS; ~0.5 would be a VOID. This bypasses any
+        UP/DOWN outcome-label interpretation, so it's impossible to
+        invert the result.
         """
         now = int(time.time())
         for t in list(self.state.pending_trades):
-            if not t.market_slug:
+            if not t.market_slug or not t.token_id:
                 continue
             expected = t.entry_ts + self.cfg.aggregate * 60
             if now < expected:
                 continue
             try:
-                outcome = get_resolution(t.market_slug, session=self.client.session)
+                price = get_token_price_final(
+                    t.market_slug, t.token_id, session=self.client.session,
+                )
             except Exception as e:  # pragma: no cover - network
-                log.debug("poly resolution check failed for %s: %s", t.market_slug, e)
+                log.debug("poly token-price check failed for %s: %s",
+                          t.market_slug, e)
                 continue
-            if outcome is None:
+            if price is None:
                 continue
-            self._finalise_trade(t, outcome=outcome, source="polymarket")
+            self._finalise_trade_by_token(t, settled_price=price)
 
     def _void_stale_trades(self) -> None:
         """Safety valve: if Polymarket never settles, mark UNRESOLVED.
@@ -306,6 +317,14 @@ class CandleReactionEngine:
             )
             return
 
+        # Record the exact CLOB token we "bought" so resolution can
+        # look up that one token's settled price directly (no outcome
+        # label interpretation).
+        token_id = (
+            market.yes_up_token_id if edge_trade.side == "UP"
+            else market.yes_down_token_id
+        ) if market else None
+
         # Append a new paper trade; it'll resolve via Polymarket polling.
         trade = TradeRow(
             entry_ts=candle.ts,
@@ -315,6 +334,7 @@ class CandleReactionEngine:
             stake=edge_trade.stake,
             features=feat,
             market_slug=market.slug if market else None,
+            token_id=token_id,
             fill_price=edge_trade.fill_price,
             edge=edge_trade.edge,
             kelly_f=edge_trade.kelly_f,
@@ -350,6 +370,47 @@ class CandleReactionEngine:
             bankroll=self.cfg.bankroll,
         )
         return trade, market, up_ask, down_ask
+
+    def _finalise_trade_by_token(self, t: TradeRow, settled_price: float) -> None:
+        """Close out ``t`` using the settled price of our specific token.
+
+        ~1.0 -> our token paid out -> WIN
+        ~0.0 -> our token was worthless -> LOSS
+        ~0.5 -> VOID
+        anything else is ambiguous; log and skip.
+        """
+        t.settled_token_price = settled_price
+        if settled_price >= 0.99:
+            t.result = "WIN"
+            if t.fill_price and t.fill_price > 0:
+                t.pnl = t.stake * (1.0 - t.fill_price) / t.fill_price
+            else:
+                t.pnl = t.stake
+        elif settled_price <= 0.01:
+            t.result = "LOSS"
+            t.pnl = -t.stake
+        elif 0.45 <= settled_price <= 0.55:
+            t.result = "VOID"
+            t.pnl = 0.0
+        else:
+            log.warning(
+                "BTC [%s] polymarket ambiguous settlement token_price=%.4f; "
+                "leaving trade open for re-poll", _window_label(t.entry_ts), settled_price,
+            )
+            return
+
+        t.resolve_ts = int(time.time())
+        t.resolution_source = "polymarket"
+        self.store.record_trade(t)
+        log.info(
+            "BTC [%s] RESOLVE %s -> %s pnl=%s$%.2f (token=%.3f)",
+            _window_label(t.entry_ts), t.side, t.result,
+            "+" if (t.pnl or 0) >= 0 else "-",
+            abs(t.pnl or 0.0),
+            settled_price,
+        )
+        if t in self.state.pending_trades:
+            self.state.pending_trades.remove(t)
 
     def _finalise_trade(
         self,

@@ -228,18 +228,29 @@ def get_resolution(
     slug: str,
     session: Optional[requests.Session] = None,
 ) -> Optional[str]:
-    """Return 'UP', 'DOWN', 'VOID', or None if the market hasn't resolved.
+    """Return 'UP', 'DOWN', 'VOID', or None if the market hasn't resolved."""
+    result, _ = get_resolution_detailed(slug, session=session)
+    return result
 
-    Polymarket settles the BTC updown-5m markets off the Chainlink
-    BTC/USD feed. Reading the resolved outcome direct from Gamma is
-    equivalent to reading the Chainlink settlement without replicating
-    their resolution rule locally.
+
+def get_token_price_final(
+    slug: str,
+    token_id: str,
+    session: Optional[requests.Session] = None,
+) -> Optional[float]:
+    """Return the settled price of a specific CLOB token, or None if
+    the market hasn't closed yet.
+
+    This is the absolute-clarity resolution path: we look up the price
+    of the exact token we "bought" at entry, avoiding any interpretation
+    of the market's UP/DOWN outcome labels. Token price ~1.0 means the
+    token paid out (our side won); ~0.0 means it settled worthless.
     """
     sess = session or requests.Session()
     try:
         r = sess.get(f"{GAMMA_BASE}/events", params={"slug": slug}, timeout=6)
     except requests.RequestException as e:
-        log.debug("gamma resolve %s network error: %s", slug, e)
+        log.debug("gamma token-price %s network error: %s", slug, e)
         return None
     if r.status_code != 200:
         return None
@@ -248,13 +259,62 @@ def get_resolution(
     except ValueError:
         return None
 
+    target = str(token_id)
+    events = data if isinstance(data, list) else [data] if isinstance(data, dict) else []
+    for ev in events:
+        for mkt in ev.get("markets", []) or []:
+            if not bool(mkt.get("closed")):
+                continue
+            token_ids = _decode_list(mkt.get("clobTokenIds") or mkt.get("tokens"))
+            prices = _decode_list(mkt.get("outcomePrices"))
+            if not token_ids or not prices or len(token_ids) != len(prices):
+                continue
+            for tid, pr in zip(token_ids, prices):
+                if str(tid) == target:
+                    try:
+                        return float(pr)
+                    except (TypeError, ValueError):
+                        return None
+    return None
+
+
+def get_resolution_detailed(
+    slug: str,
+    session: Optional[requests.Session] = None,
+) -> tuple[Optional[str], dict]:
+    """Like ``get_resolution`` but also return the raw Gamma fields
+    we used to make the decision. Logged by the live engine so that
+    any future mismatch with on-chain can be diagnosed directly from
+    Railway output without a re-query.
+    """
+    sess = session or requests.Session()
+    try:
+        r = sess.get(f"{GAMMA_BASE}/events", params={"slug": slug}, timeout=6)
+    except requests.RequestException as e:
+        log.debug("gamma resolve %s network error: %s", slug, e)
+        return None, {}
+    if r.status_code != 200:
+        return None, {}
+    try:
+        data = r.json()
+    except ValueError:
+        return None, {}
+
     events = data if isinstance(data, list) else [data] if isinstance(data, dict) else []
     for ev in events:
         for mkt in ev.get("markets", []) or []:
             res = _parse_resolution(mkt)
             if res is not None:
-                return res
-    return None
+                raw = {
+                    "closed": mkt.get("closed"),
+                    "outcomes": mkt.get("outcomes"),
+                    "outcomePrices": mkt.get("outcomePrices"),
+                    "winnerOutcome": mkt.get("winnerOutcome"),
+                    "resolvedOutcome": mkt.get("resolvedOutcome"),
+                    "umaResolutionStatus": mkt.get("umaResolutionStatus"),
+                }
+                return res, raw
+    return None, {}
 
 
 def _parse_resolution(mkt: dict) -> Optional[str]:
