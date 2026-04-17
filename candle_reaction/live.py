@@ -20,6 +20,7 @@ import logging
 import threading
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from .coindesk import Candle, CoindeskClient
@@ -30,6 +31,13 @@ from .sizing import stake_for
 from .store import SignalRow, Store, TradeRow
 
 log = logging.getLogger("candle_reaction")
+
+
+def _window_label(ts: int) -> str:
+    """Format a 5m candle window like '14:55-15:00 UTC'."""
+    start = datetime.fromtimestamp(ts, tz=timezone.utc)
+    end = start + timedelta(minutes=5)
+    return f"{start:%H:%M}-{end:%H:%M} UTC"
 
 
 @dataclass
@@ -181,6 +189,10 @@ class CandleReactionEngine:
         self.state.last_signal = sig
 
         if stake <= 0.0:
+            log.info(
+                "BTC [%s] SKIP side=%s conf=%.1f%% (below ladder) close=$%.2f",
+                _window_label(candle.ts), j.side, j.confidence * 100.0, candle.close,
+            )
             return
 
         # 4. Open a new paper trade; resolution happens on the NEXT close.
@@ -192,8 +204,10 @@ class CandleReactionEngine:
             stake=stake,
             features=feat,
         )
-        log.info("opened %s @ %.2f conf=%.3f stake=$%.2f",
-                 j.side, candle.close, j.confidence, stake)
+        log.info(
+            "BTC [%s] ENTER %s conf=%.1f%% stake=$%.2f close=$%.2f",
+            _window_label(candle.ts), j.side, j.confidence * 100.0, stake, candle.close,
+        )
 
     def _resolve_open_trade(self, new_candle: Candle) -> None:
         t = self.state.open_trade
@@ -219,7 +233,13 @@ class CandleReactionEngine:
         t.resolve_ts = new_candle.ts
         t.resolve_close = new_candle.close
         self.store.record_trade(t)
-        log.info("resolved %s -> %s pnl=%+.2f", t.side, t.result, t.pnl)
+        log.info(
+            "BTC [%s] RESOLVE %s -> %s pnl=%s$%.2f (%.2f -> %.2f)",
+            _window_label(t.entry_ts), t.side, t.result,
+            "+" if (t.pnl or 0) >= 0 else "-",
+            abs(t.pnl or 0.0),
+            t.entry_close, new_candle.close,
+        )
         self.state.open_trade = None
 
     # ---- snapshots ----

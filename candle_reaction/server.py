@@ -19,11 +19,22 @@ Env::
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 from pathlib import Path
 
 from flask import Flask, Response, jsonify, request, send_from_directory
 from flask_cors import CORS
+
+
+# Make sure log.info() calls in live.py / polymarket.py reach stdout so
+# Railway surfaces them. Flask/gunicorn don't always set up a root handler
+# for non-werkzeug loggers.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
 
 from . import backtest as bt
 from .live import get_engine
