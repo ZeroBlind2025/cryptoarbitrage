@@ -1103,6 +1103,69 @@ def api_start():
 
 
 
+@app.route('/api/candle/status')
+def api_candle_status():
+    """Status snapshot for the BTC 5m candle-reaction engine."""
+    from candle_reaction.live import get_engine
+    return jsonify(get_engine().status())
+
+
+@app.route('/api/candle/start', methods=['POST'])
+def api_candle_start():
+    from candle_reaction.live import get_engine
+    eng = get_engine()
+    eng.start()
+    return jsonify({"success": True, **eng.status()})
+
+
+@app.route('/api/candle/stop', methods=['POST'])
+def api_candle_stop():
+    from candle_reaction.live import get_engine
+    eng = get_engine()
+    eng.stop()
+    return jsonify({"success": True, **eng.status()})
+
+
+@app.route('/api/candle/trades')
+def api_candle_trades():
+    """Return all paper trades (resolved + open) with their signal features."""
+    from candle_reaction.live import get_engine
+    eng = get_engine()
+    trades = eng.store.read_trades()
+    return jsonify({"trades": trades, "summary": eng.store.summary()})
+
+
+@app.route('/api/candle/signals')
+def api_candle_signals():
+    """Return the last N signals regardless of whether they were traded."""
+    from candle_reaction.live import get_engine
+    eng = get_engine()
+    try:
+        limit = int(request.args.get("limit", 200))
+    except (TypeError, ValueError):
+        limit = 200
+    return jsonify({"signals": eng.store.read_signals(limit=limit)})
+
+
+@app.route('/api/candle/export')
+def api_candle_export():
+    """Export trades+signals as CSV. `?kind=trades` or `?kind=signals`."""
+    from candle_reaction.live import get_engine
+    kind = (request.args.get("kind") or "trades").lower()
+    eng = get_engine()
+    path = eng.store.cfg.trades_path() if kind == "trades" else eng.store.cfg.signals_path()
+    if not path.exists():
+        return Response("", mimetype="text/csv")
+    with path.open("r") as fh:
+        body = fh.read()
+    filename = f"candle_{kind}.csv"
+    return Response(
+        body,
+        mimetype="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 @app.route('/api/debug/books')
 def api_debug_books():
     """Debug endpoint showing order book fetch stats"""
