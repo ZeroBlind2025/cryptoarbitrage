@@ -67,12 +67,13 @@ def run(
         hist = candles[: i + 1]
         feat = extract(hist, lookback=cfg.lookback)
         j = judge(feat, contrarian=contrarian)
-        # The regime judge can return side="SKIP" for neutral bars.
-        # Respect that before applying the confidence ladder.
-        if j.side == "SKIP":
-            stake = 0.0
-        else:
-            stake = stake_for(j.confidence, cfg)
+        # Backtest uses a flat $1 stake whenever the judge decides to
+        # trade. The old confidence-ladder was a relic of the logistic
+        # judge -- the regime judge fires only when its rule matches
+        # and always emits the same q, so ladder scaling adds no
+        # information. Live sizing uses Kelly on Polymarket edge; the
+        # backtest is measuring hit-rate of the rule itself.
+        stake = 0.0 if j.side == "SKIP" else 1.0
 
         next_close = candles[i + 1].close
         cur_close = candles[i].close
