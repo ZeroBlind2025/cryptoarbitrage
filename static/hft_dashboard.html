@@ -794,6 +794,149 @@
             );
         };
 
+        // BTC 5m Candle-Reaction paper-trading card.
+        // Visual W/L + last signal; no orderbook microstructure details.
+        const CandleReactionCard = () => {
+            const [s, setS] = useState(null);
+            const [err, setErr] = useState(null);
+
+            const refresh = useCallback(async () => {
+                try {
+                    const r = await fetch('/api/candle/status');
+                    if (!r.ok) throw new Error('HTTP ' + r.status);
+                    setS(await r.json());
+                    setErr(null);
+                } catch (e) { setErr(String(e.message || e)); }
+            }, []);
+
+            useEffect(() => {
+                refresh();
+                const h = setInterval(refresh, 5000);
+                return () => clearInterval(h);
+            }, [refresh]);
+
+            const toggle = async () => {
+                const ep = s && s.running ? '/api/candle/stop' : '/api/candle/start';
+                await fetch(ep, { method: 'POST' });
+                refresh();
+            };
+
+            const running = !!(s && s.running);
+            const wins = s?.wins ?? 0;
+            const losses = s?.losses ?? 0;
+            const voids = s?.voids ?? 0;
+            const hitRate = s?.win_rate ?? 0;
+            const pnl = s?.pnl ?? 0;
+            const equity = s?.equity ?? (s?.bankroll ?? 0);
+            const sig = s?.last_signal;
+            const open = s?.open_trade;
+
+            const stat = (label, value, tone) => (
+                <div className="flex flex-col">
+                    <span className="text-[10px] uppercase tracking-wider text-slate-500">{label}</span>
+                    <span className={`text-lg font-semibold ${tone || 'text-white'}`}>{value}</span>
+                </div>
+            );
+
+            return (
+                <div className="bg-slate-800/50 backdrop-blur rounded-xl border border-slate-700/50 p-4 mb-6">
+                    <div className="flex items-center justify-between mb-3 gap-3 flex-wrap">
+                        <div className="flex items-center gap-3">
+                            <h2 className="text-lg font-semibold flex items-center gap-2">
+                                <span className="text-cyan-400"><TrendingUp /></span>
+                                BTC 5m Candle Reaction
+                            </h2>
+                            <span className={`px-2 py-0.5 text-xs rounded border ${running ? 'bg-green-500/20 text-green-400 border-green-500/30' : 'bg-slate-700/40 text-slate-400 border-slate-600'}`}>
+                                {running ? 'LIVE' : 'STOPPED'}
+                            </span>
+                            {err && <span className="text-red-400 text-xs">{err}</span>}
+                        </div>
+                        <div className="flex items-center gap-2">
+                            <button onClick={toggle}
+                                className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm border ${running ? 'bg-red-500/20 text-red-400 border-red-500/30' : 'bg-green-500/20 text-green-400 border-green-500/30'}`}>
+                                {running ? <Square /> : <Play />} {running ? 'Stop' : 'Start'}
+                            </button>
+                            <a href="/api/candle/export?kind=trades"
+                                className="px-3 py-1.5 rounded-lg text-sm border border-slate-600 text-slate-300 hover:bg-slate-700">
+                                Export trades
+                            </a>
+                            <a href="/api/candle/export?kind=signals"
+                                className="px-3 py-1.5 rounded-lg text-sm border border-slate-600 text-slate-300 hover:bg-slate-700">
+                                Export signals
+                            </a>
+                        </div>
+                    </div>
+
+                    <div className="grid grid-cols-2 md:grid-cols-6 gap-4 mb-4">
+                        {stat('Wins', wins, 'text-green-400')}
+                        {stat('Losses', losses, 'text-red-400')}
+                        {stat('Voids', voids, 'text-slate-400')}
+                        {stat('Hit rate', (hitRate * 100).toFixed(1) + '%')}
+                        {stat('P&L', (pnl >= 0 ? '+$' : '-$') + Math.abs(pnl).toFixed(2), pnl >= 0 ? 'text-green-400' : 'text-red-400')}
+                        {stat('Equity', '$' + equity.toFixed(2))}
+                    </div>
+
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                        <div className="bg-slate-900/40 rounded-lg p-3 border border-slate-700/50">
+                            <div className="text-[10px] uppercase tracking-wider text-slate-500 mb-2">Last signal</div>
+                            {sig ? (
+                                <div className="space-y-1 text-sm">
+                                    <div className="flex justify-between">
+                                        <span className="text-slate-400">Side</span>
+                                        <span className={sig.side === 'UP' ? 'text-green-400' : 'text-red-400'}>{sig.side}</span>
+                                    </div>
+                                    <div className="flex justify-between">
+                                        <span className="text-slate-400">Confidence</span>
+                                        <span>{(sig.confidence * 100).toFixed(1)}%</span>
+                                    </div>
+                                    <div className="flex justify-between">
+                                        <span className="text-slate-400">Stake</span>
+                                        <span>{sig.traded ? '$' + Number(sig.stake).toFixed(2) : 'skip'}</span>
+                                    </div>
+                                    <div className="flex justify-between">
+                                        <span className="text-slate-400">Close</span>
+                                        <span>${Number(sig.close_price).toFixed(2)}</span>
+                                    </div>
+                                    {sig.features && (
+                                        <div className="text-xs text-slate-500 mt-2">
+                                            cp={sig.features.close_position} body={sig.features.body_signed} volZ={sig.features.volume_z} streak={sig.features.streak}
+                                        </div>
+                                    )}
+                                </div>
+                            ) : (
+                                <div className="text-sm text-slate-500">Waiting for first 5m close...</div>
+                            )}
+                        </div>
+                        <div className="bg-slate-900/40 rounded-lg p-3 border border-slate-700/50">
+                            <div className="text-[10px] uppercase tracking-wider text-slate-500 mb-2">Open trade</div>
+                            {open ? (
+                                <div className="space-y-1 text-sm">
+                                    <div className="flex justify-between">
+                                        <span className="text-slate-400">Side</span>
+                                        <span className={open.side === 'UP' ? 'text-green-400' : 'text-red-400'}>{open.side}</span>
+                                    </div>
+                                    <div className="flex justify-between">
+                                        <span className="text-slate-400">Confidence</span>
+                                        <span>{(open.confidence * 100).toFixed(1)}%</span>
+                                    </div>
+                                    <div className="flex justify-between">
+                                        <span className="text-slate-400">Stake</span>
+                                        <span>${Number(open.stake).toFixed(2)}</span>
+                                    </div>
+                                    <div className="flex justify-between">
+                                        <span className="text-slate-400">Entry close</span>
+                                        <span>${Number(open.entry_close).toFixed(2)}</span>
+                                    </div>
+                                </div>
+                            ) : (
+                                <div className="text-sm text-slate-500">No open position.</div>
+                            )}
+                        </div>
+                    </div>
+                </div>
+            );
+        };
+
         // Main Dashboard
         function HFTDashboard() {
             const [data, setData] = useState(null);
@@ -955,6 +1098,8 @@
                     </div>
 
 
+
+                    <CandleReactionCard />
 
                     {/* Main Grid */}
                     <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
