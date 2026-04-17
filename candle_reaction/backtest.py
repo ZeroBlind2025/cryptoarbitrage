@@ -58,12 +58,18 @@ def run(
     equity = cfg.bankroll
     wins = losses = voids = skips = 0
     bucket_stats: dict[str, dict[str, int]] = defaultdict(lambda: {"n": 0, "w": 0})
+    regime_stats: dict[str, dict[str, int]] = defaultdict(lambda: {"n": 0, "w": 0})
 
     for i in range(warmup, len(candles) - 1):
         hist = candles[: i + 1]
         feat = extract(hist, lookback=cfg.lookback)
         j = judge(feat, contrarian=contrarian)
-        stake = stake_for(j.confidence, cfg)
+        # The regime judge can return side="SKIP" for neutral bars.
+        # Respect that before applying the confidence ladder.
+        if j.side == "SKIP":
+            stake = 0.0
+        else:
+            stake = stake_for(j.confidence, cfg)
 
         next_close = candles[i + 1].close
         cur_close = candles[i].close
@@ -92,6 +98,9 @@ def run(
             bucket_stats[bucket]["n"] += 1
             if result == "WIN":
                 bucket_stats[bucket]["w"] += 1
+            regime_stats[j.regime]["n"] += 1
+            if result == "WIN":
+                regime_stats[j.regime]["w"] += 1
 
         out_rows.append({
             "ts": candles[i].ts,
@@ -104,6 +113,7 @@ def run(
             "streak": feat.streak,
             "p_up": round(j.p_up, 6),
             "side": j.side,
+            "regime": j.regime,
             "confidence": round(j.confidence, 6),
             "stake": stake,
             "actual": actual,
@@ -131,6 +141,14 @@ def run(
         }
         for name in ("70-80", "80-90", "90-100")
     }
+    regimes = {
+        name: {
+            "n": s["n"],
+            "wins": s["w"],
+            "hit_rate": (s["w"] / s["n"]) if s["n"] else 0.0,
+        }
+        for name, s in regime_stats.items()
+    }
     result = {
         "path": str(out_path),
         "csv_name": out_path.name,
@@ -149,6 +167,7 @@ def run(
         "equity": round(equity, 4),
         "pnl": round(equity - cfg.bankroll, 4),
         "buckets": buckets,
+        "regimes": regimes,
     }
 
     if verbose:
@@ -168,6 +187,11 @@ def run(
         for name in ("70-80", "80-90", "90-100"):
             b = buckets[name]
             print(f"  {name}: {b['n']:4d} trades, hit {b['hit_rate']:.2%}")
+        print("\nHit rate by regime:")
+        for name in ("momentum", "exhaustion", "neutral"):
+            if name in regimes:
+                r = regimes[name]
+                print(f"  {name:10s}: {r['n']:4d} trades, hit {r['hit_rate']:.2%}")
         print(f"\nWrote {out_path}")
     return result
 
