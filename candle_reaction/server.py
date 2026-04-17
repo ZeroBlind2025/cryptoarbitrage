@@ -35,6 +35,10 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
+# Drop the per-request access log; the dashboard polls 3 endpoints every
+# 5s and drowns out real ENTER/RESOLVE/SKIP lines. Real errors still
+# surface at WARNING.
+logging.getLogger("werkzeug").setLevel(logging.WARNING)
 
 from . import backtest as bt
 from .live import get_engine
