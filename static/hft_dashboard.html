@@ -407,14 +407,19 @@
         };
 
         // Algo Settings Component - Per-coin lot size controls + dynamic lot sizing
-        const AlgoSettings = ({ copyTrader, fetchData, setError }) => {
+        // apiPrefix: '/api/copy-trader' (default) or '/api/contrarian' / '/api/momentum'
+        // showDynamic: dynamic-lot-sizing toggle only exists on /api/copy-trader
+        const AlgoSettings = ({ copyTrader, fetchData, setError,
+                                apiPrefix = '/api/copy-trader',
+                                showDynamic = true }) => {
             const [isOpen, setIsOpen] = useState(false);
             const COINS = ['btc', 'eth', 'sol', 'xrp'];
             const [coinAmounts, setCoinAmounts] = useState({});
             const [saving, setSaving] = useState(false);
             const [saveMsg, setSaveMsg] = useState('');
 
-            const isDynamic = copyTrader.dynamic_lot_sizing_enabled || false;
+            const supportsDynamic = showDynamic && apiPrefix === '/api/copy-trader';
+            const isDynamic = supportsDynamic && (copyTrader.dynamic_lot_sizing_enabled || false);
 
             // Sync inputs with live data when panel opens
             useEffect(() => {
@@ -434,7 +439,7 @@
 
             const toggleDynamicLots = async () => {
                 try {
-                    const resp = await fetch('/api/copy-trader/dynamic-lots', {
+                    const resp = await fetch(`${apiPrefix}/dynamic-lots`, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ enabled: !isDynamic }),
@@ -472,7 +477,7 @@
                         return;
                     }
 
-                    const resp = await fetch('/api/copy-trader/settings', {
+                    const resp = await fetch(`${apiPrefix}/settings`, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ coin_bet_amounts }),
@@ -502,27 +507,29 @@
 
                     {isOpen && (
                         <div className="mt-3 space-y-3">
-                            {/* Dynamic Lot Sizing Toggle */}
-                            <div className="flex items-center justify-between p-2 rounded-lg bg-slate-700/30 border border-slate-600/50">
-                                <div>
-                                    <p className="text-xs text-slate-300 font-medium">Auto-Scale Lots by Win Rate</p>
-                                    <p className="text-xs text-slate-500 mt-0.5">
-                                        {isDynamic
-                                            ? 'ON: lots auto-adjust based on coin win %'
-                                            : 'OFF: manual lot sizes only'}
-                                    </p>
+                            {/* Dynamic Lot Sizing Toggle (copy-trader only) */}
+                            {supportsDynamic && (
+                                <div className="flex items-center justify-between p-2 rounded-lg bg-slate-700/30 border border-slate-600/50">
+                                    <div>
+                                        <p className="text-xs text-slate-300 font-medium">Auto-Scale Lots by Win Rate</p>
+                                        <p className="text-xs text-slate-500 mt-0.5">
+                                            {isDynamic
+                                                ? 'ON: lots auto-adjust based on coin win %'
+                                                : 'OFF: manual lot sizes only'}
+                                        </p>
+                                    </div>
+                                    <button
+                                        onClick={toggleDynamicLots}
+                                        className={`px-3 py-1 text-xs rounded border transition-all ${
+                                            isDynamic
+                                                    ? 'bg-cyan-500/20 text-cyan-400 border-cyan-500/30 hover:bg-cyan-500/30'
+                                                    : 'bg-slate-600/50 text-slate-400 border-slate-500/30 hover:bg-slate-500/30'
+                                        }`}
+                                    >
+                                        {isDynamic ? 'ON' : 'OFF'}
+                                    </button>
                                 </div>
-                                <button
-                                    onClick={toggleDynamicLots}
-                                    className={`px-3 py-1 text-xs rounded border transition-all ${
-                                        isDynamic
-                                                ? 'bg-cyan-500/20 text-cyan-400 border-cyan-500/30 hover:bg-cyan-500/30'
-                                                : 'bg-slate-600/50 text-slate-400 border-slate-500/30 hover:bg-slate-500/30'
-                                    }`}
-                                >
-                                    {isDynamic ? 'ON' : 'OFF'}
-                                </button>
-                            </div>
+                            )}
 
                             {/* Dynamic lot tier explanation */}
                             {isDynamic && (
@@ -1489,6 +1496,17 @@
                                     <p className="text-slate-500 text-sm">
                                         Click Start to begin contrarian fade trading.
                                     </p>
+                                )}
+
+                                {/* Lot Sizes panel (contrarian engine) */}
+                                {momentum.running && (
+                                    <AlgoSettings
+                                        copyTrader={momentum}
+                                        fetchData={fetchData}
+                                        setError={setError}
+                                        apiPrefix="/api/contrarian"
+                                        showDynamic={false}
+                                    />
                                 )}
                             </div>
 

@@ -2822,6 +2822,53 @@ def api_contrarian_settings():
     })
 
 
+@app.route('/api/contrarian/pause-coin', methods=['POST'])
+def api_contrarian_pause_coin():
+    """Pause a coin in the contrarian fade engine."""
+    if not contrarian_engine:
+        return jsonify({"error": "Contrarian engine not running"}), 400
+
+    data = request.get_json() or {}
+    coin = (data.get('coin') or '').lower().strip()
+    if not coin:
+        return jsonify({"error": "Missing 'coin' parameter"}), 400
+
+    if coin in contrarian_engine.paused_coins:
+        return jsonify({"error": f"{coin.upper()} already paused"}), 400
+
+    contrarian_engine.paused_coins.add(coin)
+    print(f"[CONTRARIAN] {coin.upper()} paused — no new fades for this coin",
+          flush=True)
+    return jsonify({
+        "success": True,
+        "message": f"{coin.upper()} paused",
+        "paused_coins": sorted(contrarian_engine.paused_coins),
+    })
+
+
+@app.route('/api/contrarian/resume-coin', methods=['POST'])
+def api_contrarian_resume_coin():
+    """Resume a coin in the contrarian fade engine."""
+    if not contrarian_engine:
+        return jsonify({"error": "Contrarian engine not running"}), 400
+
+    data = request.get_json() or {}
+    coin = (data.get('coin') or '').lower().strip()
+    if not coin:
+        return jsonify({"error": "Missing 'coin' parameter"}), 400
+
+    if coin not in contrarian_engine.paused_coins:
+        return jsonify({"error": f"{coin.upper()} not paused"}), 400
+
+    contrarian_engine.paused_coins.discard(coin)
+    print(f"[CONTRARIAN] {coin.upper()} resumed", flush=True)
+    return jsonify({
+        "success": True,
+        "message": f"{coin.upper()} resumed",
+        "paused_coins": sorted(contrarian_engine.paused_coins),
+    })
+
+
 @app.route('/api/contrarian/trades')
 def api_contrarian_trades():
     """Get contrarian fade engine trade history."""
