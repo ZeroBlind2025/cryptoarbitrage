@@ -40,7 +40,7 @@ class CoindeskClient:
 
     def fetch_minutes(
         self,
-        limit: int = 2000,
+        limit: int = 400,
         to_ts: Optional[int] = None,
         aggregate: Optional[int] = None,
         instrument: Optional[str] = None,
@@ -48,14 +48,15 @@ class CoindeskClient:
     ) -> list[Candle]:
         """Fetch historical minute candles, aggregated to `aggregate` minutes.
 
-        `limit` is capped at 2000 by the API. For deeper history, call
-        repeatedly with `to_ts` stepping backwards.
+        `limit` is capped at 400 by the CoinDesk Data API for spot
+        minute candles. For deeper history, call repeatedly with
+        `to_ts` stepping backwards.
         """
         params = {
             "market": market or self.cfg.market,
             "instrument": instrument or self.cfg.instrument,
             "aggregate": aggregate or self.cfg.aggregate,
-            "limit": min(limit, 2000),
+            "limit": min(limit, 400),
         }
         if to_ts is not None:
             params["to_ts"] = to_ts
@@ -64,8 +65,18 @@ class CoindeskClient:
 
         url = COINDESK_REST_BASE + COINDESK_HISTORICAL_MINUTES
         resp = self.session.get(url, params=params, timeout=15)
-        resp.raise_for_status()
-        payload = resp.json()
+        try:
+            payload = resp.json()
+        except ValueError:
+            resp.raise_for_status()
+            raise RuntimeError(f"CoinDesk returned non-JSON body: {resp.text[:200]!r}")
+
+        # CoinDesk Data API returns 4xx/5xx with a structured Err envelope.
+        err = payload.get("Err")
+        if err and (err.get("message") or err.get("type")):
+            raise RuntimeError(f"CoinDesk API error: {err.get('message') or err}")
+        if not resp.ok:
+            resp.raise_for_status()
 
         rows = payload.get("Data") or payload.get("data") or []
         candles: list[Candle] = []
@@ -102,12 +113,12 @@ class CoindeskClient:
         out: list[Candle] = []
         to_ts: Optional[int] = None
         while len(out) < total:
-            batch = self.fetch_minutes(limit=2000, to_ts=to_ts)
+            batch = self.fetch_minutes(limit=400, to_ts=to_ts)
             if not batch:
                 break
             out = batch + out
             to_ts = batch[0].ts - 1
-            if len(batch) < 2000:
+            if len(batch) < 400:
                 break
         # Dedupe by timestamp, keep chronological order.
         seen: set[int] = set()
