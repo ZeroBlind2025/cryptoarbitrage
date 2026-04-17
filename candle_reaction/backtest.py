@@ -36,12 +36,15 @@ def run(
     warmup: int = 30,
     verbose: bool = True,
     contrarian: Optional[bool] = None,
+    aggregate: Optional[int] = None,
 ) -> dict:
     cfg = load()
     if not cfg.api_key:
         raise RuntimeError("COINDESK_API_KEY is not set")
     if contrarian is None:
         contrarian = cfg.contrarian
+    if aggregate is not None:
+        cfg.aggregate = int(aggregate)
 
     client = CoindeskClient(cfg)
     if verbose:
@@ -158,6 +161,7 @@ def run(
         "end_ts": candles[-1].ts,
         "warmup": warmup,
         "mode": "contrarian" if contrarian else "continuation",
+        "aggregate": cfg.aggregate,
         "wins": wins,
         "losses": losses,
         "voids": voids,
@@ -226,6 +230,7 @@ def start_async(
     total_candles: int = 6000,
     warmup: int = 30,
     contrarian: Optional[bool] = None,
+    aggregate: Optional[int] = None,
 ) -> dict:
     """Kick off a backtest in a daemon thread. Idempotent while running."""
     with _STATE_LOCK:
@@ -236,23 +241,29 @@ def start_async(
             "started_at": int(time.time()),
             "finished_at": None,
             "params": {"candles": total_candles, "warmup": warmup,
-                       "contrarian": bool(contrarian)},
+                       "contrarian": bool(contrarian), "aggregate": aggregate},
             "result": None,
             "error": None,
         })
     threading.Thread(
         target=_run_and_store,
-        args=(total_candles, warmup, contrarian),
+        args=(total_candles, warmup, contrarian, aggregate),
         daemon=True,
         name="candle-backtest",
     ).start()
     return get_state()
 
 
-def _run_and_store(total_candles: int, warmup: int, contrarian: Optional[bool]) -> None:
+def _run_and_store(
+    total_candles: int,
+    warmup: int,
+    contrarian: Optional[bool],
+    aggregate: Optional[int],
+) -> None:
     try:
         result = run(total_candles=total_candles, warmup=warmup,
-                     verbose=False, contrarian=contrarian)
+                     verbose=False, contrarian=contrarian,
+                     aggregate=aggregate)
         with _STATE_LOCK:
             _STATE["status"] = "done"
             _STATE["finished_at"] = int(time.time())
@@ -281,8 +292,12 @@ def main() -> None:
                    help="Warmup bars skipped for z-score windows")
     p.add_argument("--contrarian", action="store_true",
                    help="Flip the judge (trade against the signal)")
+    p.add_argument("--aggregate", type=int, default=None,
+                   help="Candle aggregation in minutes (default: config / 5m). "
+                        "e.g. --aggregate 15 for 15m bars")
     args = p.parse_args()
-    run(total_candles=args.candles, warmup=args.warmup, contrarian=args.contrarian)
+    run(total_candles=args.candles, warmup=args.warmup,
+        contrarian=args.contrarian, aggregate=args.aggregate)
 
 
 if __name__ == "__main__":
