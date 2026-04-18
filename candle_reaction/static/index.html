@@ -261,6 +261,10 @@
                       className="px-3 py-1.5 rounded-lg text-sm border border-cyan-500/30 bg-cyan-500/20 text-cyan-400 hover:bg-cyan-500/30 disabled:opacity-50 disabled:cursor-not-allowed">
                       {bt && bt.status === 'running' ? 'Running...' : 'Run backtest'}
                     </button>
+                    <a href={`/api/candle/raw?count=${Number(btCandles) || 6000}&aggregate=${Number(btAggregate) || 5}`}
+                      className="px-3 py-1.5 rounded-lg text-sm border border-slate-600 text-slate-300 hover:bg-slate-700">
+                      Raw data
+                    </a>
                     {bt && bt.status === 'done' && (
                       <a href="/api/candle/backtest/export"
                         className="px-3 py-1.5 rounded-lg text-sm border border-slate-600 text-slate-300 hover:bg-slate-700">

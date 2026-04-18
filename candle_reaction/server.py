@@ -164,6 +164,48 @@ def create_app() -> Flask:
             headers={"Content-Disposition": f'attachment; filename="{path.name}"'},
         )
 
+    @app.route("/api/candle/raw")
+    def api_raw_candles():
+        """Raw OHLCV dump from the live data source (no judge, no trades)."""
+        from .config import load as load_cfg, make_live_client
+        try:
+            count = int(request.args.get("count", 400))
+        except (TypeError, ValueError):
+            return jsonify({"error": "count must be an integer"}), 400
+        try:
+            aggregate = int(request.args.get("aggregate", 5))
+        except (TypeError, ValueError):
+            return jsonify({"error": "aggregate must be an integer"}), 400
+        if aggregate not in (1, 5, 15, 60):
+            return jsonify({"error": "aggregate must be one of 1, 5, 15, 60"}), 400
+        count = max(1, min(count, 20000))
+
+        cfg = load_cfg()
+        cfg.aggregate = aggregate
+        client = make_live_client(cfg)
+        try:
+            candles = client.fetch_history(count) if count > 300 \
+                else client.fetch_minutes(limit=count)
+        except Exception as e:
+            return jsonify({"error": f"fetch failed: {e}"}), 502
+
+        from datetime import datetime, timezone
+        import io, csv as _csv
+        buf = io.StringIO()
+        w = _csv.writer(buf)
+        w.writerow(["ts", "datetime_utc", "open", "high", "low", "close", "volume"])
+        for c in candles:
+            iso = datetime.fromtimestamp(c.ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            w.writerow([c.ts, iso, c.open, c.high, c.low, c.close, c.volume])
+
+        src = cfg.source
+        filename = f"raw_{src}_{aggregate}m_{count}bars.csv"
+        return Response(
+            buf.getvalue(),
+            mimetype="text/csv",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
     return app
 
 
