@@ -252,7 +252,7 @@
                       <option value="60">1h</option>
                     </select>
                     <label className="text-xs text-slate-400">Candles</label>
-                    <input type="number" min="100" max="100000" step="500"
+                    <input type="number" min="100" max="200000" step="500"
                       value={btCandles} onChange={(e) => setBtCandles(e.target.value)}
                       disabled={bt && bt.status === 'running'}
                       className="w-24 px-2 py-1 rounded bg-slate-800 border border-slate-700 text-sm text-white disabled:opacity-50" />

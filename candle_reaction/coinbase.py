@@ -106,21 +106,36 @@ class CoinbaseClient:
         return candles
 
     def fetch_history(self, total: int) -> list[Candle]:
-        """Paginate backwards until at least ``total`` bars are collected."""
+        """Paginate backwards until ``total`` bars are collected.
+
+        Keeps going while each batch returns at least one bar and the
+        oldest timestamp is strictly decreasing. A short batch (fewer
+        than MAX_PER_REQUEST) used to be treated as end-of-history,
+        but Coinbase returns short batches whenever there's any gap
+        in the data -- so we'd abort ~55 days in and only deliver 16k
+        of a requested 24k bars. Now we press on and stop only on a
+        truly empty batch or lack of progress.
+        """
         import time as _time
         out: list[Candle] = []
         to_ts: Optional[int] = None
-        # Coinbase public API tolerates ~10 req/s; we'll stay well under
-        # that to avoid 429s on large pulls (e.g. 24k 5m bars = 80 calls).
-        pause = 0.15
-        while len(out) < total:
+        prev_oldest: Optional[int] = None
+        pause = 0.15       # ~6 req/s, well under Coinbase's ~10 req/s cap
+        max_iters = 800    # safety valve (~240k bars at 300/req)
+
+        for _ in range(max_iters):
+            if len(out) >= total:
+                break
             batch = self.fetch_minutes(limit=MAX_PER_REQUEST, to_ts=to_ts)
             if not batch:
                 break
+            oldest = batch[0].ts
+            if prev_oldest is not None and oldest >= prev_oldest:
+                # Not making progress (API returning the same window).
+                break
+            prev_oldest = oldest
             out = batch + out
             to_ts = batch[0].ts - 1
-            if len(batch) < MAX_PER_REQUEST:
-                break
             _time.sleep(pause)
         seen: set[int] = set()
         unique: list[Candle] = []
