@@ -290,8 +290,11 @@ class CandleReactionEngine:
         )
 
         # 3. Ask Polymarket for the next-bucket BTC updown-5m market
-        #    and compute the edge trade. If nothing tradable, signal only.
-        if degenerate:
+        #    and compute the edge trade. If the judge says SKIP we
+        #    don't trade at all -- a SKIP with p_up=0.5 would otherwise
+        #    look "edgey" against any Polymarket ask below 0.47 and
+        #    trigger signal-less trades.
+        if degenerate or j.side == "SKIP":
             edge_trade, market, up_ask, down_ask = None, None, None, None
         else:
             edge_trade, market, up_ask, down_ask = self._price_polymarket(candle.ts, j.p_up)
@@ -316,6 +319,12 @@ class CandleReactionEngine:
                     "BTC [%s] SKIP degenerate candle (flat OHLC from data source); "
                     "judge uninformative, no trade",
                     window,
+                )
+                return
+            if j.side == "SKIP":
+                log.info(
+                    "BTC [%s] SKIP judge regime=%s (no trade) close=$%.2f",
+                    window, j.regime, candle.close,
                 )
                 return
             if market is None:
