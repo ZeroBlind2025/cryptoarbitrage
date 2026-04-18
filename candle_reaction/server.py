@@ -176,8 +176,8 @@ def create_app() -> Flask:
             aggregate = int(request.args.get("aggregate", 5))
         except (TypeError, ValueError):
             return jsonify({"error": "aggregate must be an integer"}), 400
-        if aggregate not in (1, 5, 15, 60):
-            return jsonify({"error": "aggregate must be one of 1, 5, 15, 60"}), 400
+        if aggregate not in (1, 5, 15, 60, 360, 1440):
+            return jsonify({"error": "aggregate must be one of 1, 5, 15, 60, 360, 1440"}), 400
         count = max(1, min(count, 200000))
 
         cfg = load_cfg()
