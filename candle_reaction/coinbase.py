@@ -107,8 +107,12 @@ class CoinbaseClient:
 
     def fetch_history(self, total: int) -> list[Candle]:
         """Paginate backwards until at least ``total`` bars are collected."""
+        import time as _time
         out: list[Candle] = []
         to_ts: Optional[int] = None
+        # Coinbase public API tolerates ~10 req/s; we'll stay well under
+        # that to avoid 429s on large pulls (e.g. 24k 5m bars = 80 calls).
+        pause = 0.15
         while len(out) < total:
             batch = self.fetch_minutes(limit=MAX_PER_REQUEST, to_ts=to_ts)
             if not batch:
@@ -117,6 +121,7 @@ class CoinbaseClient:
             to_ts = batch[0].ts - 1
             if len(batch) < MAX_PER_REQUEST:
                 break
+            _time.sleep(pause)
         seen: set[int] = set()
         unique: list[Candle] = []
         for c in out:
