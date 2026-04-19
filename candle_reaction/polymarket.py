@@ -233,6 +233,63 @@ def get_resolution(
     return result
 
 
+def get_resolution_via_clob(
+    condition_id: str,
+    token_id: str,
+    session: Optional[requests.Session] = None,
+) -> Optional[dict]:
+    """Definitive Polymarket resolution via the CLOB /markets/<cid>.
+
+    Matches the pattern copy_trader.py / momentum_engine.py use -- they
+    observed 100% resolution accuracy against on-chain. Gamma's
+    outcomePrices is orderbook-derived and can lag or stale; the CLOB
+    endpoint exposes a per-token ``winner: bool`` flag that reflects
+    the actual settlement record.
+
+    Returns ``{resolved: bool, our_token_won: bool, winning_outcome,
+    winning_token_id}`` on success, or None if not yet resolved.
+    """
+    if not condition_id:
+        return None
+    sess = session or requests.Session()
+    try:
+        r = sess.get(f"{CLOB_BASE}/markets/{condition_id}", timeout=10)
+    except requests.RequestException as e:
+        log.debug("clob markets %s network error: %s", condition_id, e)
+        return None
+    if r.status_code != 200:
+        return None
+    try:
+        market = r.json()
+    except ValueError:
+        return None
+
+    # Must be closed to be resolved.
+    if not market.get("closed"):
+        return None
+
+    tokens = market.get("tokens") or []
+    winning_token = None
+    for t in tokens:
+        if t.get("winner") is True:
+            winning_token = t
+            break
+    if winning_token is None:
+        # Closed but no winner flag set yet (very brief settlement window).
+        return None
+
+    winning_token_id = str(winning_token.get("token_id", "")).strip()
+    our_tid = str(token_id).strip() if token_id else ""
+    our_token_won = (our_tid == winning_token_id) if our_tid else None
+
+    return {
+        "resolved": True,
+        "our_token_won": our_token_won,
+        "winning_outcome": winning_token.get("outcome"),
+        "winning_token_id": winning_token_id,
+    }
+
+
 def get_market_settled_prices(
     slug: str,
     session: Optional[requests.Session] = None,

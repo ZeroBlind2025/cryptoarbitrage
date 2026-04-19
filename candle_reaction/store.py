@@ -32,7 +32,7 @@ SIGNAL_HEADER = [
 TRADE_HEADER = [
     "entry_ts", "entry_close",
     "side", "confidence", "stake",
-    "market_slug", "token_id", "fill_price", "edge", "kelly_f", "shares",
+    "market_slug", "condition_id", "token_id", "fill_price", "edge", "kelly_f", "shares",
     "close_position", "body_signed", "direction",
     "volume_z", "range_z", "streak",
     "resolve_ts", "resolve_close", "settled_token_price",
@@ -61,6 +61,7 @@ class TradeRow:
     # Polymarket execution context. When the trader couldn't find a
     # market these stay None and the trade is a synthetic 1:1 bet.
     market_slug: Optional[str] = None
+    condition_id: Optional[str] = None     # Polymarket conditionId (for CLOB /markets lookup)
     token_id: Optional[str] = None         # the specific YES-UP or YES-DOWN CLOB token we "bought"
     fill_price: Optional[float] = None     # 0..1, ask we paid
     edge: Optional[float] = None           # our_q - fill_price
@@ -168,6 +169,7 @@ class Store:
             r.entry_ts, r.entry_close,
             r.side, round(r.confidence, 6), round(r.stake, 4),
             r.market_slug or "",
+            r.condition_id or "",
             r.token_id or "",
             _opt(r.fill_price, 6), _opt(r.edge, 6),
             _opt(r.kelly_f, 6), _opt(r.shares, 6),

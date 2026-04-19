@@ -31,8 +31,7 @@ from .judge import judge
 from .polymarket import (
     PolyMarket,
     discover_btc_updown_5m,
-    get_market_settled_prices,
-    get_resolution,
+    get_resolution_via_clob,
     get_top_of_book,
 )
 from .store import SignalRow, Store, TradeRow
@@ -207,56 +206,51 @@ class CandleReactionEngine:
         self.state.last_judged_ts = newest.ts
 
     def _try_poly_resolution_all(self) -> None:
-        """Poll Polymarket for resolution of every pending trade.
+        """Resolve every pending trade via the CLOB /markets/{conditionId}.
 
-        A market goes through several states after its 5m window ends:
-
-          1. ``closed=true`` but oracle hasn't posted yet: prices are
-             the last-traded book (e.g. [0.98, 0.02]).
-          2. Oracle settled: prices are [1.0, 0.0] -- sum = 1.0.
-          3. Post-redemption: winning token drops to 0 on the book
-             while the loser can show a 1c residual ([0, 0.01]).
-
-        Only state (2) is the definitive oracle outcome. We require
-        ``our_price + other_price`` to sum to ~1.0 before trusting the
-        numbers; any other sum means 'not yet oracle-settled, poll again'.
+        The CLOB endpoint returns ``tokens: [{token_id, outcome, winner}]``
+        where ``winner`` is the authoritative Polymarket settlement flag
+        (same source the momentum/copy-trader engines use with 100%
+        accuracy). Gamma's outcomePrices is orderbook-derived and can
+        report transient [0, 0.01] / [0.99, 0.01] states that lag or
+        flip relative to actual on-chain resolution -- don't trust it.
         """
         now = int(time.time())
         for t in list(self.state.pending_trades):
-            if not t.market_slug or not t.token_id:
+            if not t.condition_id or not t.token_id:
                 continue
             expected = t.entry_ts + self.cfg.aggregate * 60
             if now < expected:
                 continue
             try:
-                settled = get_market_settled_prices(
-                    t.market_slug, session=self.client.session,
+                result = get_resolution_via_clob(
+                    t.condition_id, t.token_id, session=self.client.session,
                 )
             except Exception as e:  # pragma: no cover - network
-                log.debug("poly settled-prices check failed for %s: %s",
-                          t.market_slug, e)
+                log.debug("clob resolution check failed for %s: %s",
+                          t.condition_id, e)
                 continue
-            if not settled:
-                continue
-
-            our_price = settled.get(str(t.token_id))
-            others = [p for tid, p in settled.items() if tid != str(t.token_id)]
-            other_price = others[0] if others else None
-            if our_price is None or other_price is None:
+            if not result or not result.get("resolved"):
                 continue
 
-            total = our_price + other_price
-            # Only state (2) above: oracle-settled clean 1/0.
-            if abs(total - 1.0) > 0.02:
-                log.info(
-                    "BTC [%s] awaiting oracle settle: our=%.4f other=%.4f sum=%.4f",
-                    _window_label(t.entry_ts), our_price, other_price, total,
+            won = result.get("our_token_won")
+            winning_outcome = result.get("winning_outcome") or ""
+            if won is True:
+                t.settled_token_price = 1.0
+                self._finalise_trade(t, outcome=t.side, source="polymarket")
+            elif won is False:
+                t.settled_token_price = 0.0
+                other = "DOWN" if t.side == "UP" else "UP"
+                self._finalise_trade(t, outcome=other, source="polymarket")
+            else:
+                log.warning(
+                    "BTC [%s] CLOB resolved but token match ambiguous "
+                    "(ours=%s winner=%s outcome=%s); leaving pending",
+                    _window_label(t.entry_ts),
+                    (t.token_id or "?")[:20],
+                    (result.get("winning_token_id") or "?")[:20],
+                    winning_outcome,
                 )
-                continue
-
-            self._finalise_trade_by_token(
-                t, our_price=our_price, other_price=other_price,
-            )
 
     def _void_stale_trades(self) -> None:
         """Safety valve: if Polymarket never settles, mark UNRESOLVED.
@@ -373,6 +367,7 @@ class CandleReactionEngine:
             stake=edge_trade.stake,
             features=feat,
             market_slug=market.slug if market else None,
+            condition_id=market.condition_id if market else None,
             token_id=token_id,
             fill_price=edge_trade.fill_price,
             edge=edge_trade.edge,
