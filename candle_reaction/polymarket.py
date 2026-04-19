@@ -77,7 +77,7 @@ def discover_btc_updown_5m(
     for slug in candidates:
         market = _fetch_event(sess, slug)
         if market is not None:
-            return market
+            return _reconcile_via_clob(market, session=sess)
     return None
 
 
@@ -109,9 +109,10 @@ def _parse_market(mkt: dict, slug: str) -> Optional[PolyMarket]:
     if not token_ids or len(token_ids) < 2:
         return None
 
-    # `outcomes` carries the canonical label order that matches both
-    # clobTokenIds and outcomePrices. Pick the UP-labelled index
-    # explicitly; fall back to [0] = UP when labels are missing.
+    # Gamma's outcomes[] array is the nominal label source, but its
+    # order relative to clobTokenIds is not always reliable. We do a
+    # best-guess here; the caller (discover_*) will override this
+    # mapping with CLOB's authoritative token->outcome lookup.
     outcomes = _decode_list(mkt.get("outcomes"))
     up_idx = _up_outcome_index(outcomes)
     down_idx = 1 - up_idx
@@ -121,7 +122,6 @@ def _parse_market(mkt: dict, slug: str) -> Optional[PolyMarket]:
 
     condition_id = str(mkt.get("conditionId") or mkt.get("id") or "")
 
-    # Resolution timestamp: prefer endDateIso -> endDate -> slug tail.
     resolve_ts = _parse_resolve_ts(mkt, slug)
     if resolve_ts is None:
         return None
@@ -132,6 +132,73 @@ def _parse_market(mkt: dict, slug: str) -> Optional[PolyMarket]:
         yes_up_token_id=yes_up_id,
         yes_down_token_id=yes_down_id,
         resolve_ts=resolve_ts,
+    )
+
+
+def _clob_token_outcome_map(
+    condition_id: str,
+    session: Optional[requests.Session] = None,
+) -> Optional[dict[str, str]]:
+    """Return ``{"up": token_id, "down": token_id}`` from CLOB.
+
+    CLOB ``/markets/{cid}`` reports each token with its authoritative
+    ``outcome`` label. This is the mapping used for resolution, so we
+    key entry off the same source -- any mismatch against Gamma's
+    inferred order is resolved in CLOB's favour.
+    """
+    if not condition_id:
+        return None
+    sess = session or requests.Session()
+    try:
+        r = sess.get(f"{CLOB_BASE}/markets/{condition_id}", timeout=6)
+    except requests.RequestException:
+        return None
+    if r.status_code != 200:
+        return None
+    try:
+        data = r.json()
+    except ValueError:
+        return None
+    mapping: dict[str, str] = {}
+    for t in (data.get("tokens") or []):
+        outcome = (t.get("outcome") or "").strip().lower()
+        tid = str(t.get("token_id", "")).strip()
+        if not tid:
+            continue
+        if outcome in _UP_WORDS:
+            mapping["up"] = tid
+        elif outcome in {"down", "no", "lower", "below"}:
+            mapping["down"] = tid
+    if "up" in mapping and "down" in mapping:
+        return mapping
+    return None
+
+
+def _reconcile_via_clob(
+    market: "PolyMarket",
+    session: Optional[requests.Session] = None,
+) -> "PolyMarket":
+    """Override Gamma-inferred token ids with CLOB's authoritative map.
+
+    Returns the market unchanged if CLOB is unreachable, so discovery
+    degrades gracefully to the Gamma-only path. When CLOB responds,
+    the yes_up/yes_down mapping becomes identical to what the
+    resolver reads -- no possibility of inversion.
+    """
+    m = _clob_token_outcome_map(market.condition_id, session=session)
+    if not m:
+        return market
+    if (m["up"] == market.yes_up_token_id
+            and m["down"] == market.yes_down_token_id):
+        return market
+    log.info("reconciled token order via CLOB for %s (Gamma had it swapped)",
+             market.slug)
+    return PolyMarket(
+        slug=market.slug,
+        condition_id=market.condition_id,
+        yes_up_token_id=m["up"],
+        yes_down_token_id=m["down"],
+        resolve_ts=market.resolve_ts,
     )
 
 
