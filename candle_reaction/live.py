@@ -123,6 +123,7 @@ class CandleReactionEngine:
             "last_judged_ts": s.last_judged_ts,
             "last_error": s.last_error,
             "bankroll": self.cfg.bankroll,
+            "max_stake": self.cfg.max_stake,
             "mode": "contrarian" if self.cfg.contrarian else "continuation",
             "source": self.cfg.source,
             **summary,
@@ -136,6 +137,12 @@ class CandleReactionEngine:
     def set_contrarian(self, contrarian: bool) -> None:
         """Flip live-engine polarity. Only affects signals after the flip."""
         self.cfg.contrarian = bool(contrarian)
+
+    def set_max_stake(self, value: float) -> None:
+        """Adjust the dollar cap applied after quarter-Kelly sizing.
+        Only affects trades opened after the change.
+        """
+        self.cfg.max_stake = max(0.0, float(value))
 
     # ---- main loop ----
 
@@ -400,6 +407,7 @@ class CandleReactionEngine:
             up_ask=up_ask,
             down_ask=down_ask,
             bankroll=self.cfg.bankroll,
+            max_stake=self.cfg.max_stake,
         )
         return trade, market, up_ask, down_ask
 

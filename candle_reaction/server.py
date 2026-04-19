@@ -92,6 +92,19 @@ def create_app() -> Flask:
         eng.set_contrarian(bool(data["contrarian"]))
         return jsonify({"success": True, **eng.status()})
 
+    @app.route("/api/candle/max_stake", methods=["POST"])
+    def api_max_stake():
+        data = request.get_json(silent=True) or {}
+        try:
+            value = float(data.get("value"))
+        except (TypeError, ValueError):
+            return jsonify({"error": "value must be a number"}), 400
+        if value < 0 or value > 250:
+            return jsonify({"error": "value must be between 0 and 250"}), 400
+        eng = get_engine()
+        eng.set_max_stake(value)
+        return jsonify({"success": True, **eng.status()})
+
     @app.route("/api/candle/trades")
     def api_trades():
         eng = get_engine()

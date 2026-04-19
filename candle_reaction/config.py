@@ -43,6 +43,10 @@ class Config:
     # Bankroll in USD (paper).
     bankroll: float = 250.0
 
+    # Maximum dollar stake per trade, applied after quarter-Kelly
+    # sizing. Adjustable at runtime via POST /api/candle/max_stake.
+    max_stake: float = 15.0
+
     # Confidence ladder -- applied to max(p_up, p_down).
     # <70% -> skip. 70-80 -> $1, 80-90 -> $3, 90+ -> $5.
     ladder: list[LadderRung] = field(

@@ -77,6 +77,19 @@
         refresh();
       };
 
+      const [maxStakeInput, setMaxStakeInput] = useState('');
+      const saveMaxStake = async () => {
+        const value = Number(maxStakeInput);
+        if (!isFinite(value) || value < 0) return;
+        await fetch('/api/candle/max_stake', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ value }),
+        });
+        setMaxStakeInput('');
+        refresh();
+      };
+
       useEffect(() => {
         refresh(); refreshBt(); refreshTrades();
         const h = setInterval(() => { refresh(); refreshBt(); refreshTrades(); }, 5000);
@@ -142,6 +155,25 @@
                     <button onClick={() => setMode(true)}
                       className={`px-2 py-1 ${s && s.mode === 'contrarian' ? 'bg-purple-500/20 text-purple-300' : 'bg-slate-800 text-slate-400 hover:bg-slate-700'}`}>
                       Contrarian
+                    </button>
+                  </div>
+                  <div className="flex items-center gap-1 text-xs">
+                    <span className="text-slate-400">Max lot</span>
+                    <span className="text-slate-200">${(s?.max_stake ?? 0).toFixed(2)}</span>
+                    <input
+                      type="number"
+                      min="0"
+                      max="250"
+                      step="1"
+                      placeholder="$"
+                      value={maxStakeInput}
+                      onChange={(e) => setMaxStakeInput(e.target.value)}
+                      onKeyDown={(e) => { if (e.key === 'Enter') saveMaxStake(); }}
+                      className="w-16 px-2 py-1 rounded bg-slate-800 border border-slate-700 text-white"
+                    />
+                    <button onClick={saveMaxStake}
+                      className="px-2 py-1 rounded border border-slate-600 text-slate-300 hover:bg-slate-700">
+                      Set
                     </button>
                   </div>
                   {err && <span className="text-red-400 text-xs">{err}</span>}
