@@ -166,6 +166,19 @@ MARKET_ENTRY_DELAY: dict[str, float] = {
     "15m": float(os.getenv("MOMENTUM_15M_ENTRY_DELAY", "540")) / 60,
 }
 
+# Global floor on market age before any entry.  Overrides any shorter
+# per-interval delay above.  User rule: no entries in the first 3 minutes.
+MIN_MARKET_AGE_MINUTES = float(os.getenv("MOMENTUM_MIN_MARKET_AGE", "3.0"))
+
+# Favorite-drop reversal trigger.  Whenever the side that was trading
+# as the favorite (peak price > 50¢) falls by this fraction from its
+# peak (e.g. 0.20 = 20%: 75¢ peak → 60¢ current), enter the OPPOSITE
+# side immediately.  Bypasses price-range / max-price filters so we
+# catch the reversal the moment it happens.  Only fires after
+# MIN_MARKET_AGE_MINUTES and only if no side of the market has been
+# entered yet.
+FAVORITE_DROP_PCT = float(os.getenv("MOMENTUM_FAVORITE_DROP_PCT", "0.20"))
+
 # Interval durations in minutes (used to derive market start time from end time)
 _INTERVAL_DURATION_MINUTES: dict[str, float] = {
     "5m": 5,
@@ -881,6 +894,11 @@ class MomentumEngine:
         # stack additional entries (bounded by MAX_ENTRIES_PER_MARKET).
         self.probe_token_by_cid: dict = {}
 
+        # Per-token peak price observed during a market's life.
+        # Keyed by (condition_id, token_id).  Feeds the favorite-drop
+        # reversal trigger (FAVORITE_DROP_PCT).
+        self.favorite_peaks: dict = {}
+
         # Position tracking — share the same dict as copy trader when available
         # so both engines' trades appear in the combined P&L / balance chart
         self.positions = shared_positions if shared_positions is not None else load_positions()
@@ -967,6 +985,8 @@ class MomentumEngine:
         _delay_info = ", ".join(f"{k}={int(v*60)}s" for k, v in MARKET_ENTRY_DELAY.items()) if _delay_status == "ENABLED" else ""
         print(f"  Delays/cooldowns: {_delay_status}" + (f" ({_delay_info})" if _delay_info else ""))
         print(f"  Max entry price: {MAX_PRICE_ENTRY*100:.0f}¢")
+        print(f"  Min market age: {MIN_MARKET_AGE_MINUTES:.1f}m (no entries in first {MIN_MARKET_AGE_MINUTES:.1f} minutes)")
+        print(f"  Favorite-drop trigger: {FAVORITE_DROP_PCT*100:.0f}% drop from peak → enter opposite side")
         _no_trade_str = ", ".join(f"{h}:00" for h in sorted(NO_TRADE_HOURS)) if NO_TRADE_HOURS else "NONE"
         print(f"  No-trade hours (ET): {_no_trade_str}")
         print(f"  DOWN bets: {'ENABLED' if DOWN_BETS_ENABLED else 'DISABLED'}")
@@ -1474,35 +1494,89 @@ class MomentumEngine:
             if minutes_left is not None and minutes_left < 0:
                 continue
 
-            # --- GUARD: Market must be old enough (entry delay) ---
-            # Derive market age from end_date and interval duration.
-            # If the market just opened, early prices are volatile and
-            # reversals are common — wait for the direction to stabilise.
-            # SKIP in dry run mode — no delays.
+            # --- Derive market age (used by delay guard + favorite-drop trigger) ---
             interval = market.get("interval", "")
+            duration = _INTERVAL_DURATION_MINUTES.get(interval)
+            market_age_minutes: Optional[float] = None
+            if duration and minutes_left is not None:
+                market_age_minutes = duration - minutes_left
+
+            # --- GUARD: Market must be old enough (entry delay) ---
+            # Uses the larger of MIN_MARKET_AGE_MINUTES (global 3-min floor)
+            # and MARKET_ENTRY_DELAY[interval] (per-interval override).
+            # Early-market prices are volatile and reversals are common —
+            # wait for the direction to stabilise.
+            # SKIP in dry run mode — no delays.
             if not getattr(self, '_dry_run_no_delays', False):
-                entry_delay = MARKET_ENTRY_DELAY.get(interval)
-                if entry_delay and minutes_left is not None:
-                    duration = _INTERVAL_DURATION_MINUTES.get(interval)
-                    if duration:
-                        market_age_minutes = duration - minutes_left
-                        if market_age_minutes < entry_delay:
-                            wait_remaining = entry_delay - market_age_minutes
-                            # Log once per market per scan cycle (only when candidate price would qualify)
-                            _delay_label = f"{coin.upper()}_{interval} {slug[:30]}"
-                            _wait_secs = int(wait_remaining * 60)
-                            _wait_m, _wait_s = divmod(_wait_secs, 60)
-                            _wait_display = f"{_wait_m}m{_wait_s:02d}s" if _wait_m else f"{_wait_s}s"
-                            print(f"[MOMENTUM] DELAY {_delay_label}: market age {market_age_minutes:.1f}m < {entry_delay:.0f}m delay "
-                                  f"(wait {_wait_display} more)", flush=True)
-                            continue
-                        else:
-                            # Delay satisfied — log that we're past the wait
-                            _delay_label = f"{coin.upper()}_{interval} {slug[:30]}"
-                            print(f"[MOMENTUM] DELAY OK {_delay_label}: market age {market_age_minutes:.1f}m >= {entry_delay:.0f}m delay", flush=True)
+                per_interval_delay = MARKET_ENTRY_DELAY.get(interval, 0.0) or 0.0
+                entry_delay = max(MIN_MARKET_AGE_MINUTES, per_interval_delay)
+                if entry_delay and market_age_minutes is not None:
+                    if market_age_minutes < entry_delay:
+                        wait_remaining = entry_delay - market_age_minutes
+                        # Log once per market per scan cycle (only when candidate price would qualify)
+                        _delay_label = f"{coin.upper()}_{interval} {slug[:30]}"
+                        _wait_secs = int(wait_remaining * 60)
+                        _wait_m, _wait_s = divmod(_wait_secs, 60)
+                        _wait_display = f"{_wait_m}m{_wait_s:02d}s" if _wait_m else f"{_wait_s}s"
+                        print(f"[MOMENTUM] DELAY {_delay_label}: market age {market_age_minutes:.1f}m < {entry_delay:.0f}m delay "
+                              f"(wait {_wait_display} more)", flush=True)
+                        continue
+                    else:
+                        # Delay satisfied — log that we're past the wait
+                        _delay_label = f"{coin.upper()}_{interval} {slug[:30]}"
+                        print(f"[MOMENTUM] DELAY OK {_delay_label}: market age {market_age_minutes:.1f}m >= {entry_delay:.0f}m delay", flush=True)
 
             # Build a short label for rejection logging
             _mkt_label = f"{coin.upper()}_{market['interval']} {slug[:30]}"
+
+            # --- FAVORITE-DROP TRIGGER ---
+            # Update per-token peaks, then check whether the current
+            # favorite has fallen FAVORITE_DROP_PCT from its peak.
+            # If so, force a first-entry on the OPPOSITE side this
+            # iteration — bypassing the normal price-range / max-price
+            # filters.  Only fires when no side of the market has been
+            # entered yet (otherwise normal hedge / re-entry logic owns
+            # the follow-up).
+            fav_drop_entry_oi: Optional[int] = None
+            fav_drop_peak = 0.0
+            fav_drop_current = 0.0
+            fav_drop_favorite_oi: Optional[int] = None
+            for _oi in range(2):
+                _tid = market["token_ids"][_oi]
+                _lp = self.get_live_price(_tid)
+                _cur = _lp if _lp is not None else market["prices"][_oi]
+                _pk_key = (condition_id, _tid)
+                if _cur > self.favorite_peaks.get(_pk_key, 0.0):
+                    self.favorite_peaks[_pk_key] = _cur
+                _peak = self.favorite_peaks[_pk_key]
+                # The "favorite" is the side that has been above 50¢
+                # and has the higher peak of the two sides.
+                if _peak > 0.5 and _peak > fav_drop_peak:
+                    fav_drop_peak = _peak
+                    fav_drop_favorite_oi = _oi
+                    fav_drop_current = _cur
+            if (
+                fav_drop_favorite_oi is not None
+                and fav_drop_peak > 0
+                and market_age_minutes is not None
+                and market_age_minutes >= MIN_MARKET_AGE_MINUTES
+            ):
+                _drop_ratio = (fav_drop_peak - fav_drop_current) / fav_drop_peak
+                _market_entered = any(
+                    cid == condition_id for (cid, _) in self.entered_markets
+                )
+                if _drop_ratio >= FAVORITE_DROP_PCT and not _market_entered:
+                    fav_drop_entry_oi = 1 - fav_drop_favorite_oi
+                    _fav_name = market["outcomes"][fav_drop_favorite_oi]
+                    _opp_name = market["outcomes"][fav_drop_entry_oi]
+                    print(
+                        f"[MOMENTUM] FAVORITE DROP {_mkt_label}: "
+                        f"{_fav_name} peaked {fav_drop_peak*100:.1f}¢ → "
+                        f"{fav_drop_current*100:.1f}¢ "
+                        f"({_drop_ratio*100:.0f}% drop) — forcing entry "
+                        f"on {_opp_name}",
+                        flush=True,
+                    )
 
             # Check each side (outcome 0 and 1)
             for oi in range(2):
@@ -1511,8 +1585,16 @@ class MomentumEngine:
                 other_token_id = market["token_ids"][1 - oi]
                 gamma_price = market["prices"][oi]
 
+                # Favorite-drop trigger overrides side selection: we only
+                # want to enter the opposite side this pass.
+                is_fav_drop_entry = (fav_drop_entry_oi is not None and oi == fav_drop_entry_oi)
+                if fav_drop_entry_oi is not None and not is_fav_drop_entry:
+                    continue
+
                 # --- GUARD: Skip DOWN bets if disabled ---
-                if not DOWN_BETS_ENABLED and outcome.lower() == "down":
+                # Bypassed for fav-drop entries — the reversal trigger
+                # takes whichever side is opposite the collapsing favorite.
+                if not is_fav_drop_entry and not DOWN_BETS_ENABLED and outcome.lower() == "down":
                     continue
 
                 # Get best available price (WS → WS cache → CLOB REST → Gamma)
@@ -1537,23 +1619,26 @@ class MomentumEngine:
                         print(f"  WARN gamma_fallback: {_mkt_label} {outcome} no live price, using gamma={gamma_price*100:.1f}¢", flush=True)
 
                 # --- FILTER: Price must be in range ---
-                # Use per-interval brackets if defined, else global min/max
+                # Use per-interval brackets if defined, else global min/max.
+                # Bypassed for fav-drop entries — the whole point is to
+                # catch the reversal regardless of where price sits.
                 interval = market.get("interval", "")
-                if interval in self.interval_price_brackets:
-                    brackets = self.interval_price_brackets[interval]
-                    in_bracket = any(lo <= price < hi for lo, hi in brackets)
-                    if not in_bracket:
-                        _ranges = " | ".join(f"{lo*100:.0f}-{hi*100:.0f}¢" for lo, hi in brackets)
-                        print(f"  REJECT price_range: {_mkt_label} {outcome} @ {price*100:.1f}¢ not in [{_ranges}]", flush=True)
-                        continue
-                else:
-                    if price < self.min_entry_price or price > self.max_entry_price:
-                        print(f"  REJECT price_range: {_mkt_label} {outcome} @ {price*100:.1f}¢ outside {self.min_entry_price*100:.0f}-{self.max_entry_price*100:.0f}¢", flush=True)
-                        continue
+                if not is_fav_drop_entry:
+                    if interval in self.interval_price_brackets:
+                        brackets = self.interval_price_brackets[interval]
+                        in_bracket = any(lo <= price < hi for lo, hi in brackets)
+                        if not in_bracket:
+                            _ranges = " | ".join(f"{lo*100:.0f}-{hi*100:.0f}¢" for lo, hi in brackets)
+                            print(f"  REJECT price_range: {_mkt_label} {outcome} @ {price*100:.1f}¢ not in [{_ranges}]", flush=True)
+                            continue
+                    else:
+                        if price < self.min_entry_price or price > self.max_entry_price:
+                            print(f"  REJECT price_range: {_mkt_label} {outcome} @ {price*100:.1f}¢ outside {self.min_entry_price*100:.0f}-{self.max_entry_price*100:.0f}¢", flush=True)
+                            continue
 
-                # --- GUARD: Hard ceiling on entry price ---
-                if price >= MAX_PRICE_ENTRY:
-                    continue
+                    # --- GUARD: Hard ceiling on entry price ---
+                    if price >= MAX_PRICE_ENTRY:
+                        continue
 
                 # --- Price qualifies! Log that we're evaluating this candidate ---
                 print(f"[MOMENTUM] CANDIDATE {_mkt_label} {outcome} @ {price*100:.1f}¢ ({_price_src})", flush=True)
@@ -1816,7 +1901,9 @@ class MomentumEngine:
                     trade_amount = round(full_lot * REENTRY_LOT_MULTIPLIER, 2)
 
                 title = (question or slug)[:50]
-                if is_opposite_first_entry:
+                if is_fav_drop_entry:
+                    entry_type = "FAV-DROP"
+                elif is_opposite_first_entry:
                     entry_type = "OPP-ENTRY"
                 elif is_first_entry:
                     entry_type = "PROBE"
