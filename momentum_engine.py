@@ -184,6 +184,30 @@ FAVORITE_DROP_PCT = float(os.getenv("MOMENTUM_FAVORITE_DROP_PCT", "0.20"))
 # any side at a price below this.
 ENTRY_PRICE_FLOOR = float(os.getenv("MOMENTUM_ENTRY_PRICE_FLOOR", "0.50"))
 
+# ---------------------------------------------------------------------------
+# MARTINGALE STRATEGY (experimental)
+# ---------------------------------------------------------------------------
+# When MARTINGALE_MODE is on, scan_and_trade runs a single-trigger
+# martingale strategy INSTEAD of the normal momentum flow:
+#
+#   * The moment either side of a market hits MARTINGALE_TRIGGER_PRICE
+#     (default 70¢), buy that side at market.
+#   * Lot size = coin_bet_amount * per-coin_multiplier.
+#   * In the final MARTINGALE_SAMPLE_SECONDS before close, sample the
+#     price of the side we bet on.  >= MARTINGALE_WIN_PRICE → WIN
+#     (multiplier resets to 1), else LOSS (multiplier doubles, capped
+#     at MARTINGALE_MAX_MULTIPLIER).
+#   * Each coin keeps its own multiplier — independent of the others.
+#
+# Normal TP/SL don't apply to martingale positions — they hold to close.
+# Actual P&L still settles via the on-chain resolver; the final-5s
+# sample only drives the multiplier (user accepts the slippage).
+MARTINGALE_MODE = os.getenv("MOMENTUM_MARTINGALE_MODE", "false").lower() == "true"
+MARTINGALE_TRIGGER_PRICE = float(os.getenv("MOMENTUM_MARTINGALE_TRIGGER", "0.70"))
+MARTINGALE_WIN_PRICE = float(os.getenv("MOMENTUM_MARTINGALE_WIN_PRICE", "0.50"))
+MARTINGALE_SAMPLE_SECONDS = float(os.getenv("MOMENTUM_MARTINGALE_SAMPLE_S", "5.0"))
+MARTINGALE_MAX_MULTIPLIER = int(os.getenv("MOMENTUM_MARTINGALE_MAX_MULT", "64"))
+
 # Interval durations in minutes (used to derive market start time from end time)
 _INTERVAL_DURATION_MINUTES: dict[str, float] = {
     "5m": 5,
@@ -904,6 +928,10 @@ class MomentumEngine:
         # reversal trigger (FAVORITE_DROP_PCT).
         self.favorite_peaks: dict = {}
 
+        # Per-coin martingale multiplier.  Doubles on a loss, resets
+        # to 1 on a win.  Each coin runs independently.
+        self.martingale_multiplier: dict[str, int] = {c: 1 for c in CRYPTO_COINS}
+
         # Position tracking — share the same dict as copy trader when available
         # so both engines' trades appear in the combined P&L / balance chart
         self.positions = shared_positions if shared_positions is not None else load_positions()
@@ -993,6 +1021,11 @@ class MomentumEngine:
         print(f"  Entry price floor: {ENTRY_PRICE_FLOOR*100:.0f}¢ (no entries below this on any path)")
         print(f"  Min market age: {MIN_MARKET_AGE_MINUTES:.1f}m (no entries in first {MIN_MARKET_AGE_MINUTES:.1f} minutes)")
         print(f"  Favorite-drop trigger: {FAVORITE_DROP_PCT*100:.0f}% drop from peak → buy the dip on the favorite side")
+        if MARTINGALE_MODE:
+            _mg_mults = ", ".join(f"{c}={self.martingale_multiplier.get(c, 1)}x" for c in CRYPTO_COINS)
+            print(f"  MARTINGALE MODE: ON — buy at market when either side hits {MARTINGALE_TRIGGER_PRICE*100:.0f}¢")
+            print(f"    Win/loss sampled in final {MARTINGALE_SAMPLE_SECONDS:.0f}s (win >= {MARTINGALE_WIN_PRICE*100:.0f}¢)")
+            print(f"    Multiplier cap: {MARTINGALE_MAX_MULTIPLIER}x | current: {_mg_mults}")
         _no_trade_str = ", ".join(f"{h}:00" for h in sorted(NO_TRADE_HOURS)) if NO_TRADE_HOURS else "NONE"
         print(f"  No-trade hours (ET): {_no_trade_str}")
         print(f"  DOWN bets: {'ENABLED' if DOWN_BETS_ENABLED else 'DISABLED'}")
@@ -1010,6 +1043,14 @@ class MomentumEngine:
                 self.dry_run = True
 
         self._start_ws()
+
+        # Seed martingale multipliers from persisted state
+        _persisted_mults = self.positions.get("stats", {}).get("martingale_multiplier", {}) or {}
+        for _c, _m in _persisted_mults.items():
+            try:
+                self.martingale_multiplier[_c] = max(1, int(_m))
+            except (TypeError, ValueError):
+                continue
 
         # Seed entered_markets from existing open positions.  We also
         # seed probe_token_by_cid from whichever momentum position on
@@ -1032,6 +1073,16 @@ class MomentumEngine:
                 # First-seen (oldest) entry on this condition is the probe
                 if cid not in self.probe_token_by_cid:
                     self.probe_token_by_cid[cid] = tid
+        # Seed entered_markets for any open martingale positions so we
+        # don't re-enter them after a restart.
+        for pos in self.positions.get("open", []):
+            if pos.get("strategy") == "martingale":
+                cid = pos.get("condition_id", "")
+                tid = pos.get("token_id", "")
+                ep = pos.get("entry_price", 0)
+                if cid and tid:
+                    self.entered_markets[(cid, tid)] = ep
+
         # Seed hedged_markets from existing arb_hedge positions
         for pos in self.positions.get("open", []):
             if pos.get("source") == "arb_hedge":
@@ -1476,6 +1527,11 @@ class MomentumEngine:
                 if self.scans_completed % 60 == 1:
                     print(f"[MOMENTUM] NO-TRADE HOUR: {_et_hour}:00 ET — skipping scan", flush=True)
                 return 0
+
+        # --- MARTINGALE MODE: run the martingale strategy INSTEAD of
+        # the normal momentum logic below.
+        if MARTINGALE_MODE:
+            return self._scan_martingale(markets)
 
         for market in markets:
             coin = market["coin"]
@@ -2038,6 +2094,264 @@ class MomentumEngine:
 
         return entered
 
+    # ------------------------------------------------------------------
+    # MARTINGALE STRATEGY
+    # ------------------------------------------------------------------
+
+    def _persist_martingale_multipliers(self):
+        """Stash per-coin multipliers in positions["stats"] so they survive restart."""
+        try:
+            stats = self.positions.setdefault("stats", {})
+            stats["martingale_multiplier"] = dict(self.martingale_multiplier)
+        except Exception:
+            pass
+
+    def _check_martingale_final5s(self):
+        """Sample the price of each open martingale position in the final
+        MARTINGALE_SAMPLE_SECONDS before close and update the per-coin
+        multiplier.  >= MARTINGALE_WIN_PRICE counts as a WIN (reset to 1),
+        anything less is a LOSS (double, capped).  Position still settles
+        via the on-chain resolver; this only drives the multiplier.
+        """
+        now_utc = datetime.now(timezone.utc)
+        updated = False
+        for position in self.positions.get("open", []):
+            if position.get("strategy") != "martingale":
+                continue
+            if position.get("martingale_settled"):
+                continue
+            end_date_str = position.get("end_date")
+            if not end_date_str:
+                continue
+            try:
+                end_date = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
+            except Exception:
+                continue
+            secs_to_close = (end_date - now_utc).total_seconds()
+            # Sample window: within the final MARTINGALE_SAMPLE_SECONDS.
+            # Keep sampling for up to 60s past close in case the scan
+            # loop fell behind — otherwise we'd miss the update.
+            if secs_to_close > MARTINGALE_SAMPLE_SECONDS or secs_to_close < -60:
+                continue
+            token_id = position.get("token_id")
+            coin = (position.get("coin") or "").lower()
+            if not token_id or not coin:
+                continue
+            price = self.get_live_price(token_id)
+            if price is None:
+                continue
+            won = price >= MARTINGALE_WIN_PRICE
+            if won:
+                self.martingale_multiplier[coin] = 1
+                print(
+                    f"[MARTINGALE] WIN {coin.upper()} final_price={price*100:.1f}¢ "
+                    f"→ multiplier reset to 1x",
+                    flush=True,
+                )
+            else:
+                prev = self.martingale_multiplier.get(coin, 1)
+                new_mult = min(prev * 2, MARTINGALE_MAX_MULTIPLIER)
+                self.martingale_multiplier[coin] = new_mult
+                print(
+                    f"[MARTINGALE] LOSS {coin.upper()} final_price={price*100:.1f}¢ "
+                    f"→ multiplier {prev}x → {new_mult}x "
+                    f"(cap {MARTINGALE_MAX_MULTIPLIER}x)",
+                    flush=True,
+                )
+            position["martingale_settled"] = True
+            updated = True
+        if updated:
+            self._persist_martingale_multipliers()
+            save_positions(self.positions)
+
+    def _scan_martingale(self, markets: list) -> int:
+        """Martingale entry scan.
+
+        Buys the first side that reaches MARTINGALE_TRIGGER_PRICE, sized
+        as base_lot * per-coin_multiplier.  One entry per market.  Runs
+        the final-5s sampler first so any just-settled market updates
+        the multiplier before a new entry on that coin.
+        """
+        # Settle any martingale positions in their final-5s window first
+        self._check_martingale_final5s()
+
+        entered = 0
+        now_utc = datetime.now(timezone.utc)
+
+        for market in markets:
+            coin = market["coin"]
+            condition_id = market["condition_id"]
+            slug = market["slug"]
+            question = market["question"]
+
+            # Per-coin pause
+            if coin in self.paused_coins:
+                continue
+
+            # Skip if we've already entered ANY side of this market
+            if any(cid == condition_id for (cid, _) in self.entered_markets):
+                continue
+
+            # Time-to-close check
+            end_date = market.get("end_date")
+            if end_date is not None:
+                minutes_left = (end_date - now_utc).total_seconds() / 60
+            else:
+                minutes_left = market.get("minutes_until_close")
+            if minutes_left is not None and minutes_left < 0:
+                continue
+            # Don't enter inside the sample window — the trade wouldn't
+            # have time to matter for win/loss sampling anyway.
+            if minutes_left is not None and minutes_left * 60 <= MARTINGALE_SAMPLE_SECONDS:
+                continue
+
+            _mkt_label = f"{coin.upper()}_{market.get('interval', '')} {slug[:30]}"
+
+            # Check each side — first to hit trigger wins
+            for oi in range(2):
+                outcome = market["outcomes"][oi]
+                token_id = market["token_ids"][oi]
+                gamma_price = market["prices"][oi]
+
+                live_price = self.get_live_price(token_id)
+                price = live_price if live_price is not None else gamma_price
+
+                if price < MARTINGALE_TRIGGER_PRICE:
+                    continue
+                # Global floor still wins
+                if price < ENTRY_PRICE_FLOOR:
+                    continue
+
+                multiplier = self.martingale_multiplier.get(coin, 1)
+                base_lot = self.coin_bet_amounts.get(coin, self.bet_amount)
+                trade_amount = round(base_lot * multiplier, 2)
+
+                title = (question or slug)[:50]
+                print(
+                    f"\n[MARTINGALE] ENTERING {coin.upper()} {outcome} @ {price*100:.1f}¢ "
+                    f"(mult={multiplier}x)",
+                    flush=True,
+                )
+                print(f"             Market: {title}", flush=True)
+                print(f"             Amount: ${trade_amount:.2f} (base=${base_lot:.2f} × {multiplier})", flush=True)
+
+                trade_record = {
+                    "id": f"martingale_{condition_id[:12]}_{oi}_{int(time.time())}",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "market": title,
+                    "slug": slug,
+                    "outcome": outcome,
+                    "outcome_index": oi,
+                    "side": "BUY",
+                    "amount": trade_amount,
+                    "coin": coin,
+                    "price": price,
+                    "interval": market.get("interval", ""),
+                    "source": "momentum",
+                    "strategy": "martingale",
+                    "martingale_multiplier": multiplier,
+                }
+
+                if self.dry_run:
+                    print(f"             DRY RUN - would buy @ {price*100:.1f}¢", flush=True)
+                    trade_record["status"] = "dry_run"
+                    entered += 1
+                else:
+                    buffer = PRICE_BUFFER_BPS / 10000
+                    max_price = min(price * (1 + buffer), 0.99)
+                    fill = place_bet(self.client, token_id, trade_amount, max_price=max_price)
+                    if fill.get("success"):
+                        if fill.get("fill_price"):
+                            price = fill["fill_price"]
+                            trade_record["price"] = price
+                        print(f"             EXECUTED @ {price*100:.1f}¢", flush=True)
+                        trade_record["status"] = "filled"
+                        entered += 1
+                        self.total_spent += trade_amount
+                    else:
+                        print(f"             FAILED!", flush=True)
+                        trade_record["status"] = "failed"
+
+                self.trade_history.append(trade_record)
+                _log_trade(trade_record["status"], {
+                    "id": trade_record["id"],
+                    "coin": coin,
+                    "interval": market.get("interval", ""),
+                    "outcome": outcome,
+                    "price": price,
+                    "amount": trade_amount,
+                    "slug": slug,
+                    "market": title,
+                    "condition_id": condition_id,
+                    "token_id": token_id,
+                    "minutes_until_close": minutes_left,
+                    "strategy": "martingale",
+                    "martingale_multiplier": multiplier,
+                })
+
+                if trade_record["status"] in ("filled", "dry_run"):
+                    market_key = (condition_id, token_id)
+                    self.entered_markets[market_key] = price
+                    self.market_entry_count[market_key] = 1
+                    self.last_trade_time[market_key] = time.time()
+
+                    position = {
+                        "id": trade_record["id"],
+                        "timestamp": trade_record["timestamp"],
+                        "condition_id": condition_id,
+                        "token_id": token_id,
+                        "outcome_index": oi,
+                        "outcome": outcome,
+                        "market": title,
+                        "slug": slug,
+                        "interval": market.get("interval", ""),
+                        "end_date": end_date.isoformat() if end_date else None,
+                        "entry_price": price,
+                        "amount": trade_amount,
+                        "potential_payout": trade_amount / price if price > 0 else 0,
+                        "dry_run": self.dry_run,
+                        "source": "momentum",
+                        "strategy": "martingale",
+                        "coin": coin,
+                        "martingale_multiplier": multiplier,
+                    }
+                    self.positions["open"].append(position)
+
+                    try:
+                        stats = self.positions["stats"]
+                        stats["balance"] = stats.get("balance", ALGO_STARTING_BALANCE) - trade_amount
+                        open_staked = sum(p.get("amount", 0) for p in self.positions.get("open", []))
+                        stats.setdefault("balance_history", []).append({
+                            "timestamp": trade_record["timestamp"],
+                            "balance": stats["balance"],
+                            "pnl": stats.get("total_pnl", 0.0),
+                            "equity": stats["balance"] + open_staked,
+                            "event": "martingale_trade",
+                            "detail": f"{coin.upper()} {outcome} {title[:30]} mult={multiplier}x",
+                        })
+                    except Exception:
+                        pass
+
+                    save_positions(self.positions)
+                    print(
+                        f"             Position saved. Balance: "
+                        f"${self.positions['stats'].get('balance', 0):.2f}",
+                        flush=True,
+                    )
+
+                    self.trades_entered += 1
+
+                    if self.on_trade:
+                        try:
+                            self.on_trade(trade_record)
+                        except Exception as e:
+                            print(f"[MARTINGALE] Callback error: {e}", flush=True)
+
+                # Only one entry per market regardless of fill/skip
+                break
+
+        return entered
+
     def check_take_profits(self) -> int:
         """Auto-sell momentum positions whose live ask reached TAKE_PROFIT_PRICE.
 
@@ -2052,7 +2366,9 @@ class MomentumEngine:
             return 0
 
         open_positions = self.positions.get("open", [])
-        momentum_open = [p for p in open_positions if p.get("source") == "momentum"]
+        momentum_open = [p for p in open_positions
+                         if p.get("source") == "momentum"
+                         and p.get("strategy") != "martingale"]
         if not momentum_open:
             return 0
 
@@ -2247,7 +2563,9 @@ class MomentumEngine:
             return 0
 
         open_positions = self.positions.get("open", [])
-        momentum_open = [p for p in open_positions if p.get("source") == "momentum"]
+        momentum_open = [p for p in open_positions
+                         if p.get("source") == "momentum"
+                         and p.get("strategy") != "martingale"]
         if not momentum_open:
             return 0
 
