@@ -170,13 +170,13 @@ MARKET_ENTRY_DELAY: dict[str, float] = {
 # per-interval delay above.  User rule: no entries in the first 3 minutes.
 MIN_MARKET_AGE_MINUTES = float(os.getenv("MOMENTUM_MIN_MARKET_AGE", "3.0"))
 
-# Favorite-drop reversal trigger.  Whenever the side that was trading
+# Favorite-drop dip-buy trigger.  Whenever the side that was trading
 # as the favorite (peak price > 50¢) falls by this fraction from its
-# peak (e.g. 0.20 = 20%: 75¢ peak → 60¢ current), enter the OPPOSITE
-# side immediately.  Bypasses price-range / max-price filters so we
-# catch the reversal the moment it happens.  Only fires after
-# MIN_MARKET_AGE_MINUTES and only if no side of the market has been
-# entered yet.
+# peak (e.g. 0.20 = 20%: 75¢ peak → 60¢ current), buy the FAVORITE
+# side immediately (buying the dip).  Bypasses price-range /
+# max-price filters so we catch the dip the moment it happens.  Only
+# fires after MIN_MARKET_AGE_MINUTES and only if no side of the
+# market has been entered yet.
 FAVORITE_DROP_PCT = float(os.getenv("MOMENTUM_FAVORITE_DROP_PCT", "0.20"))
 
 # Interval durations in minutes (used to derive market start time from end time)
@@ -986,7 +986,7 @@ class MomentumEngine:
         print(f"  Delays/cooldowns: {_delay_status}" + (f" ({_delay_info})" if _delay_info else ""))
         print(f"  Max entry price: {MAX_PRICE_ENTRY*100:.0f}¢")
         print(f"  Min market age: {MIN_MARKET_AGE_MINUTES:.1f}m (no entries in first {MIN_MARKET_AGE_MINUTES:.1f} minutes)")
-        print(f"  Favorite-drop trigger: {FAVORITE_DROP_PCT*100:.0f}% drop from peak → enter opposite side")
+        print(f"  Favorite-drop trigger: {FAVORITE_DROP_PCT*100:.0f}% drop from peak → buy the dip on the favorite side")
         _no_trade_str = ", ".join(f"{h}:00" for h in sorted(NO_TRADE_HOURS)) if NO_TRADE_HOURS else "NONE"
         print(f"  No-trade hours (ET): {_no_trade_str}")
         print(f"  DOWN bets: {'ENABLED' if DOWN_BETS_ENABLED else 'DISABLED'}")
@@ -1532,8 +1532,8 @@ class MomentumEngine:
             # --- FAVORITE-DROP TRIGGER ---
             # Update per-token peaks, then check whether the current
             # favorite has fallen FAVORITE_DROP_PCT from its peak.
-            # If so, force a first-entry on the OPPOSITE side this
-            # iteration — bypassing the normal price-range / max-price
+            # If so, force a first-entry on the FAVORITE side (buying
+            # the dip) — bypassing the normal price-range / max-price
             # filters.  Only fires when no side of the market has been
             # entered yet (otherwise normal hedge / re-entry logic owns
             # the follow-up).
@@ -1566,15 +1566,15 @@ class MomentumEngine:
                     cid == condition_id for (cid, _) in self.entered_markets
                 )
                 if _drop_ratio >= FAVORITE_DROP_PCT and not _market_entered:
-                    fav_drop_entry_oi = 1 - fav_drop_favorite_oi
+                    # Buy the dip: enter the FAVORITE side, not the opposite.
+                    fav_drop_entry_oi = fav_drop_favorite_oi
                     _fav_name = market["outcomes"][fav_drop_favorite_oi]
-                    _opp_name = market["outcomes"][fav_drop_entry_oi]
                     print(
                         f"[MOMENTUM] FAVORITE DROP {_mkt_label}: "
                         f"{_fav_name} peaked {fav_drop_peak*100:.1f}¢ → "
                         f"{fav_drop_current*100:.1f}¢ "
-                        f"({_drop_ratio*100:.0f}% drop) — forcing entry "
-                        f"on {_opp_name}",
+                        f"({_drop_ratio*100:.0f}% drop) — buying dip on "
+                        f"{_fav_name}",
                         flush=True,
                     )
 
