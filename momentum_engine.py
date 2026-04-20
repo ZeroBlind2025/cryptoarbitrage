@@ -179,6 +179,11 @@ MIN_MARKET_AGE_MINUTES = float(os.getenv("MOMENTUM_MIN_MARKET_AGE", "3.0"))
 # market has been entered yet.
 FAVORITE_DROP_PCT = float(os.getenv("MOMENTUM_FAVORITE_DROP_PCT", "0.20"))
 
+# Hard price floor applied to every entry — including the fav-drop
+# dip-buy trigger which bypasses the other price filters.  Never enter
+# any side at a price below this.
+ENTRY_PRICE_FLOOR = float(os.getenv("MOMENTUM_ENTRY_PRICE_FLOOR", "0.50"))
+
 # Interval durations in minutes (used to derive market start time from end time)
 _INTERVAL_DURATION_MINUTES: dict[str, float] = {
     "5m": 5,
@@ -985,6 +990,7 @@ class MomentumEngine:
         _delay_info = ", ".join(f"{k}={int(v*60)}s" for k, v in MARKET_ENTRY_DELAY.items()) if _delay_status == "ENABLED" else ""
         print(f"  Delays/cooldowns: {_delay_status}" + (f" ({_delay_info})" if _delay_info else ""))
         print(f"  Max entry price: {MAX_PRICE_ENTRY*100:.0f}¢")
+        print(f"  Entry price floor: {ENTRY_PRICE_FLOOR*100:.0f}¢ (no entries below this on any path)")
         print(f"  Min market age: {MIN_MARKET_AGE_MINUTES:.1f}m (no entries in first {MIN_MARKET_AGE_MINUTES:.1f} minutes)")
         print(f"  Favorite-drop trigger: {FAVORITE_DROP_PCT*100:.0f}% drop from peak → buy the dip on the favorite side")
         _no_trade_str = ", ".join(f"{h}:00" for h in sorted(NO_TRADE_HOURS)) if NO_TRADE_HOURS else "NONE"
@@ -1617,6 +1623,13 @@ class MomentumEngine:
                     # Warn once per scan when using gamma fallback (likely stale)
                     if self.scans_completed % 60 == 1:
                         print(f"  WARN gamma_fallback: {_mkt_label} {outcome} no live price, using gamma={gamma_price*100:.1f}¢", flush=True)
+
+                # --- HARD FLOOR: Never enter below ENTRY_PRICE_FLOOR ---
+                # Applies to every entry path, including the fav-drop
+                # trigger that otherwise bypasses price filters.
+                if price < ENTRY_PRICE_FLOOR:
+                    print(f"  REJECT price_floor: {_mkt_label} {outcome} @ {price*100:.1f}¢ < floor {ENTRY_PRICE_FLOOR*100:.0f}¢", flush=True)
+                    continue
 
                 # --- FILTER: Price must be in range ---
                 # Use per-interval brackets if defined, else global min/max.
