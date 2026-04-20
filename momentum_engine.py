@@ -202,11 +202,30 @@ ENTRY_PRICE_FLOOR = float(os.getenv("MOMENTUM_ENTRY_PRICE_FLOOR", "0.50"))
 # Normal TP/SL don't apply to martingale positions — they hold to close.
 # Actual P&L still settles via the on-chain resolver; the final-5s
 # sample only drives the multiplier (user accepts the slippage).
-MARTINGALE_MODE = os.getenv("MOMENTUM_MARTINGALE_MODE", "false").lower() == "true"
-MARTINGALE_TRIGGER_PRICE = float(os.getenv("MOMENTUM_MARTINGALE_TRIGGER", "0.70"))
-MARTINGALE_WIN_PRICE = float(os.getenv("MOMENTUM_MARTINGALE_WIN_PRICE", "0.50"))
-MARTINGALE_SAMPLE_SECONDS = float(os.getenv("MOMENTUM_MARTINGALE_SAMPLE_S", "5.0"))
-MARTINGALE_MAX_MULTIPLIER = int(os.getenv("MOMENTUM_MARTINGALE_MAX_MULT", "64"))
+#
+# Env vars (primary names; the MOMENTUM_-prefixed forms are also
+# accepted for backwards compat):
+#   MARTINGALE_MODE                (default false)
+#   MARTINGALE_TRIGGER_PRICE       (default 0.70)
+#   MARTINGALE_WIN_PRICE           (default 0.50)
+#   MARTINGALE_SAMPLE_SECONDS      (default 5.0)
+#   MARTINGALE_MAX_MULTIPLIER      (default 64)
+MARTINGALE_MODE = (
+    os.getenv("MARTINGALE_MODE", os.getenv("MOMENTUM_MARTINGALE_MODE", "false"))
+    .lower() == "true"
+)
+MARTINGALE_TRIGGER_PRICE = float(
+    os.getenv("MARTINGALE_TRIGGER_PRICE", os.getenv("MOMENTUM_MARTINGALE_TRIGGER", "0.70"))
+)
+MARTINGALE_WIN_PRICE = float(
+    os.getenv("MARTINGALE_WIN_PRICE", os.getenv("MOMENTUM_MARTINGALE_WIN_PRICE", "0.50"))
+)
+MARTINGALE_SAMPLE_SECONDS = float(
+    os.getenv("MARTINGALE_SAMPLE_SECONDS", os.getenv("MOMENTUM_MARTINGALE_SAMPLE_S", "5.0"))
+)
+MARTINGALE_MAX_MULTIPLIER = int(
+    os.getenv("MARTINGALE_MAX_MULTIPLIER", os.getenv("MOMENTUM_MARTINGALE_MAX_MULT", "64"))
+)
 
 # Interval durations in minutes (used to derive market start time from end time)
 _INTERVAL_DURATION_MINUTES: dict[str, float] = {
@@ -1026,6 +1045,8 @@ class MomentumEngine:
             print(f"  MARTINGALE MODE: ON — buy at market when either side hits {MARTINGALE_TRIGGER_PRICE*100:.0f}¢")
             print(f"    Win/loss sampled in final {MARTINGALE_SAMPLE_SECONDS:.0f}s (win >= {MARTINGALE_WIN_PRICE*100:.0f}¢)")
             print(f"    Multiplier cap: {MARTINGALE_MAX_MULTIPLIER}x | current: {_mg_mults}")
+        else:
+            print(f"  MARTINGALE MODE: OFF (set MARTINGALE_MODE=true to enable)")
         _no_trade_str = ", ".join(f"{h}:00" for h in sorted(NO_TRADE_HOURS)) if NO_TRADE_HOURS else "NONE"
         print(f"  No-trade hours (ET): {_no_trade_str}")
         print(f"  DOWN bets: {'ENABLED' if DOWN_BETS_ENABLED else 'DISABLED'}")
