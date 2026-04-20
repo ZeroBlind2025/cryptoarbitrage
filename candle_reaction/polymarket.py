@@ -60,18 +60,23 @@ def discover_btc_updown_5m(
     now_ts: int,
     session: Optional[requests.Session] = None,
 ) -> Optional[PolyMarket]:
-    """Find the BTC 5m updown market that resolves at the *next* 5m close.
+    """Find the BTC 5m updown market for the *upcoming* 5m window.
 
-    Polymarket names these markets by the settlement timestamp
-    (e.g. ``bitcoin-updown-5m-1772397000``). We try the next bucket
-    first, then the current bucket as a fallback for edge-of-interval
-    cases.
+    ``now_ts`` is the bucket-start of the candle we just observed --
+    e.g. 04:15 means the bar [04:15, 04:20). We want to bet on the
+    bar AFTER that one, [04:20, 04:25), which is the currently-live
+    Polymarket window and settles at 04:25. So the primary slug
+    target is ``now_ts + 2 * WINDOW_SEC`` (= 04:25), with
+    ``+3 * WINDOW_SEC`` as a forward fallback (next-listed market)
+    and ``+1 * WINDOW_SEC`` only as a last resort -- that one is the
+    bar whose outcome is already known on our side, betting it would
+    be paying ~99c for the winning side or ~1c for the loser.
     """
     sess = session or requests.Session()
 
     candidates: list[str] = []
     for root in _SLUG_ROOTS:
-        for offset in (1, 0, 2):  # next bucket, current, two-ahead
+        for offset in (2, 3, 1):  # currently-live, prepared, just-closed (fallback)
             candidates.append(f"{root}-{_bucket_ts(now_ts, offset)}")
 
     for slug in candidates:
@@ -313,8 +318,18 @@ def get_resolution_via_clob(
     endpoint exposes a per-token ``winner: bool`` flag that reflects
     the actual settlement record.
 
-    Returns ``{resolved: bool, our_token_won: bool, winning_outcome,
-    winning_token_id}`` on success, or None if not yet resolved.
+    Returns a dict on success, or None if not yet resolved::
+
+        {
+          "resolved": True,
+          "our_token_won": bool,
+          "our_outcome": str,         # e.g. "Up" / "Down" -- what our
+                                       # token actually represented per
+                                       # CLOB, regardless of what we
+                                       # locally labeled it as
+          "winning_outcome": str,
+          "winning_token_id": str,
+        }
     """
     if not condition_id:
         return None
@@ -337,21 +352,24 @@ def get_resolution_via_clob(
 
     tokens = market.get("tokens") or []
     winning_token = None
+    our_outcome: Optional[str] = None
+    our_tid = str(token_id).strip() if token_id else ""
     for t in tokens:
+        tid = str(t.get("token_id", "")).strip()
         if t.get("winner") is True:
             winning_token = t
-            break
+        if our_tid and tid == our_tid:
+            our_outcome = t.get("outcome")
     if winning_token is None:
-        # Closed but no winner flag set yet (very brief settlement window).
         return None
 
     winning_token_id = str(winning_token.get("token_id", "")).strip()
-    our_tid = str(token_id).strip() if token_id else ""
     our_token_won = (our_tid == winning_token_id) if our_tid else None
 
     return {
         "resolved": True,
         "our_token_won": our_token_won,
+        "our_outcome": our_outcome,
         "winning_outcome": winning_token.get("outcome"),
         "winning_token_id": winning_token_id,
     }

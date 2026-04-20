@@ -358,9 +358,16 @@ class CandleReactionEngine:
             else market.yes_down_token_id
         ) if market else None
 
+        # entry_ts = START of the bet window (= end of the observed
+        # candle). Polymarket's "Price To Beat" timestamp matches
+        # this. The OBSERVED candle's start is candle.ts; the bet
+        # window covers [candle.ts + agg, candle.ts + 2*agg).
+        bet_start_ts = candle.ts + self.cfg.aggregate * 60
+        bet_window = _window_label(bet_start_ts)
+
         # Append a new paper trade; it'll resolve via Polymarket polling.
         trade = TradeRow(
-            entry_ts=candle.ts,
+            entry_ts=bet_start_ts,
             entry_close=candle.close,
             side=edge_trade.side,
             confidence=edge_trade.our_q,
@@ -376,8 +383,10 @@ class CandleReactionEngine:
         )
         self.state.pending_trades.append(trade)
         log.info(
-            "BTC [%s] ENTER %s @ %s (edge %s, q=%.1f%%) stake=$%.2f close=$%.2f pending=%d",
-            window, edge_trade.side, _c(edge_trade.fill_price), _c(edge_trade.edge),
+            "BTC [bet %s | feat %s] ENTER %s @ %s (edge %s, q=%.1f%%) "
+            "stake=$%.2f close=$%.2f pending=%d",
+            bet_window, window,
+            edge_trade.side, _c(edge_trade.fill_price), _c(edge_trade.edge),
             edge_trade.our_q * 100.0, edge_trade.stake, candle.close,
             len(self.state.pending_trades),
         )
