@@ -206,14 +206,21 @@ class HFEngine:
             if 0.01 < meta.initial_yes_price < 0.99:
                 market.gm.reset(meta.initial_yes_price)
 
-            # Apply current calibrator priors. Every new market benefits
-            # from whatever the online calibrator has learned so far.
+            # Apply current calibrator priors. Every new market
+            # benefits from whatever the online calibrator has learned
+            # so far: all three of alpha, beta, and pi are EMA-blended
+            # after every resolved market and carried forward here.
+            # (Previously only alpha/beta were applied — current_pi
+            # was returned by current_priors() but never written into
+            # the market, so the GM update weight was stuck at the
+            # config default forever.)
             current_alpha, current_beta, current_pi = self.calibrator.current_priors()
             market.hawkes_buy.alpha = current_alpha
             market.hawkes_buy.beta = current_beta
             market.hawkes_sell.alpha = current_alpha
             market.hawkes_sell.beta = current_beta
-            # pi_base stays in the cfg; pi_effective will track cascade.
+            market.pi_base = current_pi
+            market.pi_effective = current_pi
             self.markets[meta.market_id] = market
 
         # Register with the feed (outside the lock to avoid contention).
@@ -337,68 +344,155 @@ class HFEngine:
     # Main loop (reporting + housekeeping)
     # ------------------------------------------------------------------ #
 
+    # Class-level constants for the main loop tick.
+    HEARTBEAT_SEC: float = 30.0
+    # Periodic re-subscribe interval. Polymarket's CLOB WS has been
+    # observed to silently stop delivering events for subscribed
+    # tokens after ~1 hour without tearing down the TCP connection —
+    # we flush the subscribe message every PERIODIC_RESUB_SEC as a
+    # cheap, non-disruptive safety net.
+    PERIODIC_RESUB_SEC: float = 300.0
+
     def _main_loop(self) -> None:
-        # Heartbeat: print a one-line status every HEARTBEAT_SEC so we
-        # can see what the scanner + feed are doing even before the
-        # first market resolves.
-        HEARTBEAT_SEC = 30.0
-        last_heartbeat = 0.0
+        # Instance state so one exception in the body doesn't lose
+        # the timestamps and so a re-enter after an error picks up
+        # where it left off.
+        self._last_heartbeat_at = 0.0
+        self._last_periodic_resub_at = time.time()
+
+        # Explicit startup marker so it's visible in the Railway log
+        # whether the background main-loop thread actually entered
+        # the loop. If this line never prints, ``start_background``
+        # never ran or the thread crashed before the first iteration.
+        self._log(
+            "main loop started "
+            f"(heartbeat every {self.HEARTBEAT_SEC:.0f}s, "
+            f"periodic resubscribe every {self.PERIODIC_RESUB_SEC:.0f}s)"
+        )
 
         while self._running:
-            self._tick_count += 1
-            now = time.time()
-
-            # Post-resolution report (fires every N resolved markets).
-            if (
-                self._markets_resolved_total > 0
-                and (self._markets_resolved_total % self.cfg.report_every_n_markets == 0)
-                and (now - self._last_report_at) > self.cfg.scan_interval_sec
-            ):
-                self._report()
-                self._last_report_at = now
-
-            # Heartbeat (unconditional, regardless of market activity).
-            if (now - last_heartbeat) > HEARTBEAT_SEC:
-                self._heartbeat()
-                last_heartbeat = now
-
-            # The ``websocket-client`` library runs its own keepalive
-            # (ping_interval=30s, ping_timeout=10s) and reconnects with
-            # exponential backoff on real TCP failures, so there is no
-            # need for the main loop to tear down a healthy feed just
-            # because a quiet market has produced no trade messages for
-            # a while. We only intervene if the feed reports that it is
-            # disconnected *and* has been silent for longer than the
-            # stale timeout, which indicates the internal reconnect
-            # loop itself is stuck.
-            if (
-                not self.feed.connected
-                and self.feed.is_stale()
-                and (now - self._last_feed_reset_at) > self._feed_reset_min_interval
-            ):
-                self._log("feed disconnected + stale — issuing a hard reset")
-                self._last_feed_reset_at = now
-                try:
-                    self.feed.stop()
-                except Exception:
-                    pass
-                self.feed = HFETradeFeed(
-                    ws_url=self.cfg.clob_ws_url,
-                    on_trade=self._on_trade,
-                    on_book=self._on_book,
-                    log_prefix=f"{self.cfg.log_prefix}-FEED",
-                )
-                self.feed.start()
-                with self._markets_lock:
-                    to_reg = list(self.markets.values())
-                for m in to_reg:
-                    self.feed.register_market(
-                        m.market_id, m.yes_token_id, m.no_token_id, flush=False
-                    )
-                # One consolidated subscribe at the end of the batch.
-                self.feed.flush_subscriptions()
-
+            # Defence in depth. The previous version had no try/except
+            # around the body of the loop, so any exception in
+            # ``_heartbeat``, ``flush_subscriptions``, ``is_stale``,
+            # or the hard-reset path would silently kill the main
+            # thread (daemon threads die quietly on unhandled
+            # exceptions). Once dead, no more heartbeats, no more
+            # stale-feed resets, no more periodic re-subscribes — the
+            # engine would still look "alive" because the scanner and
+            # Flask threads keep running, but the feed would go
+            # silent over the next hour and there would be nothing
+            # to kick it back up. THIS is almost certainly what
+            # caused the recurring hour-long stall — the stale-feed
+            # reset code I "fixed" previously wasn't executing
+            # because its thread was dead. Wrap the body so the
+            # loop self-heals and the crash is visible in the log.
+            try:
+                self._main_loop_tick()
+            except Exception as e:
+                import traceback
+                self._log(f"main loop iteration error: {e}")
+                self._log(traceback.format_exc())
             time.sleep(max(self.cfg.loop_sleep_sec, 0.05))
+
+    def _main_loop_tick(self) -> None:
+        """One iteration of the main loop body. Extracted so the
+        outer loop can wrap it in try/except without losing state.
+
+        All rate-limited timestamps live on ``self`` (see
+        ``_last_heartbeat_at`` / ``_last_periodic_resub_at``) so
+        that an exception on iteration N cannot cause us to
+        rerun a heartbeat / resubscribe / hard-reset on iteration
+        N+1.
+        """
+        self._tick_count += 1
+        now = time.time()
+
+        # Post-resolution report (fires every N resolved markets).
+        if (
+            self._markets_resolved_total > 0
+            and (self._markets_resolved_total % self.cfg.report_every_n_markets == 0)
+            and (now - self._last_report_at) > self.cfg.scan_interval_sec
+        ):
+            self._report()
+            self._last_report_at = now
+
+        # Heartbeat. Wrapped so a formatting error can't break the loop.
+        if (now - self._last_heartbeat_at) > self.HEARTBEAT_SEC:
+            try:
+                self._heartbeat()
+            except Exception as e:
+                self._log(f"heartbeat error: {e}")
+            self._last_heartbeat_at = now
+
+        # Periodic re-subscribe. Cheap insurance against silent
+        # server-side subscription TTL expiry: even if the feed
+        # looks healthy, re-send the full token list every 5
+        # minutes so Polymarket is guaranteed to have our current
+        # set. A single subscribe message with ~16 tokens is
+        # roughly 1 KB — nothing.
+        if (now - self._last_periodic_resub_at) > self.PERIODIC_RESUB_SEC:
+            with self._markets_lock:
+                reg_count = len(self.markets)
+            if reg_count > 0:
+                try:
+                    self.feed.flush_subscriptions()
+                    self._log(f"periodic re-subscribe ({reg_count} markets)")
+                except Exception as e:
+                    self._log(f"periodic re-subscribe error: {e}")
+            self._last_periodic_resub_at = now
+
+        # Stale-feed hard reset.
+        #
+        # ``websocket-client`` runs its own ping/pong keepalive, so
+        # a TCP-level disconnect triggers its internal reconnect
+        # loop. What the keepalive CANNOT detect is Polymarket
+        # silently dropping our subscription while keeping the
+        # connection open: ``connected`` stays True, but
+        # ``last_message_time`` stops advancing because no data
+        # frames arrive. The previous guard required
+        # ``not self.feed.connected`` and therefore never fired
+        # in this failure mode. We now hard-reset on
+        # ``is_stale()`` alone, whenever we have registered tokens
+        # (and are therefore expecting data).
+        feed_stats = self.feed.stats()
+        registered = int(feed_stats.get("registered_tokens", 0))
+        if (
+            registered > 0
+            and self.feed.is_stale()
+            and (now - self._last_feed_reset_at) > self._feed_reset_min_interval
+        ):
+            self._log(
+                f"feed stale — hard reset "
+                f"(connected={feed_stats.get('connected')}, "
+                f"reg={registered}, "
+                f"msgs={feed_stats.get('messages_received')}, "
+                f"books={feed_stats.get('book_updates')}, "
+                f"trades={feed_stats.get('trades_received')}, "
+                f"unknown={feed_stats.get('unknown_asset_events')})"
+            )
+            self._last_feed_reset_at = now
+            try:
+                self.feed.stop()
+            except Exception:
+                pass
+            self.feed = HFETradeFeed(
+                ws_url=self.cfg.clob_ws_url,
+                on_trade=self._on_trade,
+                on_book=self._on_book,
+                log_prefix=f"{self.cfg.log_prefix}-FEED",
+            )
+            self.feed.start()
+            with self._markets_lock:
+                to_reg = list(self.markets.values())
+            for m in to_reg:
+                self.feed.register_market(
+                    m.market_id, m.yes_token_id, m.no_token_id, flush=False
+                )
+            # One consolidated subscribe at the end of the batch.
+            self.feed.flush_subscriptions()
+            # Reset the periodic-resub clock so we don't fire a
+            # redundant flush 30s after a hard reset.
+            self._last_periodic_resub_at = now
 
     def _heartbeat(self) -> None:
         feed_stats = self.feed.stats()
@@ -413,6 +507,16 @@ class HFEngine:
         top_rejects = sorted(hist.items(), key=lambda kv: -kv[1])[:3]
         reject_str = ", ".join(f"{k}={v}" for k, v in top_rejects) or "-"
 
+        # How many seconds since the feed last received any message.
+        # This is the critical number for diagnosing the "engine goes
+        # stale" symptom: if ``silent=`` climbs past ~60-120s while
+        # ``connected=True`` the engine is about to auto-reset.
+        last_msg = feed_stats.get("last_message")
+        if last_msg is None:
+            silent_str = "never"
+        else:
+            silent_str = f"{time.time() - last_msg:.0f}s"
+
         self._log(
             f"heartbeat "
             f"uptime={self.uptime_seconds:.0f}s "
@@ -426,6 +530,7 @@ class HFEngine:
             f"msgs={feed_stats['messages_received']}, "
             f"books={feed_stats['book_updates']}, "
             f"trades={feed_stats['trades_received']}, "
+            f"silent={silent_str}, "
             f"unknown={feed_stats['unknown_asset_events']}) "
             f"signals(pass={self.executor.signals_accepted_total}, "
             f"rej={self.executor.signals_rejected_total}, {reject_str}) "

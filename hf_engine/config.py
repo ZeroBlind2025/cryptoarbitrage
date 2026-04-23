@@ -117,8 +117,31 @@ class HFEConfig:
     # 10.4 — Position sizing
     # ------------------------------------------------------------------
     kelly_base_fraction: float = 0.25
-    max_dollar_risk_per_market: float = 10.0
-    max_total_dollar_risk: float = 50.0
+    # Lot-size caps (raised 10x from the original $10/$50 so real
+    # fee bite is small relative to P/L movement). Override via
+    # ``HFE_MAX_DOLLAR_RISK_PER_MARKET`` / ``HFE_MAX_TOTAL_DOLLAR_RISK``.
+    max_dollar_risk_per_market: float = 100.0
+    max_total_dollar_risk: float = 500.0
+
+    # Polymarket taker fee peak, in basis points of contract notional.
+    # The real Polymarket schedule is a symmetric curve peaking at
+    # price = 0.50 where the fee equals ``peak_bps / 10_000`` of
+    # notional (1.80% at the default 180 bps peak) and falling
+    # toward zero at both price extremes. Per-leg formula, derived
+    # from the published Polymarket table:
+    #
+    #     fee_usdc = (peak_bps / 2500) * size_dollars * (1 - price)
+    #
+    # At peak_bps = 180 this reduces to ``0.072 * size * (1 - price)``
+    # which reproduces the published schedule exactly:
+    #   price 0.50, size $50 -> $1.80  (peak of curve)
+    #   price 0.10, size $10 -> $0.648 ≈ $0.65
+    #   price 0.90, size $90 -> $0.648 ≈ $0.65
+    #   price 0.01, size $1  -> $0.0007128 ≈ $0.07
+    #
+    # Set to 0 to turn fee accounting off entirely (gross ==
+    # net P/L). Override via ``HFE_TAKER_FEE_PEAK_BPS``.
+    taker_fee_peak_bps: float = 180.0
 
     # ------------------------------------------------------------------
     # 10.5 — Exit parameters
@@ -156,7 +179,12 @@ class HFEConfig:
     # Scanner / market selection (Section 9)
     # ------------------------------------------------------------------
     scan_interval_sec: float = 10.0
-    min_market_duration_min: float = 4.0
+    # 5m Polymarket crypto updown markets have a ~50% paper win rate
+    # and are net-negative after taker fees. Default floor raised from
+    # 4 minutes to 14 minutes so only 15m+ markets pass through. Lower
+    # it back via ``HFE_MIN_MARKET_DURATION_MIN`` if you want to
+    # re-enable 5m for experimentation.
+    min_market_duration_min: float = 14.0
     max_market_duration_min: float = 65.0
     min_pre_volume_usd: float = 1000.0
     min_unique_traders: int = 10
@@ -238,6 +266,9 @@ class HFEConfig:
         )
         cfg.max_total_dollar_risk = _getenv_float(
             "HFE_MAX_TOTAL_DOLLAR_RISK", cfg.max_total_dollar_risk
+        )
+        cfg.taker_fee_peak_bps = _getenv_float(
+            "HFE_TAKER_FEE_PEAK_BPS", cfg.taker_fee_peak_bps
         )
 
         # Exits
