@@ -1049,7 +1049,15 @@ def market_refresh_loop():
 def index():
     """Serve the HFT dashboard"""
     # Serve from static to avoid Jinja2 interpreting React's {{ }} syntax
-    return app.send_static_file('hft_dashboard.html')
+    resp = app.make_response(app.send_static_file('hft_dashboard.html'))
+    # Force browser + Railway CDN to re-fetch every time — we've had
+    # cases where stale cached dashboards kept POSTing old endpoints
+    # after a redeploy.  The dashboard is tiny (~100KB) so no-cache
+    # is cheap.
+    resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    resp.headers["Pragma"] = "no-cache"
+    resp.headers["Expires"] = "0"
+    return resp
 
 
 @app.route('/api/status')
@@ -1666,11 +1674,14 @@ def api_copy_trader_settings_get():
 @app.route('/api/copy-trader/settings', methods=['POST'])
 def api_copy_trader_settings_update():
     """Update trading settings at runtime (lot sizes, bet amounts).
-    Works with momentum engine even when copy trader is disabled.
-    Changes take effect immediately - new trades will use the new bet amount."""
-    # Allow settings changes as long as at least one engine is available
-    if not copy_trader and not momentum_engine:
-        return jsonify({"error": "No trading engine running. Start momentum engine first."}), 400
+    Applies to every engine that is running (copy trader, momentum,
+    contrarian fade). Changes take effect immediately — new trades will
+    use the new bet amount."""
+    # Fan changes out to every engine that's alive so the dashboard
+    # panel works regardless of which engine is driving trades.
+    engines = [e for e in (copy_trader, momentum_engine, contrarian_engine) if e]
+    if not engines:
+        return jsonify({"error": "No trading engine running. Start an engine first."}), 400
 
     data = request.get_json() or {}
     changes = []
@@ -1680,32 +1691,25 @@ def api_copy_trader_settings_update():
         new_amount = float(data['bet_amount'])
         if new_amount <= 0:
             return jsonify({"error": "Bet amount must be positive"}), 400
-        # Get old amount from whichever engine is running
-        active = momentum_engine or copy_trader
-        old_amount = active.bet_amount
-        if copy_trader:
-            copy_trader.bet_amount = new_amount
-        if momentum_engine:
-            momentum_engine.bet_amount = new_amount
+        old_amount = engines[0].bet_amount
+        for eng in engines:
+            eng.bet_amount = new_amount
         changes.append(f"Bet amount: ${old_amount:.2f} -> ${new_amount:.2f}")
         print(f"[ALGO] Bet amount changed: ${old_amount:.2f} -> ${new_amount:.2f}", flush=True)
 
     # Update per-coin lot sizes (e.g. {"btc": 1.0, "eth": 2.0, "sol": 1.0})
-    # Applies to BOTH copy trader and momentum engine (whichever is running)
+    # Applied to every running engine.
     if 'coin_bet_amounts' in data:
         new_coin_bets = data['coin_bet_amounts']
         if not isinstance(new_coin_bets, dict):
             return jsonify({"error": "coin_bet_amounts must be an object like {\"btc\": 1.0, \"eth\": 2.0}"}), 400
-        active = momentum_engine or copy_trader
         for coin, amt in new_coin_bets.items():
             amt = float(amt)
             if amt <= 0:
                 return jsonify({"error": f"Lot size for {coin} must be positive"}), 400
-            old_amt = active.coin_bet_amounts.get(coin, active.bet_amount)
-            if copy_trader:
-                copy_trader.coin_bet_amounts[coin] = amt
-            if momentum_engine:
-                momentum_engine.coin_bet_amounts[coin] = amt
+            old_amt = engines[0].coin_bet_amounts.get(coin, engines[0].bet_amount)
+            for eng in engines:
+                eng.coin_bet_amounts[coin] = amt
             changes.append(f"{coin.upper()} lot: ${old_amt:.2f} -> ${amt:.2f}")
             print(f"[ALGO] {coin.upper()} lot size changed: ${old_amt:.2f} -> ${amt:.2f}", flush=True)
 
@@ -1716,7 +1720,7 @@ def api_copy_trader_settings_update():
     if not changes:
         return jsonify({"error": "No settings provided. Send bet_amount or coin_bet_amounts."}), 400
 
-    active = momentum_engine or copy_trader
+    active = engines[0]
     return jsonify({
         "success": True,
         "changes": changes,
@@ -2072,6 +2076,16 @@ def momentum_loop():
 def api_momentum_start():
     """Start momentum engine. Auto-pauses copy trader polling."""
     global momentum_engine, momentum_thread, stop_momentum, copy_trader_paused
+
+    # --- DIAGNOSTIC: who is calling /api/momentum/start? ---
+    # On the contrarian branch the dashboard button no longer hits this
+    # endpoint, yet we still see POSTs arriving.  Log the User-Agent,
+    # Referer and X-Forwarded-For so we can identify the rogue client.
+    _ua = request.headers.get("User-Agent", "?")
+    _ref = request.headers.get("Referer", "?")
+    _xff = request.headers.get("X-Forwarded-For", request.remote_addr or "?")
+    print(f"[MOMENTUM/START] CALLED BY ua={_ua!r} ref={_ref!r} xff={_xff!r}",
+          flush=True)
 
     if not HAS_MOMENTUM_ENGINE:
         return jsonify({"error": "Momentum engine module not available"}), 400
@@ -2804,6 +2818,53 @@ def api_contrarian_settings():
     })
 
 
+@app.route('/api/contrarian/pause-coin', methods=['POST'])
+def api_contrarian_pause_coin():
+    """Pause a coin in the contrarian fade engine."""
+    if not contrarian_engine:
+        return jsonify({"error": "Contrarian engine not running"}), 400
+
+    data = request.get_json() or {}
+    coin = (data.get('coin') or '').lower().strip()
+    if not coin:
+        return jsonify({"error": "Missing 'coin' parameter"}), 400
+
+    if coin in contrarian_engine.paused_coins:
+        return jsonify({"error": f"{coin.upper()} already paused"}), 400
+
+    contrarian_engine.paused_coins.add(coin)
+    print(f"[CONTRARIAN] {coin.upper()} paused — no new fades for this coin",
+          flush=True)
+    return jsonify({
+        "success": True,
+        "message": f"{coin.upper()} paused",
+        "paused_coins": sorted(contrarian_engine.paused_coins),
+    })
+
+
+@app.route('/api/contrarian/resume-coin', methods=['POST'])
+def api_contrarian_resume_coin():
+    """Resume a coin in the contrarian fade engine."""
+    if not contrarian_engine:
+        return jsonify({"error": "Contrarian engine not running"}), 400
+
+    data = request.get_json() or {}
+    coin = (data.get('coin') or '').lower().strip()
+    if not coin:
+        return jsonify({"error": "Missing 'coin' parameter"}), 400
+
+    if coin not in contrarian_engine.paused_coins:
+        return jsonify({"error": f"{coin.upper()} not paused"}), 400
+
+    contrarian_engine.paused_coins.discard(coin)
+    print(f"[CONTRARIAN] {coin.upper()} resumed", flush=True)
+    return jsonify({
+        "success": True,
+        "message": f"{coin.upper()} resumed",
+        "paused_coins": sorted(contrarian_engine.paused_coins),
+    })
+
+
 @app.route('/api/contrarian/trades')
 def api_contrarian_trades():
     """Get contrarian fade engine trade history."""
@@ -2971,6 +3032,36 @@ def _get_momentum_data() -> dict:
     return base
 
 
+def _get_contrarian_data() -> dict:
+    """Get contrarian fade engine data for /api/data, with error isolation"""
+    _defaults = {
+        "running": False,
+        "trades_entered": 0, "trades_skipped": 0,
+        "total_spent": 0, "scans_completed": 0,
+        "open_positions": 0, "resolved_positions": 0,
+        "min_entry_price": 0.60, "max_entry_price": 1.0,
+        "trigger_price": 0.60,
+        "bet_amount": 2.0,
+        "coin_bet_amounts": {"btc": 2.0, "eth": 2.0, "sol": 2.0, "xrp": 2.0},
+        "paused_coins": [], "dry_run": True,
+        "active_entries": {},
+    }
+    running = contrarian_thread and contrarian_thread.is_alive()
+    base = {
+        "running": running,
+        "paused": contrarian_paused.is_set() if running else False,
+    }
+    try:
+        if contrarian_engine:
+            base.update(contrarian_engine.get_stats())
+        else:
+            base.update(_defaults)
+    except Exception as e:
+        print(f"[CONTRARIAN] get_stats error (using defaults): {e}", flush=True)
+        base.update(_defaults)
+    return base
+
+
 @app.route('/api/data')
 def api_data():
     """Get all dashboard data in one call"""
@@ -3013,9 +3104,11 @@ def api_data():
             "live": recent_live,
             "copy": list(copy_trades)[-20:],
             "momentum": list(momentum_trades)[-20:],
+            "contrarian": list(contrarian_trades)[-20:],
         },
         "copy_trader": _get_copy_trader_data(),
         "momentum": _get_momentum_data(),
+        "contrarian": _get_contrarian_data(),
         "pnl": {
             "demo": {
                 "filled": len(demo_filled),
@@ -3069,6 +3162,76 @@ def api_events():
 
 
 # =============================================================================
+# CONTRARIAN AUTO-START
+# =============================================================================
+#
+# The claude/contrarian-fade-strategy branch is meant to run the contrarian
+# fade engine as its default mode of operation.  Without this helper the
+# container boots idle and the first thing that POSTs to any /api/*/start
+# endpoint wins — which historically has been stale browser JS hitting
+# /api/momentum/start.  Auto-starting at boot makes the contrarian engine
+# the only thing running by default, with no dashboard click required.
+#
+# Env knobs:
+#   CONTRARIAN_AUTOSTART (default "true") — set to "false" to disable
+#   CONTRARIAN_LIVE      (default "false") — set to "true" to run LIVE
+#
+def _autostart_contrarian_engine():
+    global contrarian_engine, contrarian_thread, stop_contrarian
+
+    if os.getenv("CONTRARIAN_AUTOSTART", "true").lower() != "true":
+        print("[AUTOSTART] CONTRARIAN_AUTOSTART=false — skipping", flush=True)
+        return
+
+    if not HAS_CONTRARIAN_ENGINE:
+        print("[AUTOSTART] contrarian_engine module NOT available — "
+              "this branch is missing contrarian_engine.py.  "
+              "Nothing to auto-start.", flush=True)
+        return
+
+    if contrarian_thread and contrarian_thread.is_alive():
+        print("[AUTOSTART] Contrarian engine already running — skipping",
+              flush=True)
+        return
+
+    live_mode = os.getenv("CONTRARIAN_LIVE", "false").lower() == "true"
+
+    print("\n" + "=" * 70)
+    print("   AUTO-START: CONTRARIAN FADE ENGINE")
+    print("   (claude/contrarian-fade-strategy branch)")
+    print(f"   Mode: {'LIVE (REAL MONEY)' if live_mode else 'DRY RUN'}")
+    print("=" * 70 + "\n", flush=True)
+
+    try:
+        # Share positions dict with whichever engine already owns state,
+        # so the combined balance chart stays consistent across engines.
+        shared_pos = (
+            copy_trader.positions if copy_trader
+            else momentum_engine.positions if momentum_engine
+            else informed_engine.positions if informed_engine
+            else None
+        )
+        contrarian_engine = ContrarianEngine(
+            dry_run=not live_mode,
+            on_trade=on_contrarian_trade,
+            shared_positions=shared_pos,
+        )
+        contrarian_engine.start()
+    except Exception as e:
+        print(f"[AUTOSTART] Failed to init contrarian engine: {e}", flush=True)
+        import traceback; traceback.print_exc()
+        contrarian_engine = None
+        return
+
+    stop_contrarian.clear()
+    contrarian_paused.clear()
+    contrarian_thread = threading.Thread(target=contrarian_loop, daemon=True)
+    contrarian_thread.start()
+    print("[AUTOSTART] Contrarian fade engine is LIVE in the scan loop",
+          flush=True)
+
+
+# =============================================================================
 # MAIN
 # =============================================================================
 
@@ -3117,7 +3280,17 @@ def main():
     print("  GET  /api/trades    - Trade history")
     print("  GET  /api/data      - All dashboard data")
     print("  GET  /api/events    - Real-time SSE stream")
+    print("  POST /api/contrarian/start   - (auto-started by default on this branch)")
     print(f"{'=' * 60}\n")
+
+    # Auto-start the contrarian fade engine on this branch.  See
+    # _autostart_contrarian_engine() for env-var knobs (CONTRARIAN_AUTOSTART,
+    # CONTRARIAN_LIVE).  Logs loudly on success or failure.
+    try:
+        _autostart_contrarian_engine()
+    except Exception as e:
+        print(f"[AUTOSTART] Unexpected error during auto-start: {e}", flush=True)
+        import traceback; traceback.print_exc()
 
     app.run(host=args.host, port=args.port, debug=args.debug, threaded=True)
 

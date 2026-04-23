@@ -383,14 +383,19 @@
         };
 
         // Algo Settings Component - Per-coin lot size controls + dynamic lot sizing
-        const AlgoSettings = ({ copyTrader, fetchData, setError }) => {
+        // apiPrefix: '/api/copy-trader' (default) or '/api/contrarian' / '/api/momentum'
+        // showDynamic: dynamic-lot-sizing toggle only exists on /api/copy-trader
+        const AlgoSettings = ({ copyTrader, fetchData, setError,
+                                apiPrefix = '/api/copy-trader',
+                                showDynamic = true }) => {
             const [isOpen, setIsOpen] = useState(false);
             const COINS = ['btc', 'eth', 'sol', 'xrp'];
             const [coinAmounts, setCoinAmounts] = useState({});
             const [saving, setSaving] = useState(false);
             const [saveMsg, setSaveMsg] = useState('');
 
-            const isDynamic = copyTrader.dynamic_lot_sizing_enabled || false;
+            const supportsDynamic = showDynamic && apiPrefix === '/api/copy-trader';
+            const isDynamic = supportsDynamic && (copyTrader.dynamic_lot_sizing_enabled || false);
 
             // Sync inputs with live data when panel opens
             useEffect(() => {
@@ -410,7 +415,7 @@
 
             const toggleDynamicLots = async () => {
                 try {
-                    const resp = await fetch('/api/copy-trader/dynamic-lots', {
+                    const resp = await fetch(`${apiPrefix}/dynamic-lots`, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ enabled: !isDynamic }),
@@ -448,7 +453,7 @@
                         return;
                     }
 
-                    const resp = await fetch('/api/copy-trader/settings', {
+                    const resp = await fetch(`${apiPrefix}/settings`, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ coin_bet_amounts }),
@@ -478,27 +483,29 @@
 
                     {isOpen && (
                         <div className="mt-3 space-y-3">
-                            {/* Dynamic Lot Sizing Toggle */}
-                            <div className="flex items-center justify-between p-2 rounded-lg bg-slate-700/30 border border-slate-600/50">
-                                <div>
-                                    <p className="text-xs text-slate-300 font-medium">Auto-Scale Lots by Win Rate</p>
-                                    <p className="text-xs text-slate-500 mt-0.5">
-                                        {isDynamic
-                                            ? 'ON: lots auto-adjust based on coin win %'
-                                            : 'OFF: manual lot sizes only'}
-                                    </p>
+                            {/* Dynamic Lot Sizing Toggle (copy-trader only) */}
+                            {supportsDynamic && (
+                                <div className="flex items-center justify-between p-2 rounded-lg bg-slate-700/30 border border-slate-600/50">
+                                    <div>
+                                        <p className="text-xs text-slate-300 font-medium">Auto-Scale Lots by Win Rate</p>
+                                        <p className="text-xs text-slate-500 mt-0.5">
+                                            {isDynamic
+                                                ? 'ON: lots auto-adjust based on coin win %'
+                                                : 'OFF: manual lot sizes only'}
+                                        </p>
+                                    </div>
+                                    <button
+                                        onClick={toggleDynamicLots}
+                                        className={`px-3 py-1 text-xs rounded border transition-all ${
+                                            isDynamic
+                                                    ? 'bg-cyan-500/20 text-cyan-400 border-cyan-500/30 hover:bg-cyan-500/30'
+                                                    : 'bg-slate-600/50 text-slate-400 border-slate-500/30 hover:bg-slate-500/30'
+                                        }`}
+                                    >
+                                        {isDynamic ? 'ON' : 'OFF'}
+                                    </button>
                                 </div>
-                                <button
-                                    onClick={toggleDynamicLots}
-                                    className={`px-3 py-1 text-xs rounded border transition-all ${
-                                        isDynamic
-                                                ? 'bg-cyan-500/20 text-cyan-400 border-cyan-500/30 hover:bg-cyan-500/30'
-                                                : 'bg-slate-600/50 text-slate-400 border-slate-500/30 hover:bg-slate-500/30'
-                                    }`}
-                                >
-                                    {isDynamic ? 'ON' : 'OFF'}
-                                </button>
-                            </div>
+                            )}
 
                             {/* Dynamic lot tier explanation */}
                             {isDynamic && (
@@ -855,8 +862,10 @@
             const scanner = data?.scanner || {};
             const trades = data?.trades || { demo: [], live: [], copy: [] };
             const copyTrader = data?.copy_trader || {};
-            const momentum = data?.momentum || {};
-            const allTrades = [...(trades.demo || []), ...(trades.live || []), ...(trades.copy || []), ...(trades.momentum || [])]
+            // On contrarian-fade-strategy branch the Momentum card is
+            // repurposed to drive the contrarian engine. Keep the var name.
+            const momentum = data?.contrarian || {};
+            const allTrades = [...(trades.demo || []), ...(trades.live || []), ...(trades.copy || []), ...(trades.momentum || []), ...(trades.contrarian || [])]
                 .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
 
             return (
@@ -959,12 +968,12 @@
                                                     trade={trade}
                                                     isNew={newTradeIds.has(trade.id)}
                                                 />
-                                            ) : trade.source === 'momentum' ? (
+                                            ) : (trade.source === 'momentum' || trade.source === 'contrarian' || trade.source === 'informed') ? (
                                                 <div key={trade.id} className={`bg-slate-800/30 rounded-lg p-3 border border-slate-700/50 hover:border-orange-500/30 transition-all ${newTradeIds.has(trade.id) ? 'flash-green' : ''}`}>
                                                     <div className="flex items-center justify-between mb-2">
                                                         <div className="flex items-center gap-2">
                                                             <span className="px-2 py-0.5 text-xs rounded border font-medium bg-orange-500/20 text-orange-400 border-orange-500/30">
-                                                                MOMENTUM
+                                                                {(trade.source || 'trade').toUpperCase()}
                                                             </span>
                                                             <span className={`px-2 py-0.5 text-xs rounded border ${
                                                                 trade.status === 'filled' ? 'bg-green-500/20 text-green-400 border-green-500/30' :
@@ -1285,12 +1294,12 @@
                                 />
                             </div>
 
-                            {/* Momentum Engine */}
+                            {/* Contrarian Fade Engine (was: Momentum Engine — repurposed on this branch) */}
                             <div className="bg-slate-800/50 backdrop-blur rounded-xl border border-slate-700/50 p-4">
                                 <div className="flex items-center justify-between mb-4">
                                     <h2 className="text-lg font-semibold flex items-center gap-2">
                                         <span className="text-orange-400"><TrendingUp /></span>
-                                        Momentum Engine
+                                        Contrarian Fade Engine
                                     </h2>
                                     <div className="flex items-center gap-2">
                                         <span className={`px-2 py-0.5 text-xs rounded border ${
@@ -1309,8 +1318,8 @@
                                                     onClick={async () => {
                                                         try {
                                                             const endpoint = momentum.paused
-                                                                ? '/api/momentum/resume'
-                                                                : '/api/momentum/pause';
+                                                                ? '/api/contrarian/resume'
+                                                                : '/api/contrarian/pause';
                                                             await fetch(endpoint, { method: 'POST' });
                                                             fetchData();
                                                         } catch (e) { console.error(e); }
@@ -1330,7 +1339,7 @@
                                                 <button
                                                     onClick={async () => {
                                                         try {
-                                                            await fetch('/api/momentum/stop', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}) });
+                                                            await fetch('/api/contrarian/stop', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}) });
                                                             fetchData();
                                                         } catch (e) { console.error(e); }
                                                     }}
@@ -1343,7 +1352,7 @@
                                             <button
                                                 onClick={async () => {
                                                     try {
-                                                        const res = await fetch('/api/momentum/start', {
+                                                        const res = await fetch('/api/contrarian/start', {
                                                             method: 'POST',
                                                             headers: { 'Content-Type': 'application/json' },
                                                             body: JSON.stringify({})
@@ -1364,7 +1373,7 @@
                                 </div>
 
                                 <p className="text-xs text-slate-500 mb-3">
-                                    Independent price-momentum trader. Enters between {((momentum.min_entry_price || 0.65) * 100).toFixed(0)}¢ – {((momentum.max_entry_price || 0.989) * 100).toFixed(1)}¢, re-enters only on upward movement. {momentum.running && copyTrader.paused ? '(Copy trader auto-paused)' : ''}
+                                    Contrarian fade engine. When either side crosses {((momentum.trigger_price || momentum.min_entry_price || 0.60) * 100).toFixed(0)}¢, buys the OPPOSITE side at market. One entry per market, no re-entries, no hedges.
                                 </p>
 
                                 {momentum.running && (
@@ -1447,14 +1456,25 @@
                                         )}
 
                                         {/* Per-Coin Performance for Momentum */}
-                                        <CoinROI coinRoi={momentum.coin_roi} copyTrader={momentum} fetchData={fetchData} apiPrefix="/api/momentum" />
+                                        <CoinROI coinRoi={momentum.coin_roi} copyTrader={momentum} fetchData={fetchData} apiPrefix="/api/contrarian" />
                                     </div>
                                 )}
 
                                 {!momentum.running && (
                                     <p className="text-slate-500 text-sm">
-                                        Click Start to begin momentum trading.
+                                        Click Start to begin contrarian fade trading.
                                     </p>
+                                )}
+
+                                {/* Lot Sizes panel (contrarian engine) */}
+                                {momentum.running && (
+                                    <AlgoSettings
+                                        copyTrader={momentum}
+                                        fetchData={fetchData}
+                                        setError={setError}
+                                        apiPrefix="/api/contrarian"
+                                        showDynamic={false}
+                                    />
                                 )}
                             </div>
 
