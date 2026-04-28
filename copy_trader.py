@@ -32,9 +32,16 @@ except ImportError:
     pass
 
 try:
-    from py_clob_client.client import ClobClient
-    from py_clob_client.clob_types import MarketOrderArgs, OrderType
-    from py_clob_client.order_builder.constants import BUY, SELL
+    # CLOB V2: prefer v2 module path, fall back to legacy if the v2 package
+    # kept the original `py_clob_client` import path (PyPI rename only).
+    try:
+        from py_clob_client_v2.client import ClobClient  # type: ignore
+        from py_clob_client_v2.clob_types import MarketOrderArgs, OrderType  # type: ignore
+        from py_clob_client_v2.order_builder.constants import BUY, SELL  # type: ignore
+    except ImportError:
+        from py_clob_client.client import ClobClient
+        from py_clob_client.clob_types import MarketOrderArgs, OrderType
+        from py_clob_client.order_builder.constants import BUY, SELL
     HAS_CLOB_CLIENT = True
 except ImportError:
     HAS_CLOB_CLIENT = False
@@ -142,7 +149,10 @@ def detect_coin(slug: str, title: str) -> str:
 
 # API endpoints
 DATA_API = "https://data-api.polymarket.com"
-CLOB_API = "https://clob.polymarket.com"
+# CLOB host — defaults to production.  Override with CLOB_API_HOST=https://clob-v2.polymarket.com
+# to point at the V2 staging host pre-cutover (Apr 28, 2026 ~11:00 UTC).
+# After cutover the production URL serves V2 automatically.
+CLOB_API = os.getenv("CLOB_API_HOST", "https://clob.polymarket.com")
 GAMMA_API = "https://gamma-api.polymarket.com"
 PROFILE_API = "https://gamma-api.polymarket.com"
 
@@ -877,14 +887,13 @@ def _get_relay_headers(body_dict: dict) -> dict:
             # Generate L2 headers from derived CLOB creds
             l2_headers = {}
             if HAS_CLOB_CLIENT and PRIVATE_KEY:
-                from py_clob_client.client import ClobClient
                 if FUNDER_ADDRESS:
-                    client = ClobClient(
-                        CLOB_API, key=PRIVATE_KEY, chain_id=137,
+                    client = _construct_clob_client(
+                        CLOB_API, key=PRIVATE_KEY,
                         signature_type=SIGNATURE_TYPE, funder=FUNDER_ADDRESS,
                     )
                 else:
-                    client = ClobClient(CLOB_API, key=PRIVATE_KEY, chain_id=137)
+                    client = _construct_clob_client(CLOB_API, key=PRIVATE_KEY)
                 creds = client.derive_api_key()
                 if creds and creds.api_key:
                     signer = Signer(private_key=PRIVATE_KEY, chain_id=137)
@@ -1786,6 +1795,19 @@ def calc_arb_hedge(entry_price: float, lot_size: float, gap: float = ARB_HEDGE_G
     }
 
 
+def _construct_clob_client(host, *, key, **kwargs) -> "ClobClient":
+    """V2-aware ClobClient constructor.
+
+    The V2 SDK renames `chain_id` → `chain`.  Try the V2 keyword first;
+    fall back to V1 if the installed SDK still uses `chain_id`.  Caller
+    should NOT pass either — this helper injects chain=137 (Polygon).
+    """
+    try:
+        return ClobClient(host, key=key, chain=137, **kwargs)
+    except TypeError:
+        return ClobClient(host, key=key, chain_id=137, **kwargs)
+
+
 def get_clob_client() -> Optional["ClobClient"]:
     """Initialize CLOB client with credentials"""
     if not HAS_CLOB_CLIENT:
@@ -1819,22 +1841,18 @@ def get_clob_client() -> Optional["ClobClient"]:
             except Exception as e:
                 print(f"[ALGO] Builder config failed ({e}) — attribution disabled", flush=True)
 
+        # V2: builder attribution moved off the client config to a per-order
+        # `builder_code` field.  Skipping per user direction — no attribution
+        # passed to client construction.
         if FUNDER_ADDRESS:
-            client = ClobClient(
+            client = _construct_clob_client(
                 CLOB_API,
                 key=PRIVATE_KEY,
-                chain_id=137,
                 signature_type=SIGNATURE_TYPE,
                 funder=FUNDER_ADDRESS,
-                builder_config=builder_config,
             )
         else:
-            client = ClobClient(
-                CLOB_API,
-                key=PRIVATE_KEY,
-                chain_id=137,
-                builder_config=builder_config,
-            )
+            client = _construct_clob_client(CLOB_API, key=PRIVATE_KEY)
 
         creds = client.create_or_derive_api_creds()
         client.set_api_creds(creds)

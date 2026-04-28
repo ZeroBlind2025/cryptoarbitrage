@@ -350,30 +350,45 @@ class CLOBClient:
             self._init_clob_client()
     
     def _init_clob_client(self) -> bool:
-        """Initialize py-clob-client for live trading"""
+        """Initialize py-clob-client(-v2) for live trading"""
         try:
-            from py_clob_client.client import ClobClient
-            from py_clob_client.clob_types import ApiCreds
-            
+            # V2: prefer v2 module path; fall back if v2 PyPI rename kept
+            # the original import path.
+            try:
+                from py_clob_client_v2.client import ClobClient  # type: ignore
+                from py_clob_client_v2.clob_types import ApiCreds  # type: ignore
+            except ImportError:
+                from py_clob_client.client import ClobClient
+                from py_clob_client.clob_types import ApiCreds
+
             creds = ApiCreds(
                 api_key=self.config.api_key,
                 api_secret=self.config.api_secret,
                 api_passphrase=self.config.passphrase,
             )
-            
-            self._clob_client = ClobClient(
-                host=self.config.clob_api_url,
-                key=self.config.private_key,
-                creds=creds,
-                chain_id=self.config.chain_id,
-            )
-            
+
+            # V2 renamed `chain_id` → `chain`.  Try v2 then fall back.
+            try:
+                self._clob_client = ClobClient(
+                    host=self.config.clob_api_url,
+                    key=self.config.private_key,
+                    creds=creds,
+                    chain=self.config.chain_id,
+                )
+            except TypeError:
+                self._clob_client = ClobClient(
+                    host=self.config.clob_api_url,
+                    key=self.config.private_key,
+                    creds=creds,
+                    chain_id=self.config.chain_id,
+                )
+
             print("✓ CLOB client initialized for live trading")
             return True
-            
+
         except ImportError:
-            print("⚠ py-clob-client not installed - paper trading only")
-            print("  Install with: pip install py-clob-client")
+            print("⚠ py-clob-client(-v2) not installed - paper trading only")
+            print("  Install with: pip install py-clob-client-v2")
             return False
         except Exception as e:
             print(f"⚠ CLOB client init failed: {e}")
