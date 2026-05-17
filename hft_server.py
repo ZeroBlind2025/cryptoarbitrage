@@ -2046,7 +2046,9 @@ def momentum_loop():
                 if entered > 0:
                     print(f"[MOMENTUM] Entered {entered} trade(s)", flush=True)
 
-            # Always check stop losses and resolutions (even when paused)
+            # Always check take-profit, stop losses, and resolutions
+            # (even when paused — these manage already-open positions)
+            momentum_engine.check_take_profits()
             momentum_engine.check_stop_losses()
             momentum_engine.check_resolutions()
 

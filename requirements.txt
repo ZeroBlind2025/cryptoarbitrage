@@ -15,12 +15,16 @@ websockets>=12.0
 websocket-client>=1.6.0  # For Polymarket Sports WebSocket
 
 # Blockchain/Trading
-py-clob-client
+# CLOB V2 cutover (Apr 28, 2026 ~11:00 UTC) — switched to py-clob-client-v2.
+# Legacy py-clob-client stops working after V2 go-live; v2 supports both
+# pre-cutover (clob-v2.polymarket.com) and post-cutover (clob.polymarket.com).
+py-clob-client-v2==1.0.0
 web3>=6.0.0
 
 # Analysis (for white paper)
 pandas>=2.0.0
 # matplotlib>=3.7.0
 
-# Note: py-clob-client may need to be installed from git:
-# pip install git+https://github.com/Polymarket/py-clob-client.git
+# Note: py-clob-client-v2 module path may still be `py_clob_client` on import
+# (we try v2 then fall back to v1 in code).  If pypi resolution fails:
+# pip install git+https://github.com/Polymarket/py-clob-client-v2.git
